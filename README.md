@@ -21,26 +21,32 @@ or what runs inside a computer:
   computers.
 - **A computer belongs to the key that created it.** Anyone else gets the
   same 404 as a missing name.
+- **Credentials come from a platform.** A computer's spec may name a
+  `credentials_url`; the node asks it, signed with its own key, which the
+  platform lists. The values reach the engine's credential swap and never
+  the guest (Credentials, below).
 
 ## Layout
 
 | Crate | What |
 |---|---|
-| `crates/proto` | The wire contract: `ComputerSpec`, `ComputerView`, `GrantSpec`, `Ticket`, `ApiError`, and every limit, validated before anything is stored |
+| `crates/proto` | The wire contract: `ComputerSpec`, `ComputerView`, `GrantSpec`, `Ticket`, `ApiError`, a credential source's `CredentialsAsk` and `Credentials`, and every limit, validated before anything is stored |
 | `crates/nip98` | NIP-98: verify (the node), sign (clients, the `sign` feature) |
 | `crates/sandcastled` | The node: the store (SQLite), the engine gate (`msb`), the supervisor, the API, the proxy, the router |
 | `crates/cli` | `sandcastle`: signs calls with a key file and prints the answer |
 
 ## The API
 
-`https://api.<domain>/v1/…`, NIP-98 on everything but `GET /v1/health`.
+`https://api.<domain>/v1/…`, NIP-98 on everything but `GET /v1/health`
+(which also answers the node's own public key, `node_key`, when it has
+one).
 
 | Call | Who | What |
 |---|---|---|
 | `PUT /v1/grants/{pubkey}` | a grantor | `{computers_max, vcpus_max, memory_mib_max, data_gib_max}` |
 | `GET /v1/grants/{pubkey}` | that key, or a grantor | |
 | `DELETE /v1/grants/{pubkey}` | a grantor | revoke; the key's computers stop |
-| `PUT /v1/computers/{name}` | a key with a grant | create (201), the same spec again (200), or an update (200): the image, the service, and `url_auth` can change; storage and size are fixed (409) |
+| `PUT /v1/computers/{name}` | a key with a grant | create (201), the same spec again (200), or an update (200): the image, the service, `url_auth`, and `credentials_url` can change; storage and size are fixed (409). A `credentials_url` outside the node's listed origins is 400 |
 | `GET /v1/computers[/{name}]` | the owner | desired and observed state, `pending` (true until the node has acted on the latest spec and desired state: poll until false), a `rollback` if any, the URL; env values read `(set)` |
 | `GET /v1/computers/{name}/snapshots` | the owner | the node's snapshots of the durable disk, oldest first |
 | `GET /v1/backups` | a key | its backups in the node's bucket, its deleted computers' included |
@@ -62,7 +68,8 @@ A computer's spec:
     "health_path": "/api/auth/providers",
     "env": {"HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "…", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "…", "HERMES_DASHBOARD_BASIC_AUTH_SECRET": "…"}
   },
-  "url_auth": "owner"
+  "url_auth": "owner",
+  "credentials_url": "https://fragment.club/api/sandcastle/credentials"
 }
 ```
 
@@ -74,7 +81,53 @@ Each field in brief:
   - `pet`: the whole machine is durable. Refused until built.
 - **`service`** is the one process the node launches on every boot. The node keeps its definition, so nothing in the guest can change or revive it.
 - **`env`** holds the service's own settings. It reaches the guest through an exec's stdin into a root-only file, never a command line.
-- **Outbound credentials** go through the credential source, which is not built yet. They never go in `env`.
+- **Outbound credentials** come from `credentials_url`, never `env` (below).
+
+## Credentials
+
+A computer's service spends credentials outbound (a model key, say)
+without ever holding one:
+
+1. **The node asks.** At every create and start, it POSTs a
+   `CredentialsAsk` (`{computer, id, node, owner}`: the owner is the key
+   that made the computer) to the spec's `credentials_url`, NIP-98 signed
+   over the body with **the node's own key** (`--node-key-file`). It asks
+   only origins its operator lists (`--credentials-origin`), and a platform
+   answers only nodes it lists.
+2. **The platform answers** `{credentials: [{name, value, hosts,
+   placeholder?}]}`, or refuses. A name ends in `_KEY`, `_TOKEN`, or
+   `_SECRET` (so no name is one the engine or its host reads), and may not
+   shadow a service variable. A placeholder, if named, is what the service
+   sees: shaped like the real thing for services that check (Hermes takes
+   an OpenRouter key only if it starts `sk-or-`); without one, msb's own
+   (`$MSB_<NAME>`).
+3. **The engine swaps.** The node hands msb the names, hosts, and
+   placeholders in a secret config (a 0600 file with no value in it,
+   removed after the create), and each value in msb's own environment,
+   never a command line. The guest's CA trusts msb's interception, and
+   the service's env holds the placeholder; msb replaces it with the value
+   only in requests to the credential's hosts.
+4. **It stays current.** Every `--credentials-every-s` (900) the node asks
+   again. A new value is swapped in live (`msb modify`), and the guest sees
+   nothing change. New names, hosts, or placeholders restart the machine.
+   A platform that is down keeps what a machine holds, and holds a new
+   generation back without stopping the old one or rolling back. A
+   platform that **refuses** (a 4xx: the owner's key revoked, say) has the
+   values withdrawn, live, until it answers again. After a daemon
+   restart, a service relaunched on a running machine gets its credentials
+   handed over again first.
+
+A value lives in the node's memory for one engine call, and in msb's
+host process for the machine's life. It never reaches the store, a view,
+a log, the guest, its disk, a snapshot, or a backup.
+
+Limits:
+
+- Only credentials that travel in headers to known hosts. Not a token in
+  a URL path, a client that pins certificates, or a signing key.
+- A response can echo a value back into the guest.
+- A refusal takes effect at the next refetch, so up to
+  `--credentials-every-s`.
 
 ## What happens
 
@@ -166,7 +219,8 @@ ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled --state-dir /var/li
   --grantor <hex> --msb /home/ubuntu/.local/bin/msb --msb-home /home/ubuntu \
   --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64> --zfs-parent tank/sandcastle \
   --node-name lat-6 --backup-bucket sandcastle-backups --backup-credentials /etc/sandcastle/backups.env \
-  --backup-key-file /etc/sandcastle/backup.key
+  --backup-key-file /etc/sandcastle/backup.key \
+  --node-key-file /etc/sandcastle/node.key --credentials-origin https://fragment.club
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
@@ -198,6 +252,11 @@ KERNEL=="zd*", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", PROGRAM="/lib/udev/zvol
 
 A disk is formatted (ext4) only when `blkid` finds nothing on it at all, and a ZFS user property (`sandcastle:formatted`) records it once done. A blkid error is never read as "empty".
 
+**The node's own key** (`--node-key-file`) is made on the node and never
+leaves it: `sandcastle keygen --out /etc/sandcastle/node.key` (0600, the
+daemon's user). The platform lists its public key, which `sandcastle
+health` shows (`node_key`); fragment's is `FRAGMENT_SANDCASTLE_NODES`.
+
 ## The client
 
 ```sh
@@ -222,7 +281,7 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 52 tests.
+`cargo test --workspace --all-features`: 62 tests.
 
 The node's tests run the real router, TLS, HTTP, store, and supervisor
 against a fake engine whose services are live sockets. They cover:
@@ -240,8 +299,15 @@ against a fake engine whose services are live sockets. They cover:
   refused with no partial disk left; the shipped base kept from pruning;
 - the seal (every size, tampering, truncation, reordering, a wrong key or
   path) and SigV4 against AWS's own worked example;
-- a restart that re-adopts.
+- a restart that re-adopts;
+- credentials: a value reaches the engine and nothing else (the guest's
+  env holds the placeholder; the store's bytes, a view, and a debug print
+  hold no value); only listed origins; a live swap of a new value; a
+  restart for new names; a source that is down keeps, one that refuses
+  withdraws, and a good answer restores; a rebase held back without a
+  rollback; a hand-over before a relaunch after a daemon restart; the
+  value in msb's environment, never its arguments.
 
 The real engine is proven by hand on `finite-lat-6`
-(`../docs/sandbox.md`, Phases 1 and 2 on the real engine). That is not
-yet a Rust e2e: see the debt ledger.
+(`../docs/sandbox.md`: Phases 1 and 2 on the real engine, and Phase 4).
+That is not yet a Rust e2e: see the debt ledger.
