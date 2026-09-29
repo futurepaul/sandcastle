@@ -317,10 +317,11 @@ pub mod fake {
         pub volumes: HashMap<String, u32>,
         pub services: HashMap<String, tokio::task::JoinHandle<()>>,
         pub calls: Vec<String>,
-        /// When set, `create` fails with this message.
-        pub fail_create: Option<String>,
-        /// When false, a launch binds nothing (a service that never answers).
-        pub service_answers: bool,
+        /// `create` fails for an image containing this.
+        pub fail_create_for: Option<String>,
+        /// A launch binds nothing (a service that never answers) for an
+        /// image containing this.
+        pub silent_for: Option<String>,
         /// The env file each machine's last launch was handed.
         pub last_env: HashMap<String, String>,
     }
@@ -336,7 +337,7 @@ pub mod fake {
 
     impl Fake {
         pub fn new() -> Fake {
-            Fake(Arc::new(Mutex::new(State { service_answers: true, ..State::default() })))
+            Fake(Arc::new(Mutex::new(State::default())))
         }
 
         pub fn calls(&self) -> Vec<String> {
@@ -416,8 +417,8 @@ pub mod fake {
             self.kill_service(&m.name).await;
             let mut s = self.0.lock().unwrap();
             s.calls.push(format!("create {} {}", m.name, m.image));
-            if let Some(msg) = s.fail_create.clone() {
-                return Err(EngineError::Failed { what: "fake create".into(), code: Some(1), stderr: msg });
+            if s.fail_create_for.as_ref().is_some_and(|f| m.image.contains(f.as_str())) {
+                return Err(EngineError::Failed { what: "fake create".into(), code: Some(1), stderr: "no such image".into() });
             }
             if let Some(v) = &m.volume {
                 s.volumes.entry(v.name.clone()).or_insert(v.gib);
@@ -482,7 +483,8 @@ pub mod fake {
                 let Some((m, VmState::Running)) = s.machines.get(name).cloned() else {
                     return Err(EngineError::Failed { what: "fake exec".into(), code: Some(1), stderr: "not running".into() });
                 };
-                (m, s.service_answers, s.services.contains_key(name))
+                let silent = s.silent_for.as_ref().is_some_and(|f| m.image.contains(f.as_str()));
+                (m, !silent, s.services.contains_key(name))
             };
             if script.contains("setsid") {
                 if answers && !already {

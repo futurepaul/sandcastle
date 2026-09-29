@@ -56,6 +56,12 @@ pub struct Config {
     /// public addresses, or a computer can reach the host's sshd.
     #[arg(long = "guest-deny")]
     pub guest_deny: Vec<String>,
+    /// How long a launched service may take to answer its health path
+    /// before it counts as failed (and a new generation is rolled back).
+    /// Hermes answers in about 3 s on the test host; a first boot with a
+    /// large home, or a slow disk, takes longer.
+    #[arg(long, default_value_t = 120)]
+    pub startup_grace_s: u64,
 }
 
 impl Config {
@@ -98,6 +104,9 @@ impl Config {
             if !ok {
                 return Err(format!("--guest-deny {d:?} is an IP address or CIDR"));
             }
+        }
+        if self.startup_grace_s == 0 || self.startup_grace_s > 3600 {
+            return Err("--startup-grace-s is 1 to 3600".into());
         }
         if self.auth_window_s <= 0 || self.auth_window_s > 600 {
             return Err("--auth-window-s is 1 to 600".into());

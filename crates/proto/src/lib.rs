@@ -124,8 +124,22 @@ pub struct ComputerView {
     pub spec: ComputerSpec,
     pub desired: Desired,
     pub observed: Observed,
+    /// Present while the node runs the last spec that served because this
+    /// spec's image or service failed. `start` retries it; a new spec
+    /// replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<Rollback>,
     /// `https://<name>.<domain>/`
     pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Rollback {
+    /// The spec's image, which failed (or whose service did).
+    pub failed_image: String,
+    /// The image actually running: the last one that served.
+    pub running_image: String,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

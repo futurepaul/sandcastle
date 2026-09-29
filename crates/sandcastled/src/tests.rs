@@ -77,6 +77,7 @@ impl Node {
             port_count: 10,
             auth_window_s: 60,
             guest_deny: vec!["203.0.113.7".into()],
+            startup_grace_s: 1,
         };
         config.check().unwrap();
         let store = Store::open(&dir.join("sandcastle.db")).unwrap();
@@ -418,7 +419,7 @@ async fn failures_back_off() {
     let (grantor, alice) = (Keys::generate(), Keys::generate());
     let mut node = Node::start(&grantor).await;
     node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
-    node.engine.0.lock().unwrap().fail_create = Some("no such image".into());
+    node.engine.0.lock().unwrap().fail_create_for = Some("example/hermes".into());
     node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
     for _ in 0..supervisor::FAILURES_MAX {
         node.tick().await;
@@ -480,5 +481,107 @@ async fn revoking_a_grant_stops_compute() {
     assert_eq!(node.app.observed("hermes"), Observed::Stopped);
     assert_eq!(node.call(&alice, "POST", "/v1/computers/hermes/start", None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(node.call(&grantor, "DELETE", &g, None).await.0, StatusCode::NOT_FOUND, "a second revoke finds nothing");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a new generation that fails rolls back to the last one that
+/// served, keeping the disk, says so, and is retried by `start`; the good
+/// generation failing is an ordinary failure, not a flip-flop. Method:
+/// images the fake refuses to create, and one whose service never answers.
+#[tokio::test]
+async fn a_failed_rebase_rolls_back() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    assert_eq!(node.app.store.computer("hermes").unwrap().unwrap().good_spec, Some(spec()), "serving proves the spec");
+
+    // An image that cannot be created.
+    node.engine.0.lock().unwrap().fail_create_for = Some("broken".into());
+    let mut broken = spec();
+    broken.image = "example/broken:2".into();
+    assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&broken)).await.0, StatusCode::OK);
+    node.tick().await;
+    assert!(matches!(node.app.observed("hermes"), Observed::Failed { reason } if reason.starts_with("rolling back: creating")));
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving, "back on the good image");
+    let (_, body) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(body["rollback"]["failed_image"], "example/broken:2");
+    assert_eq!(body["rollback"]["running_image"], "example/hermes:1");
+    assert!(body["rollback"]["reason"].as_str().unwrap().contains("no such image"));
+    assert_eq!(body["spec"]["image"], "example/broken:2", "the spec is still what was asked for");
+    // The failed create never replaced the machine, so rolling back is a
+    // start of the old one (had the engine removed it first, the next tick
+    // would create it from the good spec).
+    let running_image = |node: &Node| {
+        let s = node.engine.0.lock().unwrap();
+        let (m, _) = s.machines.values().next().unwrap();
+        m.image.clone()
+    };
+    assert_eq!(running_image(&node), "example/hermes:1", "{:?}", node.engine.calls());
+    assert_eq!(node.engine.0.lock().unwrap().volumes.len(), 1, "one disk throughout");
+
+    // Staying rolled back: no further attempts at the broken image.
+    let creates = node.engine.calls().iter().filter(|c| c.starts_with("create")).count();
+    node.tick().await;
+    assert_eq!(node.engine.calls().iter().filter(|c| c.starts_with("create")).count(), creates);
+
+    // `start` retries it, and it rolls back again.
+    assert_eq!(node.call(&alice, "POST", "/v1/computers/hermes/start", None).await.0, StatusCode::OK);
+    node.tick().await;
+    assert!(matches!(node.app.observed("hermes"), Observed::Failed { reason } if reason.starts_with("rolling back")));
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+
+    // A service that never answers rolls back after the grace (1 s here).
+    node.engine.0.lock().unwrap().silent_for = Some("silent".into());
+    let mut silent = spec();
+    silent.image = "example/silent:3".into();
+    assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&silent)).await.0, StatusCode::OK);
+    let (_, body) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert!(body.get("rollback").is_none(), "a new spec clears the old rollback");
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Starting);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    node.tick().await;
+    assert!(matches!(node.app.observed("hermes"), Observed::Failed { reason } if reason.contains("did not answer")));
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    let (_, body) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(body["rollback"]["running_image"], "example/hermes:1");
+    assert_eq!(running_image(&node), "example/hermes:1", "the silent image's machine was replaced by the good one");
+
+    // A good new image clears everything and becomes the good spec.
+    let mut fixed = spec();
+    fixed.image = "example/hermes:4".into();
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&fixed)).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    let c = node.app.store.computer("hermes").unwrap().unwrap();
+    assert_eq!(c.good_spec.map(|g| g.image), Some("example/hermes:4".to_string()));
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: when there is nothing to roll back to (the first generation) or
+/// the good generation itself fails, the node backs off rather than
+/// flipping. Method: a first spec that cannot be created.
+#[tokio::test]
+async fn a_first_generation_that_fails_backs_off() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.engine.0.lock().unwrap().fail_create_for = Some("example/hermes".into());
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    assert!(matches!(node.app.observed("hermes"), Observed::Failed { reason } if !reason.starts_with("rolling back")));
+    let (_, body) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert!(body.get("rollback").is_none());
     std::fs::remove_dir_all(&node.dir).unwrap();
 }

@@ -86,6 +86,7 @@ it every 2 s, from the node's own state:
   3. stops the machine cleanly,
   4. recreates it on the same disk,
   5. relaunches the service.
+- **Rollback.** A new generation that fails (its create or launch errs, or its service does not answer within `--startup-grace-s`, 120 s by default) is marked failed. The node goes back to the last spec that served, keeping the data (never rewound). A view's `rollback` field names the failed and running images and the reason. `start` retries it, and a new spec replaces it. The good spec failing is an ordinary failure, so the node never flips between the two.
 - **Daemon restart.** A restarted daemon re-adopts running machines without relaunching anything. The launch script refuses to start a second copy.
 - **Failures** back off: five in a row, then 60 s alone.
 
@@ -175,7 +176,7 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 33 tests.
+`cargo test --workspace --all-features`: 35 tests.
 
 The node's tests run the real router, TLS, HTTP, store, and supervisor
 against a fake engine whose services are live sockets. They cover:
@@ -184,7 +185,7 @@ against a fake engine whose services are live sockets. They cover:
 - idempotent create, conflicts, and ownership;
 - a whole life, from create to delete, including a ticket, the cookie
   strip, an upgrade, a rebase, and stop/start;
-- backoff;
+- rollback, and backoff when there is nothing to roll back to;
 - a restart that re-adopts.
 
 The real engine is proven by hand on `finite-lat-6`

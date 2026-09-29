@@ -10,17 +10,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sandcastle_proto::{Observed, Storage};
+use sandcastle_proto::{ComputerSpec, Observed, Storage};
 
 use crate::app::App;
 use crate::engine::{machine_name, volume_name, Engine, Machine, VmState, Volume};
 use crate::store::{Computer, DesiredState};
 
 pub const TICK: Duration = Duration::from_secs(2);
-/// How long a launched service may take to answer before it is launched
-/// again. Hermes answers in about 3 s on the test host; a first boot with
-/// a large home, or a slow disk, takes longer.
-pub const STARTUP_GRACE: Duration = Duration::from_secs(120);
 /// Consecutive failures before a computer is marked failed and retried
 /// only after `FAILED_BACKOFF`.
 pub const FAILURES_MAX: u32 = 5;
@@ -108,19 +104,32 @@ pub fn generation(spec: &sandcastle_proto::ComputerSpec) -> String {
     hex::encode(sha2::Sha256::digest(&canonical))
 }
 
-pub fn machine_of(c: &Computer) -> Machine {
-    let volume = match c.spec.storage {
-        Storage::Data => Some(Volume { name: volume_name(&c.id), gib: c.spec.data_gib, path: c.spec.data_path.clone() }),
+/// The machine a computer's `spec` makes (its own, or the good one it
+/// rolled back to: storage and size are the same in both).
+pub fn machine_of(c: &Computer, spec: &ComputerSpec) -> Machine {
+    let volume = match spec.storage {
+        Storage::Data => Some(Volume { name: volume_name(&c.id), gib: spec.data_gib, path: spec.data_path.clone() }),
         Storage::Ephemeral | Storage::Pet => None,
     };
     Machine {
         name: machine_name(&c.id),
-        image: c.spec.image.clone(),
-        vcpus: c.spec.vcpus,
-        memory_mib: c.spec.memory_mib,
+        image: spec.image.clone(),
+        vcpus: spec.vcpus,
+        memory_mib: spec.memory_mib,
         host_port: c.host_port,
-        guest_port: c.spec.service.port,
+        guest_port: spec.service.port,
         volume,
+    }
+}
+
+/// What the node runs for `c`: its spec, or, when the spec's generation
+/// failed and was rolled back from, the last spec that served. The bool
+/// says which.
+pub fn target(c: &Computer) -> (&ComputerSpec, bool) {
+    let rolled_back = c.failed_generation.as_deref() == Some(generation(&c.spec).as_str());
+    match (&c.good_spec, rolled_back) {
+        (Some(good), true) => (good, true),
+        _ => (&c.spec, false),
     }
 }
 
@@ -187,15 +196,34 @@ async fn converge<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, tr
                 let last = track.last_error.as_deref().unwrap_or("repeated failures");
                 return Observed::Failed { reason: format!("{last} (backing off)") };
             }
-            let result = run_step(app, c, vm, track).await;
+            let (spec, rolled_back) = target(c);
+            let result = run_step(app, c, spec, vm, track).await;
             match result {
                 Ok(observed) => {
                     if observed == Observed::Serving {
                         track.failures = 0;
                         track.retry_at = None;
                         track.last_error = None;
+                        let proven = !rolled_back && c.good_spec.as_ref() != Some(&c.spec);
+                        if proven {
+                            if let Err(e) = app.store.set_good_spec(&c.name, &c.spec, app.now()) {
+                                eprintln!("supervisor: recording {}'s good spec: {e}", c.name);
+                            }
+                        }
                     }
                     observed
+                }
+                // A new generation's first failure: go back to the last one
+                // that served, keeping the data (never rewound), and say so.
+                // The good spec itself failing is an ordinary failure, so
+                // the node never flips between the two.
+                Err(reason) if !rolled_back && c.good_spec.as_ref().is_some_and(|g| generation(g) != generation(&c.spec)) => {
+                    let failed = generation(&c.spec);
+                    if let Err(e) = app.store.set_failed(&c.name, Some((&failed, &reason)), app.now()) {
+                        eprintln!("supervisor: recording {}'s rollback: {e}", c.name);
+                    }
+                    *track = Track::default();
+                    Observed::Failed { reason: format!("rolling back: {reason}") }
                 }
                 Err(reason) => {
                     track.last_error = Some(reason.clone());
@@ -212,10 +240,10 @@ async fn converge<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, tr
     }
 }
 
-/// One step toward a running, serving computer.
-async fn run_step<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
+/// One step toward a running, serving computer made from `spec`.
+async fn run_step<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
     let name = machine_name(&c.id);
-    let wanted = generation(&c.spec);
+    let wanted = generation(spec);
     let rebase_due = c.applied_generation.as_deref() != Some(wanted.as_str());
     if vm.is_none() || rebase_due {
         if vm == Some(VmState::Running) {
@@ -225,34 +253,38 @@ async fn run_step<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, tr
             quiesce(app, &name).await;
             app.engine.stop(&name).await.map_err(|e| format!("stopping before the rebase: {e}"))?;
         }
-        app.engine.create(&machine_of(c)).await.map_err(|e| format!("creating: {e}"))?;
+        app.engine.create(&machine_of(c, spec)).await.map_err(|e| format!("creating: {e}"))?;
         app.store.set_applied_generation(&c.name, &wanted, app.now()).map_err(|e| format!("recording the generation: {e}"))?;
-        launch(app, c, track).await?;
+        launch(app, c, spec, track).await?;
         return Ok(Observed::Starting);
     }
     if vm != Some(VmState::Running) {
         app.engine.start(&name).await.map_err(|e| format!("starting: {e}"))?;
-        launch(app, c, track).await?;
+        launch(app, c, spec, track).await?;
         return Ok(Observed::Starting);
     }
-    if probe(c.host_port, &c.spec.service.health_path).await {
+    if probe(c.host_port, &spec.service.health_path).await {
         return Ok(Observed::Serving);
     }
-    let within_grace = track.launched_at.is_some_and(|t| t.elapsed() < STARTUP_GRACE);
-    if within_grace {
-        return Ok(Observed::Starting);
+    let grace = Duration::from_secs(app.config.startup_grace_s);
+    match track.launched_at {
+        Some(t) if t.elapsed() < grace => Ok(Observed::Starting),
+        // Launched by this process and still silent past its grace: a
+        // failure (the caller rolls a new generation back).
+        Some(_) => Err(format!("the service did not answer {} within {} s", spec.service.health_path, grace.as_secs())),
+        // Up but never launched by this process (a daemon restart): launch.
+        // The script keeps a live service rather than starting a second.
+        None => {
+            launch(app, c, spec, track).await?;
+            Ok(Observed::Starting)
+        }
     }
-    // Up but not serving, and either never launched by this process (a
-    // daemon restart) or past its grace: launch. The script keeps a live
-    // service rather than starting a second one.
-    launch(app, c, track).await?;
-    Ok(Observed::Starting)
 }
 
-async fn launch<E: Engine>(app: &App<E>, c: &Computer, track: &mut Track) -> Result<(), String> {
+async fn launch<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
     let mut argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), LAUNCH_SCRIPT.into(), "sandcastle-launch".into()];
-    argv.extend(c.spec.service.argv.iter().cloned());
-    let env = env_file(&c.spec.service.env);
+    argv.extend(spec.service.argv.iter().cloned());
+    let env = env_file(&spec.service.env);
     let out = app
         .engine
         .exec(&machine_name(&c.id), &argv, env.as_bytes(), EXEC_TIMEOUT)

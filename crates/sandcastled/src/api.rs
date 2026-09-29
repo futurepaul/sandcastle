@@ -8,7 +8,7 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use sandcastle_proto::{
-    validate_name, validate_pubkey, ComputerList, ComputerSpec, ComputerView, GrantSpec, GrantView, Ticket, UrlAuth, TICKET_TTL_S,
+    validate_name, validate_pubkey, ComputerList, ComputerSpec, ComputerView, GrantSpec, GrantView, Rollback, Ticket, UrlAuth, TICKET_TTL_S,
 };
 
 use crate::app::{random_hex32, token_hash, App};
@@ -46,12 +46,21 @@ fn view<E: Engine>(app: &App<E>, c: &Computer) -> ComputerView {
     for v in spec.service.env.values_mut() {
         *v = REDACTED.to_string();
     }
+    let rollback = match crate::supervisor::target(c) {
+        (good, true) => Some(Rollback {
+            failed_image: c.spec.image.clone(),
+            running_image: good.image.clone(),
+            reason: c.failed_reason.clone().unwrap_or_default(),
+        }),
+        (_, false) => None,
+    };
     ComputerView {
         name: c.name.clone(),
         owner: c.owner.clone(),
         spec,
         desired: c.desired.public(),
         observed: app.observed(&c.name),
+        rollback,
         url: app.config.computer_url(&c.name),
     }
 }
@@ -255,6 +264,12 @@ fn set_desired<E: Engine>(app: &App<E>, signer: &str, name: &str, desired: Desir
         }
         if let Err(e) = app.store.set_desired(name, desired, app.now()) {
             return store_error(e);
+        }
+        // Starting is also the retry of a generation that was rolled back.
+        if desired == DesiredState::Running && c.failed_generation.is_some() {
+            if let Err(e) = app.store.set_failed(name, None, app.now()) {
+                return store_error(e);
+            }
         }
         if desired == DesiredState::Deleted {
             return json(StatusCode::ACCEPTED, &serde_json::json!({"deleting": name}));

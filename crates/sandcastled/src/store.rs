@@ -47,6 +47,12 @@ pub struct Computer {
     /// created from, or `None` before the first create. A spec whose
     /// generation differs means a rebase is due.
     pub applied_generation: Option<String>,
+    /// The last spec that reached serving: what a failed rebase returns to.
+    pub good_spec: Option<ComputerSpec>,
+    /// A generation that failed and was rolled back from, and why. The node
+    /// stays on `good_spec` while the spec's generation is this one.
+    pub failed_generation: Option<String>,
+    pub failed_reason: Option<String>,
 }
 
 /// `Desired` plus the deletion the supervisor has yet to carry out.
@@ -109,6 +115,9 @@ CREATE TABLE IF NOT EXISTS computers (
   desired TEXT NOT NULL CHECK (desired IN ('running', 'stopped', 'deleted')),
   host_port INTEGER NOT NULL UNIQUE CHECK (host_port BETWEEN 1 AND 65535),
   applied_generation TEXT CHECK (applied_generation IS NULL OR length(applied_generation) = 64),
+  good_spec TEXT,
+  failed_generation TEXT CHECK (failed_generation IS NULL OR length(failed_generation) = 64),
+  failed_reason TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -137,21 +146,35 @@ fn spec_from_json(name: &str, raw: &str) -> Result<ComputerSpec, StoreError> {
     Ok(spec)
 }
 
-/// name, id, owner, spec, desired, host_port, applied_generation
-type ComputerRow = (String, String, String, String, String, i64, Option<String>);
+/// name, id, owner, spec, desired, host_port, applied_generation,
+/// good_spec, failed_generation, failed_reason
+type ComputerRow = (String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>);
 
 fn row_to_computer(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
 }
 
 fn computer_from_row(r: ComputerRow) -> Result<Computer, StoreError> {
-    let (name, id, owner, spec, desired, port, applied_generation) = r;
+    let (name, id, owner, spec, desired, port, applied_generation, good_spec, failed_generation, failed_reason) = r;
     let host_port = u16::try_from(port).map_err(|_| StoreError::Corrupt(format!("computer {name} port {port}")))?;
     let spec = spec_from_json(&name, &spec)?;
-    Ok(Computer { desired: DesiredState::parse(&desired)?, spec, id, owner, host_port, applied_generation, name })
+    let good_spec = good_spec.map(|g| spec_from_json(&name, &g)).transpose()?;
+    Ok(Computer { desired: DesiredState::parse(&desired)?, spec, id, owner, host_port, applied_generation, good_spec, failed_generation, failed_reason, name })
 }
 
-const COMPUTER_COLUMNS: &str = "name, id, owner, spec, desired, host_port, applied_generation";
+const COMPUTER_COLUMNS: &str =
+    "name, id, owner, spec, desired, host_port, applied_generation, good_spec, failed_generation, failed_reason";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, StoreError> {
@@ -299,10 +322,14 @@ impl Store {
         }
     }
 
+    /// A new spec; any rollback mark goes with the old one.
     pub fn set_spec(&self, name: &str, spec: &ComputerSpec, now: i64) -> Result<(), StoreError> {
         assert!(spec.validate().is_ok());
         let spec_json = serde_json::to_string(spec).expect("a spec serializes");
-        let n = self.conn().execute("UPDATE computers SET spec = ?2, updated_at = ?3 WHERE name = ?1", params![name, spec_json, now])?;
+        let n = self.conn().execute(
+            "UPDATE computers SET spec = ?2, failed_generation = NULL, failed_reason = NULL, updated_at = ?3 WHERE name = ?1",
+            params![name, spec_json, now],
+        )?;
         if n == 1 {
             Ok(())
         } else {
@@ -321,6 +348,39 @@ impl Store {
             Ok(())
         } else {
             Err(StoreError::Corrupt(format!("set_applied_generation on missing computer {name}")))
+        }
+    }
+
+    /// Records the spec that just reached serving.
+    pub fn set_good_spec(&self, name: &str, spec: &ComputerSpec, now: i64) -> Result<(), StoreError> {
+        assert!(spec.validate().is_ok());
+        let spec_json = serde_json::to_string(spec).expect("a spec serializes");
+        let n = self.conn().execute("UPDATE computers SET good_spec = ?2, updated_at = ?3 WHERE name = ?1", params![name, spec_json, now])?;
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt(format!("set_good_spec on missing computer {name}")))
+        }
+    }
+
+    /// Marks a generation failed (the node rolls back from it), or clears
+    /// the mark with `None` (a retry).
+    pub fn set_failed(&self, name: &str, failed: Option<(&str, &str)>, now: i64) -> Result<(), StoreError> {
+        let (generation, reason) = match failed {
+            Some((g, r)) => {
+                assert_eq!(g.len(), 64);
+                (Some(g), Some(r))
+            }
+            None => (None, None),
+        };
+        let n = self.conn().execute(
+            "UPDATE computers SET failed_generation = ?2, failed_reason = ?3, updated_at = ?4 WHERE name = ?1",
+            params![name, generation, reason, now],
+        )?;
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt(format!("set_failed on missing computer {name}")))
         }
     }
 
