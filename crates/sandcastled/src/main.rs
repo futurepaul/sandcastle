@@ -90,7 +90,15 @@ fn activated_listener() -> Result<Option<std::net::TcpListener>, String> {
     // and LISTEN_FDS=1, fd 3 is an open listening socket systemd handed to
     // this process alone, and nothing else in it has taken ownership of fd
     // 3 (this runs once, before any other file is opened for the listener).
-    let listener = unsafe { std::net::TcpListener::from_raw_fd(3) };
+    let passed = unsafe { std::net::TcpListener::from_raw_fd(3) };
+    // systemd passes fd 3 without close-on-exec, so every msb the daemon
+    // spawned, and every VM process under it, inherited the node's public
+    // listener: a VM held 443 after the daemon stopped, and systemd could
+    // not bind it again (finite-lat-6, 2026-09-29). try_clone duplicates
+    // with close-on-exec (F_DUPFD_CLOEXEC); the inheritable original is
+    // closed when `passed` drops.
+    let listener = passed.try_clone().map_err(|e| format!("the socket from systemd: {e}"))?;
+    drop(passed);
     listener.set_nonblocking(true).map_err(|e| format!("the socket from systemd: {e}"))?;
     Ok(Some(listener))
 }

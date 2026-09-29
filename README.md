@@ -132,7 +132,7 @@ User=ubuntu
 SupplementaryGroups=kvm
 Environment=HOME=/home/ubuntu
 ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled --state-dir /var/lib/sandcastle \
-  --domain sandcastle.test --tls-cert /etc/sandcastle/cert.pem --tls-key /etc/sandcastle/key.pem \
+  --domain sandcastle.fragment.club --tls-cert /etc/sandcastle/le-cert.pem --tls-key /etc/sandcastle/le-key.pem \
   --grantor <hex> --msb /home/ubuntu/.local/bin/msb --msb-home /home/ubuntu \
   --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64>
 CapabilityBoundingSet=
@@ -159,7 +159,7 @@ The host's firewall admits 22 and 443 and nothing else.
 ```sh
 cargo build -p sandcastle
 sandcastle keygen --out ~/.sandcastle/key      # prints the public key
-export SANDCASTLE_API=https://api.sandcastle.test SANDCASTLE_KEY_FILE=~/.sandcastle/key
+export SANDCASTLE_API=https://api.sandcastle.fragment.club SANDCASTLE_KEY_FILE=~/.sandcastle/key
 sandcastle health
 sandcastle grant <pubkey> --computers 3 --vcpus 4 --memory-mib 8192 --data-gib 20   # as a grantor
 sandcastle put hermes --spec hermes.json
