@@ -105,8 +105,8 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Held {
     digest: [u8; 32],
-    /// (name, hosts), in the source's order.
-    shape: Vec<(String, Vec<String>)>,
+    /// (name, hosts, what the guest sees), in the source's order.
+    shape: Vec<(String, Vec<String>, String)>,
 }
 
 fn held(credentials: &[Credential]) -> Held {
@@ -114,13 +114,13 @@ fn held(credentials: &[Credential]) -> Held {
     let mut h = sha2::Sha256::new();
     for c in credentials {
         // length-prefixed, so no two lists hash alike
-        for part in std::iter::once(&c.name).chain(std::iter::once(&c.value)).chain(c.hosts.iter()) {
+        for part in [&c.name, &c.value, &placeholder(c)].into_iter().chain(c.hosts.iter()) {
             h.update((part.len() as u64).to_be_bytes());
             h.update(part.as_bytes());
         }
         h.update([0xff]);
     }
-    Held { digest: h.finalize().into(), shape: credentials.iter().map(|c| (c.name.clone(), c.hosts.clone())).collect() }
+    Held { digest: h.finalize().into(), shape: credentials.iter().map(|c| (c.name.clone(), c.hosts.clone(), placeholder(c))).collect() }
 }
 
 /// Why a step toward serving failed.
@@ -384,9 +384,9 @@ async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
 
 /// A serving computer's credentials, fetched again every
 /// `credentials_every_s`. New values with the same names and hosts are
-/// swapped in live (the guest sees nothing change); new names or hosts
-/// stop the machine, and the next tick starts it with them, since the
-/// service reads its variables only when it starts. A failed fetch keeps
+/// swapped in live (the guest sees nothing change); new names, hosts, or
+/// placeholders stop the machine, and the next tick starts it with them,
+/// since the service reads its variables only when it starts. A failed fetch keeps
 /// what the machine holds and waits for the next slot: a platform that is
 /// down never takes a computer down. True when it stopped the machine.
 async fn scheduled_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> bool {
@@ -430,10 +430,10 @@ async fn scheduled_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, 
 /// The service's own variables, and each credential's placeholder.
 fn service_env(spec: &ComputerSpec, track: &Track) -> std::collections::BTreeMap<String, String> {
     let mut env = spec.service.env.clone();
-    for (name, _) in track.credentials.iter().flat_map(|h| h.shape.iter()) {
+    for (name, _, seen) in track.credentials.iter().flat_map(|h| h.shape.iter()) {
         // validate() refused a credential named like one of these
         assert!(!spec.service.env.contains_key(name));
-        env.insert(name.clone(), placeholder(name));
+        env.insert(name.clone(), seen.clone());
     }
     env
 }

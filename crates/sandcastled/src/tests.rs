@@ -825,7 +825,7 @@ const KEY_V1: &str = "sk-or-v1-first-value-0001";
 const KEY_V2: &str = "sk-or-v1-second-value-0002";
 
 fn model_key(value: &str) -> Credential {
-    Credential { name: "OPENROUTER_API_KEY".into(), value: value.into(), hosts: vec!["openrouter.ai".into()] }
+    Credential { name: "OPENROUTER_API_KEY".into(), value: value.into(), hosts: vec!["openrouter.ai".into()], placeholder: Some("sk-or-v1-sandcastle-placeholder".into()) }
 }
 
 fn with_source(mut s: ComputerSpec) -> ComputerSpec {
@@ -887,7 +887,7 @@ async fn credentials_reach_the_engine_and_nothing_else() {
 
     assert_eq!(node.machine_credentials(), vec![model_key(KEY_V1)], "the engine holds the value");
     let env = node.last_env();
-    assert!(env.contains("OPENROUTER_API_KEY='$MSB_OPENROUTER_API_KEY'\n"), "the guest sees the placeholder: {env}");
+    assert!(env.contains("OPENROUTER_API_KEY='sk-or-v1-sandcastle-placeholder'\n"), "the guest sees the source's placeholder: {env}");
     assert!(!env.contains(KEY_V1), "never the value: {env}");
     let asks = node.source.asks();
     let c = node.app.store.computer("hermes").unwrap().unwrap();
@@ -959,7 +959,7 @@ async fn credentials_rotate_live_and_a_new_shape_restarts() {
     assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
 
     // a new name: the machine restarts with it, and the service sees it
-    let gh = Credential { name: "GH_TOKEN".into(), value: "ghp-token-value".into(), hosts: vec!["api.github.com".into()] };
+    let gh = Credential { name: "GH_TOKEN".into(), value: "ghp-token-value".into(), hosts: vec!["api.github.com".into()], placeholder: None };
     node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V2), gh.clone()]));
     let before = node.engine.calls().len();
     node.after_credentials_interval().await;
@@ -1002,7 +1002,7 @@ async fn a_source_that_fails_holds_a_rebase_back_without_rolling_back() {
     assert!(view["rollback"].is_null(), "not the spec's fault: {view}");
 
     // an answer that would shadow the service's own variable is refused
-    let shadow = Credential { name: "DASH_PASSWORD_KEY".into(), value: "x".into(), hosts: vec!["a.example".into()] };
+    let shadow = Credential { name: "DASH_PASSWORD_KEY".into(), value: "x".into(), hosts: vec!["a.example".into()], placeholder: None };
     let mut clash = newer.clone();
     clash.service.env.insert("DASH_PASSWORD_KEY".into(), "mine".into());
     node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&clash)).await;

@@ -78,10 +78,10 @@ pub fn machine_name(id: &str) -> String {
     format!("sc-{id}")
 }
 
-/// What the guest sees in a credential's variable: microsandbox's own
-/// placeholder, which its swap replaces on the way out.
-pub fn placeholder(name: &str) -> String {
-    format!("$MSB_{name}")
+/// What the guest sees in a credential's variable: the one its source
+/// chose, or microsandbox's own. The swap replaces it on the way out.
+pub fn placeholder(c: &Credential) -> String {
+    c.placeholder.clone().unwrap_or_else(|| format!("$MSB_{}", c.name))
 }
 
 pub trait Engine: Send + Sync + 'static {
@@ -156,7 +156,7 @@ mod msb_tests {
         std::fs::write(&program, "#!/bin/sh\necho \"argv: $*\"\nenv\n").unwrap();
         std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let msb = Msb { program, home: dir.clone(), guest_deny: vec![] };
-        let cred = Credential { name: "OPENROUTER_API_KEY".into(), value: "sk-or-v1-in-the-env".into(), hosts: vec!["openrouter.ai".into(), "*.openrouter.ai".into()] };
+        let cred = Credential { name: "OPENROUTER_API_KEY".into(), value: "sk-or-v1-in-the-env".into(), hosts: vec!["openrouter.ai".into(), "*.openrouter.ai".into()], placeholder: Some("sk-or-v1-sandcastle-placeholder".into()) };
         let args: Vec<String> = vec!["modify".into(), "sc-x".into(), "--secret".into(), secret_arg(&cred)];
         let out = msb.run_ok_with("msb modify", &args, std::slice::from_ref(&cred), LIFECYCLE_TIMEOUT).await.unwrap();
         let argv = out.stdout.lines().next().unwrap();
@@ -164,6 +164,10 @@ mod msb_tests {
         assert!(out.stdout.lines().any(|l| l == "OPENROUTER_API_KEY=sk-or-v1-in-the-env"), "{}", out.stdout);
         let plain = msb.run_ok("msb ls", &["ls".into()], LIFECYCLE_TIMEOUT).await.unwrap();
         assert!(!plain.stdout.contains("sk-or-v1"), "another call carries no credential: {}", plain.stdout);
+        let conf = secret_conf(std::slice::from_ref(&cred));
+        assert_eq!(conf, r#"{"OPENROUTER_API_KEY":{"allow":["openrouter.ai","*.openrouter.ai"],"placeholder":"sk-or-v1-sandcastle-placeholder"}}"#);
+        assert!(!conf.contains("in-the-env"), "the config holds no value");
+        assert_eq!(secret_conf(&[]), "");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
@@ -314,12 +318,20 @@ impl Engine for Msb {
             args.push("--mount-disk".into());
             args.push(format!("{}:{}:format=raw,fstype=ext4", d.device.display(), d.mount));
         }
-        for c in &m.credentials {
-            args.push("--secret".into());
-            args.push(secret_arg(c));
+        // Names, hosts, and placeholders go as a secret config on stdin
+        // (the `--secret` flag takes no placeholder); each value stays in
+        // msb's environment under its name, the config's default source.
+        let conf = secret_conf(&m.credentials);
+        if !m.credentials.is_empty() {
+            args.push("--secret-conf".into());
+            args.push("/dev/stdin".into());
         }
         args.push(m.image.clone());
-        self.run_ok_with("msb create", &args, &m.credentials, CREATE_TIMEOUT).await.map(|_| ())
+        let out = self.run_with_stdin("msb create", &args, conf.as_bytes(), &m.credentials, CREATE_TIMEOUT).await?;
+        if out.code != Some(0) {
+            return Err(EngineError::Failed { what: "msb create".into(), code: out.code, stderr: out.stderr.trim().to_string() });
+        }
+        Ok(())
     }
 
     async fn start(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
@@ -358,6 +370,26 @@ impl Engine for Msb {
 /// value in msb's environment, and where the value may go.
 fn secret_arg(c: &Credential) -> String {
     format!("{}@{}", c.name, c.hosts.join(","))
+}
+
+/// msb's secret config (`--secret-conf`), as JSON: per name, its hosts and
+/// its placeholder. No value: the default source is msb's environment
+/// variable of the same name. Empty when there is nothing to configure.
+fn secret_conf(credentials: &[Credential]) -> String {
+    if credentials.is_empty() {
+        return String::new();
+    }
+    let map: serde_json::Map<String, serde_json::Value> = credentials
+        .iter()
+        .map(|c| {
+            let mut entry = serde_json::json!({ "allow": c.hosts });
+            if let Some(p) = &c.placeholder {
+                entry["placeholder"] = serde_json::Value::String(p.clone());
+            }
+            (c.name.clone(), entry)
+        })
+        .collect();
+    serde_json::Value::Object(map).to_string()
 }
 
 /// An engine for tests: machines are map entries, and launching a service

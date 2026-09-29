@@ -33,6 +33,8 @@ pub const CREDENTIALS_MAX: usize = 16;
 pub const CREDENTIAL_VALUE_BYTES_MAX: usize = 8 * 1024;
 pub const CREDENTIAL_HOSTS_MAX: usize = 8;
 pub const CREDENTIALS_BODY_BYTES_MAX: usize = 64 * 1024;
+pub const PLACEHOLDER_BYTES_MIN: usize = 8;
+pub const PLACEHOLDER_BYTES_MAX: usize = 256;
 
 /// What survives a computer's machine (docs/sandbox.md, decision 3).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,12 +232,24 @@ pub struct Credential {
     pub name: String,
     pub value: String,
     pub hosts: Vec<String>,
+    /// What the service sees in place of the value, and sends; the engine
+    /// swaps it for the value on the way to `hosts`. Shaped like the real
+    /// thing for services that check a key's shape (Hermes takes an
+    /// OpenRouter key only if it starts `sk-or-`). Without one, the
+    /// engine's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }
 
 /// A credential's value never reaches a log.
 impl std::fmt::Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credential").field("name", &self.name).field("value", &"(set)").field("hosts", &self.hosts).finish()
+        f.debug_struct("Credential")
+            .field("name", &self.name)
+            .field("value", &"(set)")
+            .field("hosts", &self.hosts)
+            .field("placeholder", &self.placeholder)
+            .finish()
     }
 }
 
@@ -393,6 +407,29 @@ impl Credentials {
             }
             if let Some(bad) = c.hosts.iter().find(|h| !valid_host(h)) {
                 return invalid(format!("credential {}: {bad:?} is not a host name (or *. and one)", c.name));
+            }
+            if let Some(p) = &c.placeholder {
+                // Printable, and nothing the engine's config reads as syntax
+                // (it interpolates `$`) or a shell or a quote would.
+                let shaped = (PLACEHOLDER_BYTES_MIN..=PLACEHOLDER_BYTES_MAX).contains(&p.len())
+                    && p.bytes().all(|b| b.is_ascii_graphic() && !b"$'\"`\\{}".contains(&b));
+                if !shaped {
+                    return invalid(format!(
+                        "credential {}'s placeholder is {PLACEHOLDER_BYTES_MIN} to {PLACEHOLDER_BYTES_MAX} printable ASCII bytes without $ ' \" ` \\ {{ }}",
+                        c.name
+                    ));
+                }
+            }
+        }
+        // A placeholder that held a value would hand it to the guest; two
+        // alike would swap one credential's value in for the other's.
+        let placeholders: Vec<&str> = self.credentials.iter().filter_map(|c| c.placeholder.as_deref()).collect();
+        for (i, p) in placeholders.iter().enumerate() {
+            if placeholders[..i].contains(p) {
+                return invalid("two credentials share a placeholder");
+            }
+            if self.credentials.iter().any(|c| p.contains(c.value.as_str())) {
+                return invalid("a placeholder holds a credential's value");
             }
         }
         Ok(())
@@ -598,7 +635,11 @@ mod tests {
     }
 
     fn cred(name: &str, value: &str, hosts: &[&str]) -> Credential {
-        Credential { name: name.into(), value: value.into(), hosts: hosts.iter().map(|h| h.to_string()).collect() }
+        Credential { name: name.into(), value: value.into(), hosts: hosts.iter().map(|h| h.to_string()).collect(), placeholder: None }
+    }
+
+    fn placed(name: &str, value: &str, placeholder: &str) -> Credential {
+        Credential { placeholder: Some(placeholder.into()), ..cred(name, value, &["a.example"]) }
     }
 
     #[test]
@@ -626,6 +667,14 @@ mod tests {
         for (what, c) in bad {
             assert!(Credentials { credentials: vec![c] }.validate(&none).is_err(), "{what} should be refused");
         }
+        for (what, p) in [("short", "sk-or-1"), ("a dollar", "sk-or-v1-$HOME-x"), ("a brace", "sk-or-v1-{x}-yz"), ("a quote", "sk-or-v1-'x'-yz"), ("a space", "sk-or-v1 xyzw")] {
+            assert!(Credentials { credentials: vec![placed("A_KEY", "v4lue-0123", p)] }.validate(&none).is_err(), "a placeholder with {what}");
+        }
+        assert_eq!(Credentials { credentials: vec![placed("A_KEY", "v4lue-0123", "sk-or-v1-sandcastle-placeholder")] }.validate(&none), Ok(()));
+        let holds = Credentials { credentials: vec![placed("A_KEY", "v4lue-0123", "sk-or-v4lue-0123-x")] };
+        assert!(holds.validate(&none).is_err(), "a placeholder never holds a value");
+        let shared = Credentials { credentials: vec![placed("A_KEY", "one-1111", "the-same-one"), placed("B_KEY", "two-2222", "the-same-one")] };
+        assert!(shared.validate(&none).is_err(), "nor is shared");
         let twice = Credentials { credentials: vec![cred("A_KEY", "x", &["a.example"]), cred("A_KEY", "y", &["a.example"])] };
         assert!(twice.validate(&none).is_err());
         let many = Credentials { credentials: (0..=CREDENTIALS_MAX).map(|i| cred(&format!("K{i}_KEY"), "x", &["a.example"])).collect() };
