@@ -20,7 +20,20 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bytes of a refusal's body kept for the computer's failure reason.
 const REFUSAL_BYTES_KEPT: usize = 300;
 
-pub type Fetch<'a> = Pin<Box<dyn Future<Output = Result<Credentials, String>> + Send + 'a>>;
+/// Why a fetch gave no credentials.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FetchError {
+    /// The source said no (a 4xx): the owner may no longer spend them, so
+    /// a machine holding them has them withdrawn.
+    #[error("refused: {0}")]
+    Refused(String),
+    /// The source could not answer (down, slow, a 5xx, an answer that is
+    /// not credentials): a machine keeps what it holds.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+pub type Fetch<'a> = Pin<Box<dyn Future<Output = Result<Credentials, FetchError>> + Send + 'a>>;
 
 /// Where credentials come from: `Https` on a node, a fake in tests.
 pub trait Source: Send + Sync + 'static {
@@ -42,12 +55,13 @@ impl Https {
         Https { keys, tls: crate::http::tls_connector() }
     }
 
-    async fn post(&self, url: &str, ask: &CredentialsAsk) -> Result<Credentials, String> {
-        let url = url::Url::parse(url).map_err(|e| format!("credentials_url: {e}"))?;
+    async fn post(&self, url: &str, ask: &CredentialsAsk) -> Result<Credentials, FetchError> {
+        use FetchError::Unavailable;
+        let url = url::Url::parse(url).map_err(|e| Unavailable(format!("credentials_url: {e}")))?;
         if url.scheme() != "https" {
-            return Err("credentials_url is https".into());
+            return Err(Unavailable("credentials_url is https".into()));
         }
-        let host = url.host_str().ok_or("credentials_url names no host")?.to_string();
+        let host = url.host_str().ok_or_else(|| Unavailable("credentials_url names no host".into()))?.to_string();
         let port = url.port_or_known_default().unwrap_or(443);
         let body = serde_json::to_vec(ask).expect("an ask serializes");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("the clock is after 1970").as_secs();
@@ -66,28 +80,29 @@ impl Https {
             .header("authorization", auth)
             .header("content-length", body.len())
             .body(Full::new(Bytes::from(body)))
-            .map_err(|e| e.to_string())?;
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| format!("connecting to {host}: {e}"))?;
-        let name = rustls_pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("{host}: {e}"))?;
-        let tls = self.tls.connect(name, tcp).await.map_err(|e| format!("TLS to {host}: {e}"))?;
-        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.map_err(|e| format!("{host}: {e}"))?;
+            .map_err(|e| Unavailable(e.to_string()))?;
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| Unavailable(format!("connecting to {host}: {e}")))?;
+        let name = rustls_pki_types::ServerName::try_from(host.clone()).map_err(|e| Unavailable(format!("{host}: {e}")))?;
+        let tls = self.tls.connect(name, tcp).await.map_err(|e| Unavailable(format!("TLS to {host}: {e}")))?;
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.map_err(|e| Unavailable(format!("{host}: {e}")))?;
         tokio::spawn(conn);
-        let resp = send.send_request(req).await.map_err(|e| format!("{host}: {e}"))?;
+        let resp = send.send_request(req).await.map_err(|e| Unavailable(format!("{host}: {e}")))?;
         let status = resp.status().as_u16();
         let bytes = Limited::new(resp.into_body(), CREDENTIALS_BODY_BYTES_MAX)
             .collect()
             .await
-            .map_err(|_| format!("{host}'s answer is over {CREDENTIALS_BODY_BYTES_MAX} bytes, or was cut off"))?
+            .map_err(|_| Unavailable(format!("{host}'s answer is over {CREDENTIALS_BODY_BYTES_MAX} bytes, or was cut off")))?
             .to_bytes();
         if status != 200 {
             // A refusal's own words, for the owner. Never a 200's body: it
             // holds values.
             let said = String::from_utf8_lossy(&bytes[..bytes.len().min(REFUSAL_BYTES_KEPT)]).into_owned();
-            return Err(format!("{host} answered {status}: {said}"));
+            let why = format!("{host} answered {status}: {said}");
+            return Err(if (400..500).contains(&status) { FetchError::Refused(why) } else { Unavailable(why) });
         }
         // serde_json's message can quote the value it choked on, so only
         // where it choked is kept.
-        serde_json::from_slice(&bytes).map_err(|e| format!("{host}'s answer is not credentials ({:?} at line {}, column {})", e.classify(), e.line(), e.column()))
+        serde_json::from_slice(&bytes).map_err(|e| Unavailable(format!("{host}'s answer is not credentials ({:?} at line {}, column {})", e.classify(), e.line(), e.column())))
     }
 }
 
@@ -96,7 +111,7 @@ impl Source for Https {
         Box::pin(async move {
             match tokio::time::timeout(FETCH_TIMEOUT, self.post(url, ask)).await {
                 Ok(answer) => answer,
-                Err(_) => Err(format!("no answer within {} s", FETCH_TIMEOUT.as_secs())),
+                Err(_) => Err(FetchError::Unavailable(format!("no answer within {} s", FETCH_TIMEOUT.as_secs()))),
             }
         })
     }
@@ -117,7 +132,7 @@ pub mod fake {
 
     #[derive(Default)]
     pub struct State {
-        pub answers: HashMap<String, Result<Vec<Credential>, String>>,
+        pub answers: HashMap<String, Result<Vec<Credential>, FetchError>>,
         pub asks: Vec<(String, CredentialsAsk)>,
     }
 
@@ -127,7 +142,7 @@ pub mod fake {
     pub const PUBKEY: &str = "5ca1ab1e00000000000000000000000000000000000000000000000000000000";
 
     impl FakeSource {
-        pub fn answer(&self, url: &str, answer: Result<Vec<Credential>, String>) {
+        pub fn answer(&self, url: &str, answer: Result<Vec<Credential>, FetchError>) {
             self.0.lock().unwrap().answers.insert(url.to_string(), answer);
         }
 
@@ -140,7 +155,7 @@ pub mod fake {
         fn fetch<'a>(&'a self, url: &'a str, ask: &'a CredentialsAsk) -> Fetch<'a> {
             let mut s = self.0.lock().unwrap();
             s.asks.push((url.to_string(), ask.clone()));
-            let answer = s.answers.get(url).cloned().unwrap_or_else(|| Err(format!("{url}: no answer set")));
+            let answer = s.answers.get(url).cloned().unwrap_or_else(|| Err(FetchError::Unavailable(format!("{url}: no answer set"))));
             Box::pin(async move { answer.map(|credentials| Credentials { credentials }) })
         }
 

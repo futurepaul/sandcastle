@@ -14,6 +14,7 @@ use sandcastle_proto::{ComputerSpec, Credential, Credentials, CredentialsAsk, Ob
 
 use crate::app::App;
 use crate::backups::Objects;
+use crate::credentials::FetchError;
 use crate::disks::{snapshot_name, Disks, SnapshotKind};
 use crate::engine::{machine_name, placeholder, Disk, Engine, Machine, VmState};
 use crate::store::{Computer, DesiredState};
@@ -297,15 +298,26 @@ async fn converge<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
     }
 }
 
+/// What a machine's swap holds once its source refuses: its credentials'
+/// names, hosts, and placeholders stay, and this goes out instead of each
+/// value, which the hosts refuse.
+pub const WITHDRAWN: &str = "withdrawn-by-its-source";
+
 /// `c`'s credentials from `spec`'s source, checked against the service's
 /// own variables; none without a source.
-async fn fetch_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec) -> Result<Vec<Credential>, Step> {
+async fn fetch_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec) -> Result<Vec<Credential>, FetchError> {
     let Some(url) = &spec.credentials_url else { return Ok(vec![]) };
-    let source = app.credentials.as_ref().ok_or_else(|| Step::Waiting("credentials: this node has no key to fetch them with".into()))?;
+    let source = app.credentials.as_ref().ok_or_else(|| FetchError::Unavailable("this node has no key to fetch them with".into()))?;
     let ask = CredentialsAsk { computer: c.name.clone(), id: c.id.clone(), node: app.config.node_name.clone(), owner: c.owner.clone() };
-    let answer: Credentials = source.fetch(url, &ask).await.map_err(|e| Step::Waiting(format!("credentials: {e}")))?;
-    answer.validate(&spec.service.env).map_err(|e| Step::Waiting(format!("credentials: {e}")))?;
+    let answer: Credentials = source.fetch(url, &ask).await?;
+    answer.validate(&spec.service.env).map_err(|e| FetchError::Unavailable(e.to_string()))?;
     Ok(answer.credentials)
+}
+
+impl From<FetchError> for Step {
+    fn from(e: FetchError) -> Step {
+        Step::Waiting(format!("credentials: {e}"))
+    }
 }
 
 /// Remembers what was handed to the engine, and when to fetch again.
@@ -375,6 +387,7 @@ async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
                 let credentials = fetch_credentials(app, c, spec).await?;
                 app.engine.rotate(&name, &credentials).await.map_err(|e| format!("handing over credentials: {e}"))?;
                 handed(app.config.credentials_every_s, &credentials, track);
+                eprintln!("supervisor: {}: credentials handed over again before relaunching its service", c.name);
             }
             launch(app, c, spec, track).await?;
             Ok(Observed::Starting)
@@ -388,7 +401,10 @@ async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
 /// placeholders stop the machine, and the next tick starts it with them,
 /// since the service reads its variables only when it starts. A failed fetch keeps
 /// what the machine holds and waits for the next slot: a platform that is
-/// down never takes a computer down. True when it stopped the machine.
+/// down never takes a computer down; a source that refuses (the owner may
+/// no longer spend them) has each value withdrawn, live: the swap sends
+/// `WITHDRAWN` instead until the source answers again. True when it
+/// stopped the machine.
 async fn scheduled_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> bool {
     if spec.credentials_url.is_none() || track.next_credentials_at.is_some_and(|t| Instant::now() < t) {
         return false;
@@ -396,8 +412,27 @@ async fn scheduled_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, 
     track.next_credentials_at = Some(Instant::now() + Duration::from_secs(app.config.credentials_every_s));
     let credentials = match fetch_credentials(app, c, spec).await {
         Ok(cr) => cr,
-        Err(Step::Failed(e) | Step::Waiting(e)) => {
-            eprintln!("supervisor: {}: {e}; keeping what it holds", c.name);
+        Err(FetchError::Unavailable(e)) => {
+            eprintln!("supervisor: {}: credentials: {e}; keeping what it holds", c.name);
+            return false;
+        }
+        Err(FetchError::Refused(e)) => {
+            let Some(before) = &track.credentials else { return false };
+            let dead: Vec<Credential> = before
+                .shape
+                .iter()
+                .map(|(name, hosts, seen)| Credential { name: name.clone(), value: WITHDRAWN.into(), hosts: hosts.clone(), placeholder: Some(seen.clone()) })
+                .collect();
+            if held(&dead).digest == before.digest {
+                return false;
+            }
+            match app.engine.rotate(&machine_name(&c.id), &dead).await {
+                Ok(()) => {
+                    eprintln!("supervisor: {}: credentials withdrawn, as its source refused them ({e})", c.name);
+                    handed(app.config.credentials_every_s, &dead, track);
+                }
+                Err(err) => eprintln!("supervisor: {}: withdrawing credentials its source refused: {err}", c.name),
+            }
             return false;
         }
     };

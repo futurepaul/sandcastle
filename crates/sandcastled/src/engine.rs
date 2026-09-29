@@ -318,20 +318,23 @@ impl Engine for Msb {
             args.push("--mount-disk".into());
             args.push(format!("{}:{}:format=raw,fstype=ext4", d.device.display(), d.mount));
         }
-        // Names, hosts, and placeholders go as a secret config on stdin
-        // (the `--secret` flag takes no placeholder); each value stays in
-        // msb's environment under its name, the config's default source.
-        let conf = secret_conf(&m.credentials);
-        if !m.credentials.is_empty() {
+        // Names, hosts, and placeholders go as a secret config file (the
+        // `--secret` flag takes no placeholder, and msb reads a config
+        // source more than once, so not stdin); each value stays in msb's
+        // environment under its name, the config's default source. The
+        // file holds no value, and goes when the create is done.
+        let conf = (!m.credentials.is_empty()).then(|| self.home.join(format!(".sandcastle-{}-secrets.json", m.name)));
+        if let Some(path) = &conf {
+            write_private(path, secret_conf(&m.credentials).as_bytes()).map_err(EngineError::Spawn)?;
             args.push("--secret-conf".into());
-            args.push("/dev/stdin".into());
+            args.push(path.display().to_string());
         }
         args.push(m.image.clone());
-        let out = self.run_with_stdin("msb create", &args, conf.as_bytes(), &m.credentials, CREATE_TIMEOUT).await?;
-        if out.code != Some(0) {
-            return Err(EngineError::Failed { what: "msb create".into(), code: out.code, stderr: out.stderr.trim().to_string() });
+        let made = self.run_ok_with("msb create", &args, &m.credentials, CREATE_TIMEOUT).await;
+        if let Some(path) = &conf {
+            let _ = std::fs::remove_file(path);
         }
-        Ok(())
+        made.map(|_| ())
     }
 
     async fn start(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
@@ -370,6 +373,15 @@ impl Engine for Msb {
 /// value in msb's environment, and where the value may go.
 fn secret_arg(c: &Credential) -> String {
     format!("{}@{}", c.name, c.hosts.join(","))
+}
+
+/// Writes `bytes` to a new file only this user can read, replacing any.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    f.write_all(bytes)
 }
 
 /// msb's secret config (`--secret-conf`), as JSON: per name, its hosts and

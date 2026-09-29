@@ -18,6 +18,7 @@ use sandcastle_proto::{ComputerSpec, ComputerView, Credential, GrantSpec, Observ
 use crate::app::{App, Config};
 use crate::backups::fake::FakeObjects;
 use crate::credentials::fake::FakeSource;
+use crate::credentials::FetchError;
 use crate::disks::fake::FakeDisks;
 use crate::engine::fake::Fake;
 use crate::store::Store;
@@ -923,7 +924,8 @@ async fn a_credential_source_must_be_listed() {
 
 /// Goal: a new value is swapped in live (no stop, no relaunch); new names
 /// restart the machine so the service reads its new variables; a source
-/// that fails keeps what the machine holds. Method: the fake source's
+/// that is down keeps what the machine holds, and one that refuses has it
+/// withdrawn, live, until it answers again. Method: the fake source's
 /// answer changes between ticks past the 1 s refetch interval.
 #[tokio::test]
 async fn credentials_rotate_live_and_a_new_shape_restarts() {
@@ -953,9 +955,27 @@ async fn credentials_rotate_live_and_a_new_shape_restarts() {
     assert_eq!(node.app.observed("hermes"), Observed::Serving);
 
     // the source fails: what the machine holds stays
-    node.source.answer(CREDS_URL, Err("platform.test answered 503".into()));
+    node.source.answer(CREDS_URL, Err(FetchError::Unavailable("platform.test answered 503".into())));
     node.after_credentials_interval().await;
     assert_eq!(node.app.observed("hermes"), Observed::Serving, "a platform that is down takes no computer down");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
+
+    // the source refuses (the owner's key was revoked): withdrawn, live
+    node.source.answer(CREDS_URL, Err(FetchError::Refused("platform.test answered 403: revoked".into())));
+    let before = node.engine.calls().len();
+    node.after_credentials_interval().await;
+    let after = node.engine.calls()[before..].to_vec();
+    assert!(after.iter().any(|c| c.starts_with("rotate")) && after.iter().all(|c| !c.starts_with("stop")), "{after:?}");
+    let held = node.machine_credentials();
+    assert_eq!(held.len(), 1);
+    assert_eq!((held[0].name.as_str(), held[0].value.as_str()), ("OPENROUTER_API_KEY", supervisor::WITHDRAWN), "the value no longer leaves");
+    assert_eq!(node.app.observed("hermes"), Observed::Serving, "the computer runs on, without it");
+    let before = node.engine.calls().len();
+    node.after_credentials_interval().await;
+    assert!(node.engine.calls()[before..].iter().all(|c| !c.starts_with("rotate")), "withdrawn once, not again and again");
+    // and the source answers again: restored, live
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V2)]));
+    node.after_credentials_interval().await;
     assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
 
     // a new name: the machine restarts with it, and the service sees it
@@ -990,7 +1010,7 @@ async fn a_source_that_fails_holds_a_rebase_back_without_rolling_back() {
     node.tick().await;
     assert_eq!(node.app.observed("hermes"), Observed::Serving);
 
-    node.source.answer(CREDS_URL, Err("platform.test answered 503: down".into()));
+    node.source.answer(CREDS_URL, Err(FetchError::Unavailable("platform.test answered 503: down".into())));
     let newer = with_source(spec());
     assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&newer)).await.0, StatusCode::OK);
     let before = node.engine.calls().len();
