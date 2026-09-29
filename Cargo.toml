@@ -4,7 +4,7 @@
 # already vetted where they overlap; new ones passed the two-week cooldown.
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/sandcastled", "crates/cli"]
+members = ["crates/proto", "crates/nip98", "crates/core", "crates/sandcastled", "crates/cli"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +13,7 @@ license = "MIT"
 [workspace.dependencies]
 sandcastle-proto = { path = "crates/proto" }
 sandcastle-nip98 = { path = "crates/nip98" }
+sandcastle-core = { path = "crates/core" }
 aes-gcm = "=0.10.3"
 base64 = "=0.22.1"
 clap = { version = "=4.6.6", features = ["derive", "env"] }
@@ -36,7 +37,13 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["rin
 url = "=2.5.8"
 webpki-roots = "=1.0.9"
 
+# The seatbelt stays on, and a failed assertion takes the whole node down
+# (systemd restarts it; its machines keep running), never one task of it
+# while the rest carries on.
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 strip = true
-# The seatbelt stays on: integer overflow panics in release as in debug.
 overflow-checks = true
+panic = "abort"

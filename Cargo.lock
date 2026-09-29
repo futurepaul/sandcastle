@@ -1130,6 +1130,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sandcastle-proto",
+ "sha2",
+]
+
+[[package]]
 name = "sandcastle-nip98"
 version = "0.1.0"
 dependencies = [
