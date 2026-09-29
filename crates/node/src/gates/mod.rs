@@ -8,6 +8,16 @@
 //! `system`; the simulator (`sandcastle-sim`) implements each over a
 //! simulated world.
 
+pub mod live;
+pub mod msb;
+pub mod probe;
+pub mod process;
+pub mod s3;
+pub mod source;
+pub mod system;
+pub mod tls;
+pub mod zfs;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;

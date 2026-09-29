@@ -329,22 +329,32 @@ pub fn validate_pubkey(pubkey: &str) -> Result<(), Invalid> {
     }
 }
 
+/// An absolute path below `/` of `[A-Za-z0-9/_.-]` with no `.` or `..`
+/// segment. No ':', ',', or '=': a disk's mount path is spliced into the
+/// engine's mount option (`device:path:options`).
+pub fn valid_abs_path(path: &str) -> bool {
+    path.len() <= PATH_BYTES_MAX
+        && path.starts_with('/')
+        && path != "/"
+        && path.split('/').all(|seg| seg != ".." && seg != ".")
+        && path.bytes().all(|c| c.is_ascii_alphanumeric() || b"/_.-".contains(&c))
+}
+
 fn validate_abs_path(path: &str, what: &str) -> Result<(), Invalid> {
-    if path.len() > PATH_BYTES_MAX {
-        return invalid(format!("{what} is at most {PATH_BYTES_MAX} bytes"));
-    }
-    if !path.starts_with('/') || path == "/" {
-        return invalid(format!("{what} is an absolute path below /"));
-    }
-    let clean = path.split('/').all(|seg| seg != ".." && seg != ".");
-    // No ':', ',', or '=': a disk's mount path is spliced into the engine's
-    // mount option (`device:path:options`).
-    let plain = path.bytes().all(|c| c.is_ascii_alphanumeric() || b"/_.-".contains(&c));
-    if clean && plain {
+    if valid_abs_path(path) {
         Ok(())
     } else {
-        invalid(format!("{what} is [A-Za-z0-9/_.-] with no '.' or '..' segments"))
+        invalid(format!("{what} is an absolute path below / of at most {PATH_BYTES_MAX} [A-Za-z0-9/_.-], with no '.' or '..' segments"))
     }
+}
+
+/// An image the engine reads as a registry reference: its last argument,
+/// so it starts with a letter or a digit and can never read as a flag.
+pub fn valid_image(image: &str) -> bool {
+    !image.is_empty()
+        && image.len() <= IMAGE_BYTES_MAX
+        && image.as_bytes()[0].is_ascii_alphanumeric()
+        && image.bytes().all(|c| c.is_ascii_alphanumeric() || b"./:-_@".contains(&c))
 }
 
 /// `https://` and at most `URL_BYTES_MAX` printable bytes; the node
@@ -440,13 +450,7 @@ impl Credentials {
 
 impl ComputerSpec {
     pub fn validate(&self) -> Result<(), Invalid> {
-        // It is the engine's last argument: starting with a letter or a
-        // digit, it can never read as a flag.
-        let image_ok = !self.image.is_empty()
-            && self.image.len() <= IMAGE_BYTES_MAX
-            && self.image.as_bytes()[0].is_ascii_alphanumeric()
-            && self.image.bytes().all(|c| c.is_ascii_alphanumeric() || b"./:-_@".contains(&c));
-        if !image_ok {
+        if !valid_image(&self.image) {
             return invalid(format!("an image is 1 to {IMAGE_BYTES_MAX} characters of [A-Za-z0-9./:-_@], starting with a letter or digit"));
         }
         if self.vcpus == 0 || self.vcpus > VCPUS_MAX {

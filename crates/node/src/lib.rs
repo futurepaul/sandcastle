@@ -8,5 +8,6 @@ pub mod commands;
 pub mod executor;
 pub mod gates;
 pub mod manifest;
+pub mod schedule;
 pub mod seal;
 pub mod store;
