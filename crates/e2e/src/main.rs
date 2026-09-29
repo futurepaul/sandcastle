@@ -10,10 +10,15 @@
 //! - `crash`: the daemon SIGKILLed mid-rebase; the node converges;
 //! - `backup`: a snapshot shipped, restored into a new computer, and a
 //!   restore with the daemon SIGKILLed mid-way;
+//! - `net`: from outside only 22 and 443 answer; from a guest, the host's
+//!   own addresses, metadata, and private ranges are refused and the
+//!   public internet is reached;
 //! - `hermes` (with `--hermes`): Hermes with credentials from
 //!   fragment.club, no token in the guest, a real model call through the
 //!   swap (a few cents);
-//! - `cleanup`: everything deleted, and nothing left on the host.
+//! - `cleanup`: everything deleted, and nothing left on the host;
+//! - `wiped` (with `--wipe-state`): the daemon stopped and its state set
+//!   aside, then a restore from the bucket's sealed manifest alone.
 //!
 //! Secrets (keys, the Hermes spec) are files read by path; nothing
 //! printed or written to the evidence holds one.
@@ -69,6 +74,13 @@ struct Args {
     /// Keep the computers at the end (no cleanup).
     #[arg(long)]
     keep: bool,
+    /// Also wipe the node's state (after the cleanup) and restore from the
+    /// bucket alone. The test node only.
+    #[arg(long)]
+    wipe_state: bool,
+    /// The node's state file, for `--wipe-state`.
+    #[arg(long, default_value = "/var/lib/sandcastle/sandcastle.db")]
+    state_file: String,
 }
 
 #[derive(Serialize)]
@@ -121,6 +133,9 @@ struct Web {
     name: String,
     id: String,
     marker: String,
+    /// A shipped snapshot holding `marker`, and the second marker in
+    /// `second`.
+    shipped: Option<(String, String)>,
 }
 
 type Step = Result<(), String>;
@@ -309,7 +324,7 @@ async fn life(r: &mut Run) -> Step {
     r.host.exec(&id, &format!("echo {marker} > /data/marker && sync")).await?;
     let served = r.marker_served(&name, "marker", &marker).await;
     r.ensure(S, "a marker written in the guest is read through the URL", served.is_ok(), served.err().unwrap_or_default())?;
-    r.web = Some(Web { name: name.clone(), id: id.clone(), marker: marker.clone() });
+    r.web = Some(Web { name: name.clone(), id: id.clone(), marker: marker.clone(), shipped: None });
 
     // A rebase: a new generation on the same disk.
     let before = r.host.machine(&id).await?.map(|m| m.created_at);
@@ -414,6 +429,9 @@ async fn backup(r: &mut Run) -> Step {
     }
     let snapshot = shipped.ok_or("no snapshot after the write was shipped in 300 s")?;
     r.record(S, "a snapshot after the write is shipped", true, format!("{snapshot} in {}", secs(start.elapsed())));
+    if let Some(w) = r.web.as_mut() {
+        w.shipped = Some((snapshot.clone(), second.clone()));
+    }
 
     let back = format!("e2e-{}-back", r.tag);
     let query = format!("?restore={}@{snapshot}", web.id);
@@ -440,6 +458,81 @@ async fn backup(r: &mut Run) -> Step {
     let (_, took) = r.serving(&crash, Duration::from_secs(300)).await?;
     let two = r.marker_served(&crash, "second", &second).await;
     r.ensure(S, "the restore finishes after the crash with the data", two.is_ok(), format!("{}{}", secs(took), two.err().map(|e| format!(": {e}")).unwrap_or_default()))
+}
+
+/// Whether TCP `port` on `host` accepts a connection within 3 s.
+async fn open(host: &str, port: u16) -> bool {
+    matches!(tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect((host, port))).await, Ok(Ok(_)))
+}
+
+async fn net(r: &mut Run) -> Step {
+    const S: &str = "net";
+    let web = r.web.clone().ok_or("the life section made no computer")?;
+    let ipv4 = r.args.ssh.rsplit('@').next().unwrap_or(&r.args.ssh).to_string();
+    let mut answered = Vec::new();
+    for port in [22u16, 80, 443, 2375, 5432, 8000, 8642, 9119, 19119, 20000, 20001, 20002] {
+        if open(&ipv4, port).await {
+            answered.push(port);
+        }
+    }
+    r.ensure(S, "from outside, only 22 and 443 answer", answered == [22, 443], format!("{answered:?}"))?;
+    let ipv6 = r.host.run("ip -6 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1").await?.trim().to_string();
+    let targets: Vec<(String, u16, bool)> = vec![
+        (ipv4.clone(), 22, false),
+        (ipv4.clone(), 443, false),
+        (ipv6.clone(), 22, false),
+        ("169.254.169.254".into(), 80, false),
+        ("10.0.0.1".into(), 80, false),
+        ("172.16.0.1".into(), 80, false),
+        ("192.168.0.1".into(), 80, false),
+        ("1.1.1.1".into(), 443, true),
+    ];
+    let list: Vec<String> = targets.iter().filter(|(h, _, _)| !h.is_empty()).map(|(h, p, _)| format!("(\\\"{h}\\\", {p})")).collect();
+    let probe = format!(
+        "python3 -c \"import socket\nfor h, p in [{}]:\n    s = socket.socket(socket.AF_INET6 if chr(58) in h else socket.AF_INET)\n    s.settimeout(3)\n    try:\n        s.connect((h, p)); print(h, p, chr(111)+chr(112)+chr(101)+chr(110))\n    except Exception as e:\n        print(h, p, type(e).__name__)\"",
+        list.join(", ")
+    );
+    let out = r.host.exec(&web.id, &probe).await?;
+    for (host, port, reachable) in &targets {
+        if host.is_empty() {
+            continue;
+        }
+        let line = out.lines().find(|l| l.starts_with(&format!("{host} {port} "))).unwrap_or("").to_string();
+        let is_open = line.ends_with(" open");
+        let what = if *reachable { format!("the guest reaches {host}:{port}") } else { format!("the guest is refused {host}:{port}") };
+        r.ensure(S, what, is_open == *reachable, line)?;
+    }
+    Ok(())
+}
+
+async fn wiped(r: &mut Run) -> Step {
+    const S: &str = "wiped";
+    let web = r.web.clone().ok_or("the life section made no computer")?;
+    let (snapshot, second) = web.shipped.clone().ok_or("the backup section shipped nothing")?;
+    let aside = format!("{}.before-e2e-{}", r.args.state_file, r.tag);
+    let state = r.args.state_file.clone();
+    r.host
+        .run(&format!("sudo systemctl stop sandcastled.service && for s in '' -wal -shm; do if [ -e {state}$s ]; then mv {state}$s {aside}$s; fi; done && sudo systemctl start sandcastled.service"))
+        .await?;
+    let took = r.back_up().await?;
+    r.record(S, "the node starts again with no state", true, format!("back in {}; the old state is {aside}", secs(took)));
+    let list = r.client.call(&r.grantor, "GET", &format!("/v1/grants/{}", r.alice.pubkey_hex()), None).await?;
+    r.ensure(S, "it knows no grant", list.status == 404, format!("{}", list.status))?;
+    let grant = json!({"computers_max": 6, "vcpus_max": 2, "memory_mib_max": 4096, "data_gib_max": 10});
+    let a = r.client.call(&r.grantor, "PUT", &format!("/v1/grants/{}", r.alice.pubkey_hex()), Some(&grant)).await?;
+    r.ensure(S, "the grantor grants again", a.status == 200, format!("{}", a.status))?;
+    let name = format!("e2e-{}-wiped", r.tag);
+    let (status, v) = r.put(&name, &web_spec("2", WEB_IMAGE), &format!("?restore={}@{snapshot}", web.id)).await?;
+    r.ensure(S, "a restore from the bucket's manifest alone is accepted", status == 201, format!("{status} {}", v["code"]))?;
+    let (_, took) = r.serving(&name, Duration::from_secs(300)).await?;
+    let one = r.marker_served(&name, "marker", &web.marker).await;
+    let two = r.marker_served(&name, "second", &second).await;
+    r.ensure(S, "it serves with the data", one.is_ok() && two.is_ok(), format!("{} {one:?} {two:?}", secs(took)))?;
+    let a = r.client.call(&r.alice, "DELETE", &format!("/v1/computers/{name}"), None).await?;
+    let gone = r.until(&name, Duration::from_secs(180), |s, _| s == 404).await;
+    r.ensure(S, "it is deleted", a.status == 202 && gone.is_ok(), gone.err().unwrap_or_default())?;
+    r.host.run(&format!("rm -f {aside} {aside}-wal {aside}-shm")).await?;
+    Ok(())
 }
 
 async fn hermes(r: &mut Run) -> Step {
@@ -521,6 +614,20 @@ async fn cleanup(r: &mut Run) -> Step {
     r.ensure(S, "no machine or disk of theirs is left on the host", left.is_empty(), format!("{left:?}"))?;
     let stray = r.host.stray_secret_configs().await?;
     r.ensure(S, "no secret config file is left", stray.is_empty(), format!("{stray:?}"))?;
+    // The test node runs only what this run made: anything else on it is
+    // a leak.
+    let mut known: Vec<String> = Vec::new();
+    for owner in [Owner::Alice, Owner::Hermes] {
+        if owner == Owner::Hermes && r.hermes_owner.is_none() {
+            continue;
+        }
+        let list = r.client.call(r.keys(owner), "GET", "/v1/computers", None).await?.json();
+        known.extend(list["computers"].as_array().into_iter().flatten().filter_map(|c| c["id"].as_str().map(str::to_string)));
+    }
+    let machines = r.host.machines().await?;
+    let volumes = r.host.volumes().await?;
+    let unknown: Vec<String> = machines.iter().map(|m| m.name.trim_start_matches("sc-").to_string()).chain(volumes).filter(|id| !known.contains(id)).collect();
+    r.ensure(S, "every machine and disk on the host has a row", unknown.is_empty(), format!("{unknown:?}"))?;
     if let Some(web) = r.web.clone() {
         let list = r.client.call(&r.alice, "GET", "/v1/backups", None).await?.json();
         let kept = list["backups"].as_array().into_iter().flatten().filter(|b| b["computer_id"] == web.id.as_str()).count();
@@ -547,12 +654,15 @@ async fn main() -> std::process::ExitCode {
         }
     }
     let wanted = |s: &str, r: &Run| r.args.only.is_empty() || r.args.only.iter().any(|o| o == s);
-    let mut sections: Vec<&str> = vec!["auth", "life", "crash", "backup"];
+    let mut sections: Vec<&str> = vec!["auth", "life", "crash", "backup", "net"];
     if r.args.hermes {
         sections.push("hermes");
     }
     if !r.args.keep {
         sections.push("cleanup");
+    }
+    if r.args.wipe_state && !r.args.keep {
+        sections.push("wiped");
     }
     for s in sections {
         if !wanted(s, &r) && s != "cleanup" {
@@ -563,7 +673,9 @@ async fn main() -> std::process::ExitCode {
             "life" => life(&mut r).await,
             "crash" => crash(&mut r).await,
             "backup" => backup(&mut r).await,
+            "net" => net(&mut r).await,
             "hermes" => hermes(&mut r).await,
+            "wiped" => wiped(&mut r).await,
             "cleanup" => cleanup(&mut r).await,
             _ => unreachable!(),
         };

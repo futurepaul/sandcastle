@@ -28,12 +28,20 @@ or what runs inside a computer:
 
 ## Layout
 
+The node is built to the engineering style's shape: a pure core, gates
+to the world, and a deterministic simulation of the whole node
+(`../docs/sandcastle-rewrite.md`).
+
 | Crate | What |
 |---|---|
 | `crates/proto` | The wire contract: `ComputerSpec`, `ComputerView`, `GrantSpec`, `Ticket`, `ApiError`, a credential source's `CredentialsAsk` and `Credentials`, and every limit, validated before anything is stored |
 | `crates/nip98` | NIP-98: verify (the node), sign (clients, the `sign` feature) |
-| `crates/sandcastled` | The node: the store (SQLite), the engine gate (`msb`), the supervisor, the API, the proxy, the router |
+| `crates/core` | The node's decisions as pure functions: each computer a state machine in its row; `plan` (what to do next), `apply` and `note` (the row after it), `learn` (what the batch now knows), and `check` (invariants and tripwires, on in release) |
+| `crates/node` | The machinery: the store (SQLite, typed columns), the API's mutations as commands (each in one transaction), the gates (`msb`, ZFS, S3, the credential source, the prober, the clock, randomness), the executor, the scheduler, the seal, the manifest |
+| `crates/sim` | A deterministic simulation: the real core, store, and executor against a simulated world with faults, crashes at every step, wedged guests, and hung machines; invariants after every action, convergence after settling |
+| `crates/sandcastled` | The daemon, a thin layer: `serve` (the config, the signed API, a computer's URL, the listener) and `reset` |
 | `crates/cli` | `sandcastle`: signs calls with a key file and prints the answer |
+| `crates/e2e` | `sandcastle-e2e`: the real engine end to end on a KVM host, with JSON evidence |
 
 ## The API
 
@@ -113,9 +121,10 @@ without ever holding one:
    A platform that is down keeps what a machine holds, and holds a new
    generation back without stopping the old one or rolling back. A
    platform that **refuses** (a 4xx: the owner's key revoked, say) has the
-   values withdrawn, live, until it answers again. After a daemon
-   restart, a service relaunched on a running machine gets its credentials
-   handed over again first.
+   values withdrawn, live, until it answers again. The row records what
+   each machine holds as its shape and a digest, never a value, so a
+   restarted daemon knows without asking; the values themselves live in
+   the machine's msb process.
 
 A value lives in the node's memory for one engine call, and in msb's
 host process for the machine's life. It never reaches the store, a view,
@@ -138,43 +147,52 @@ Limits:
 
 ## What happens
 
-The API records what callers want. The supervisor converges the engine to
-it every 2 s, from the node's own state:
+The API records what callers want, in one transaction per call. The node
+converges to it at its own pace: every 2 s the scheduler lists the
+engine's machines once and runs a batch for each computer, at most 32 at
+once and never two for one computer, so an hours-long upload of one
+never holds another. A batch is up to 16 steps, each three calls the
+simulator can crash between: plan (read the row, ask the core), perform
+the effect through its gate within its deadline (or observe), and record
+the outcome against the row as it is now. Backoff, the snapshot
+schedule, what is owed, and every open upload are columns in the row, so
+a restart resumes rather than starts over.
 
 - **Create.** An idle microVM is made from the image, with the service port published on `127.0.0.1` only. For `data` storage it gets the computer's durable disk, a ZFS volume the node made and owns (not the engine's). Then the service is launched.
-- **Snapshots** of the durable disk are taken only when something was written since the last one:
-  - every `--snapshot-every-s` (300 s by default) while serving, after the guest syncs;
-  - after the clean stop before a rebase;
-  - after a stop.
+- **Snapshots** (`sc-<n>-<auto|stop|rebase>`, numbered in the row) of the durable disk are taken only when something was written since the last one:
+  - every `--snapshot-every-s` (300 s by default) while serving, after the guest syncs (a sync that fails is logged and the snapshot taken anyway: crash-consistent, which SQLite in WAL mode recovers from);
+  - after a stop: owed in the row before the stop, so a crash between the two still takes it;
+  - before a machine is replaced (a rebase, or a crashed machine): from what the disk shows, so nothing written is ever replaced unsnapshotted.
 
-  They are crash-consistent: a write the guest fsynced is in a snapshot taken at once, as proven on the test node after the ext4 journal replay. The node keeps the newest `--snapshots-kept` (24 by default), plus the last one shipped.
+  The node keeps the newest `--snapshots-kept` (24 by default), plus the last one shipped.
 - **Serving** means the service answered its health path through that port. It is not the engine's say-so.
-- **Update.** When the image or service changes (a new *generation*), the node:
-  1. stops the service gracefully,
-  2. syncs the guest,
-  3. stops the machine cleanly,
-  4. recreates it on the same disk,
+- **Update.** When the image or service changes (a new *generation*), the node fetches its credentials first (a source that is down leaves the old machine serving), then:
+  1. stops the service gracefully and syncs the guest,
+  2. stops the machine,
+  3. snapshots the disk,
+  4. recreates the machine on the same disk,
   5. relaunches the service.
-- **Rollback.** A new generation that fails (its create or launch errs, or its service does not answer within `--startup-grace-s`, 120 s by default) is marked failed. The node goes back to the last spec that served, keeping the data (never rewound). A view's `rollback` field names the failed and running images and the reason. `start` retries it, and a new spec replaces it. The good spec failing is an ordinary failure, so the node never flips between the two.
-- **Daemon restart.** A restarted daemon re-adopts running machines without relaunching anything. The launch script refuses to start a second copy.
-- **Failures** back off: five in a row, then 60 s alone.
+- **Rollback.** A new generation is rolled back only for its own fault: the engine refusing to make or launch it (no such image, a bad argv), or its service not answering within `--startup-grace-s` (120 s by default). The node goes back to the last generation that served, keeping the data (never rewound). A view's `rollback` names the failed and running images and the reason; `start` retries it, and a new spec replaces it. An engine that timed out or could not run is the node's fault: a backoff, never a rollback.
+- **Failures** back off in the row: 2 s, doubling to 60 s.
+- **Nothing waits forever.** A guest that will not quiesce is stopped with its machine after one failed try; a machine that will not power off is killed (`msb stop -f`) after one failed stop; a guest that will not take a launch is restarted. The simulator's wedged guests and hung machines hold every one of these.
+- **Daemon restart.** A restarted daemon picks running machines up where they are, without relaunching anything; the launch script refuses to start a second copy. A daemon that crashes (the store failing, an assertion) is restarted by systemd; its machines keep running.
 
 The router is the node's one listener: TLS on 443, then by Host.
 
 - **`api.<domain>`** is the API.
 - **`<name>.<domain>`** is a computer. For `url_auth: owner`, the router admits only a browser holding its `__Host-sandcastle` session:
   - That session comes from redeeming a ticket, once.
-  - The cookie is stripped before the service sees the request.
+  - The cookie is stripped before the service sees the request, as is anything a client claims about where it came from (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`).
   - The service's own login (Hermes') is the second gate.
-- WebSockets pass through.
+- WebSockets pass through; each holds a connection slot of its own, for at most a day.
 
 ## Backups
 
-With `--backup-bucket`, a shipper sends each computer's snapshots off the host, oldest first, one per computer every 10 s:
+With `--backup-bucket`, each computer's batch ships its snapshots off the host, oldest first, as duties after its lifecycle (so a prune never races a ship):
 
 - **Streams.** The first is a whole `zfs send -c`, then incrementals from the last one shipped. After 48 incrementals, or when the last shipped snapshot was pruned, the next goes whole again.
 - **Sealing.** Every object is sealed before it leaves (`seal.rs`): AES-256-GCM in 1 MiB chunks with the STREAM construction, and a per-object key from HKDF of the node's backup key, bound to the object's path. The bucket can neither read an object, nor alter it, reorder it, truncate it, or swap it for another without the restore failing.
-- **Layout.** Objects are uploaded in parts (`--backup-part-mib`, 16) under `nodes/<node>/computers/<computer id>/`.
+- **Layout.** Objects are uploaded in parts (`--backup-part-mib`, 16) under `nodes/<node>/computers/<computer id>/`. An open upload is a column in the row: after a crash it is finished from part 1, or aborted, never dropped.
 - **Manifest.** Each computer has a sealed manifest there, naming its owner and its chain. So a node that lost its state still authorizes and replays a restore from the bucket alone.
 - **The key.** It is a file (`--backup-key-file`, 64 hex). **The operator keeps a copy apart from the node**: without it, no backup opens.
 - **Credentials.** The bucket's key (`--backup-credentials`, an env file) should reach that bucket alone.
@@ -186,7 +204,9 @@ A restore (`?restore=` on create):
 3. It replays the chain into the new computer's empty disk, each object opened as it streams and fed to `zfs receive`.
 4. Only then does it boot the machine.
 
-A restore cut short leaves no partial disk behind.
+A restore cut short resumes: a disk holding a prefix of the chain gets
+the rest, and anything else is destroyed and replayed from the start. It
+is done only when the target snapshot is on the disk.
 
 ## Running a node
 
@@ -221,7 +241,7 @@ After=network-online.target sandcastled.socket
 User=ubuntu
 SupplementaryGroups=kvm
 Environment=HOME=/home/ubuntu
-ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled --state-dir /var/lib/sandcastle \
+ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled serve --state-dir /var/lib/sandcastle \
   --domain sandcastle.fragment.club --tls-cert /etc/sandcastle/le-cert.pem --tls-key /etc/sandcastle/le-key.pem \
   --grantor <hex> --msb /home/ubuntu/.local/bin/msb --msb-home /home/ubuntu \
   --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64> --zfs-parent tank/sandcastle \
@@ -236,6 +256,13 @@ Restart=on-failure
 ```
 
 **`KillMode=process`:** stopping the daemon never stops a computer.
+
+**Starting over** (a test node): `sandcastled reset` takes the same
+`--state-dir`, `--msb`, `--msb-home`, `--zfs-parent`, `--node-name`, and
+bucket flags, and `--confirm <node name>`. It kills and removes the
+node's machines, aborts the uploads its state names, deletes its objects
+under `nodes/<node>/`, destroys its disks, and removes its state. Stop the
+daemon first. Run twice, it is the same as once.
 
 **No capabilities, deliberately.** An earlier unit gave the daemon
 `CAP_NET_BIND_SERVICE`. Every VM process inherited it, and Linux then
@@ -288,33 +315,46 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 62 tests.
+`cargo test --workspace --all-features`: 87 tests, in CI (the
+`sandcastle` job).
 
-The node's tests run the real router, TLS, HTTP, store, and supervisor
-against a fake engine whose services are live sockets. They cover:
+- **The core** (`crates/core/tests/paths.rs`): each path a computer
+  takes, step by step: create, serve, rebase, rollback (and never for a
+  node fault), stop and start, delete in order, restore (resumed after a
+  crash), snapshots owed across a crash, shipping and pruning, credentials
+  (rotate, withdraw, a new shape), and the liveness rules (a wedged
+  guest, a hung machine, a restart through its own failures).
+- **The node** (`crates/node`): the store's schema and caps, every
+  command valid, invalid, and replayed, and a restart that reads back
+  every field and no value; the seal, SigV4, the manifest; the gates'
+  parsing and bounds (msb's list, arguments that hold no owner syntax, a
+  credential only in msb's environment, ZFS listings read whole or
+  refused, a program's output past its cap refused).
+- **The simulator** (`crates/sim/tests/seeds.rs`): 64 seeds by default
+  (`SANDCASTLE_SIM_SEEDS=n` runs more; `SANDCASTLE_SIM_SEED=s` replays
+  one, and a failing seed prints its last gate calls), each 400 actions
+  (owners' commands, steps, crashes after an effect or between steps,
+  gate faults and lost replies, guest writes, wedges, hangs, crashed
+  machines, the credential source's moods, time), invariants after every
+  one, then convergence. 1024 seeds pass. It found five defects the
+  hand-written tests had not (`../docs/sandcastle-rewrite.md`).
+- **The daemon** (`crates/sandcastled`): the router over real TLS on the
+  simulator's world: auth (valid, invalid, replay), a computer's whole
+  life through the proxy and a tunnel, a restore through the API, and a
+  restart that keeps state, sessions, and the replay cache.
+- **The real engine** (`crates/e2e`, by hand: it needs the KVM host):
 
-- valid, invalid, and replayed calls;
-- idempotent create, conflicts, and ownership;
-- a whole life, from create to delete, including a ticket, the cookie
-  strip, an upgrade, a rebase, and stop/start;
-- rollback, and backoff when there is nothing to roll back to;
-- the snapshot schedule: skipped unless written, the guest synced first,
-  pruned, owner-only;
-- `pending` across a rebase and a stop;
-- backups shipped sealed, whole then incremental, in parts, and restored
-  into a new computer after the original is deleted; a tampered object
-  refused with no partial disk left; the shipped base kept from pruning;
-- the seal (every size, tampering, truncation, reordering, a wrong key or
-  path) and SigV4 against AWS's own worked example;
-- a restart that re-adopts;
-- credentials: a value reaches the engine and nothing else (the guest's
-  env holds the placeholder; the store's bytes, a view, and a debug print
-  hold no value); only listed origins; a live swap of a new value; a
-  restart for new names; a source that is down keeps, one that refuses
-  withdraws, and a good answer restores; a rebase held back without a
-  rollback; a hand-over before a relaunch after a daemon restart; the
-  value in msb's environment, never its arguments.
+  ```sh
+  cargo run --release -p sandcastle-e2e -- \
+    --keys-dir ~/.config/finite-next/secrets/sandcastle-test \
+    --evidence target/e2e/sandcastle-e2e.json \
+    [--hermes --hermes-owner-key ~/.config/finite-next/secrets/fragment-club-e2e-key]
+  ```
 
-The real engine is proven by hand on `finite-lat-6`
-(`../docs/sandbox.md`: Phases 1 and 2 on the real engine, and Phase 4).
-That is not yet a Rust e2e: see the debt ledger.
+  Sections `auth`, `life`, `crash`, `backup`, `hermes`, `cleanup`
+  (`--only` picks some): 62 checks in about 100 s on `finite-lat-6`,
+  among them the daemon SIGKILLed mid-rebase and mid-restore by a watcher
+  on the host, and a model call from a Hermes guest through the swap with
+  the computer's own token (a few cents). It reaches a computer the
+  node's certificate does not name with the API's TLS name and the
+  computer's Host header.

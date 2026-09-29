@@ -32,8 +32,11 @@ pub const TICKETS_PER_COMPUTER_MAX: u32 = 32;
 pub const SESSIONS_PER_COMPUTER_MAX: u32 = 64;
 /// A page of an owner's backups.
 pub const BACKUPS_PAGE_MAX: u32 = 1_000;
-/// Backups one computer's manifest carries (the debt ledger records that
-/// backups never expire; this bounds a manifest meanwhile).
+/// Backups one computer's manifest carries: its newest, so every recent
+/// chain restores (about a year of 5-minute snapshots; the debt ledger
+/// records that backups never expire, and this bounds a manifest
+/// meanwhile). Recording a backup never fails on the count: a node that
+/// could not record what it shipped would stop.
 pub const BACKUPS_PER_COMPUTER_MAX: u32 = 100_000;
 
 const _: () = assert!(SEEN_PER_SIGNER_MAX < SEEN_EVENTS_MAX);
@@ -413,9 +416,12 @@ impl Store {
 
     // Backups ----------------------------------------------------------
 
-    /// A computer's backups, oldest first: what its manifest lists.
+    /// A computer's newest `BACKUPS_PER_COMPUTER_MAX` backups, oldest
+    /// first: what its manifest lists.
     pub fn backups_of_computer(&self, id: ComputerId) -> Result<Vec<Backup>, StoreError> {
-        self.select_backups("WHERE computer_id = ?1 ORDER BY snapshot_seq", &id.hex(), BACKUPS_PER_COMPUTER_MAX)
+        let mut newest = self.select_backups("WHERE computer_id = ?1 ORDER BY snapshot_seq DESC", &id.hex(), BACKUPS_PER_COMPUTER_MAX)?;
+        newest.reverse();
+        Ok(newest)
     }
 
     /// An owner's backups, newest first, a page at a time.
@@ -854,10 +860,6 @@ fn write_chain(tx: &Transaction<'_>, c: &Computer) -> Result<(), StoreError> {
 }
 
 fn insert_backup(tx: &Transaction<'_>, c: &Computer, s: &Shipped) -> Result<(), StoreError> {
-    let count: u32 = tx.query_row("SELECT count(*) FROM backups WHERE computer_id = ?1", params![c.id.hex()], |r| r.get(0))?;
-    if count >= BACKUPS_PER_COMPUTER_MAX {
-        return Err(StoreError::Full("backups of this computer"));
-    }
     let (seq, kind) = opt_seq(Some(s.snapshot));
     let (base_seq, base_kind) = opt_seq(s.base);
     tx.execute(
@@ -1007,4 +1009,63 @@ pub(crate) fn read_grant(conn: &Connection, pubkey: &str) -> Result<Option<(Gran
         )
         .optional()?;
     Ok(row.map(|(computers_max, vcpus_max, memory_mib_max, data_gib_max, by)| (GrantSpec { computers_max, vcpus_max, memory_mib_max, data_gib_max }, by)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sandcastle_core::model::SnapshotKind;
+    use sandcastle_core::step::{Change, Shipped};
+
+    /// Goal: a computer past `BACKUPS_PER_COMPUTER_MAX` backups still
+    /// records what it ships (the node would stop if it could not), and its
+    /// manifest lists the newest (audit defect 2: the old node froze on the
+    /// oldest 10,000).
+    #[test]
+    fn a_computer_past_its_manifest_cap_keeps_shipping() {
+        let store = Store::in_memory().unwrap();
+        let owner = "aa".repeat(32);
+        let grant = sandcastle_proto::GrantSpec { computers_max: 1, vcpus_max: 2, memory_mib_max: 4096, data_gib_max: 10 };
+        crate::commands::put_grant(&store, &["ff".repeat(32)], &"ff".repeat(32), &owner, grant, 1).unwrap();
+        let spec = sandcastle_proto::ComputerSpec {
+            image: "img:1".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            storage: sandcastle_proto::Storage::Data,
+            data_gib: 1,
+            data_path: "/data".into(),
+            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], port: 8000, health_path: "/".into(), env: Default::default() },
+            url_auth: sandcastle_proto::UrlAuth::Public,
+            credentials_url: None,
+        };
+        let id = ComputerId::from_bytes([7; 8]);
+        crate::commands::put_computer(&store, &owner, "busy", &spec, None, id, 20_000..20_001, 1).unwrap();
+        let n = u64::from(BACKUPS_PER_COMPUTER_MAX);
+        {
+            let mut conn = store.conn();
+            let tx = conn.transaction().unwrap();
+            for seq in 1..=n {
+                tx.execute(
+                    "INSERT INTO backups (object_key, computer_id, computer_name, owner, snapshot_seq, snapshot_kind, base_seq, base_kind, data_gib, data_path, bytes, shipped_at)
+                     VALUES (?1, ?2, 'busy', ?3, ?4, 'auto', NULL, NULL, 1, '/data', 10, ?4)",
+                    params![format!("k/{seq}"), id.hex(), owner, i64::try_from(seq).unwrap()],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let next = SnapshotName::new(n + 1, SnapshotKind::Auto);
+        let recorded = store.record(id, 2, |cur| {
+            let mut row = cur.clone();
+            row.snapshot_seq = n + 2;
+            row.ship.head = Some(next);
+            row.ship.manifest_due = true;
+            Change { row: Some(row), shipped: Some(Shipped { key: format!("k/{}", n + 1), snapshot: next, base: None, bytes: 10, shipped_at: 2 }) }
+        });
+        assert!(recorded.is_ok(), "{recorded:?}");
+        let listed = store.backups_of_computer(id).unwrap();
+        assert_eq!(listed.len(), BACKUPS_PER_COMPUTER_MAX as usize);
+        assert_eq!(listed.last().map(|b| b.snapshot), Some(next), "the newest is in the manifest");
+        assert_eq!(listed.first().map(|b| b.snapshot.seq), Some(2), "the oldest gives way, oldest first");
+    }
 }
