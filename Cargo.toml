@@ -44,6 +44,20 @@ webpki-roots = "=1.0.9"
 [profile.dev]
 panic = "abort"
 
+# The simulator's seeds are mostly SQLite and the core: optimized, a
+# debug run of the default seeds takes seconds, not minutes.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.sandcastle-core]
+opt-level = 2
+
+[profile.dev.package.sandcastle-node]
+opt-level = 2
+
+[profile.dev.package.sandcastle-sim]
+opt-level = 2
+
 [profile.release]
 strip = true
 overflow-checks = true

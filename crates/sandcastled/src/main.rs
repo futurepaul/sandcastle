@@ -1,120 +1,88 @@
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use sandcastled::app::{App, Config};
-use sandcastled::credentials::Https;
-use sandcastled::disks::Zfs;
-use sandcastled::s3::{Bucket, Credentials};
-use sandcastled::seal::BackupKey;
-use sandcastled::engine::Msb;
-use sandcastled::store::Store;
+use sandcastled::config::{Command, Serve};
+use sandcastled::daemon::Daemon;
+use sandcastle_node::executor::Node;
+use sandcastle_node::gates::live::Live;
+use sandcastle_node::gates::msb::Msb;
+use sandcastle_node::gates::probe::TcpProber;
+use sandcastle_node::gates::s3::{Bucket, Credentials};
+use sandcastle_node::gates::source::Https;
+use sandcastle_node::gates::system::{OsRandom, SystemClock};
+use sandcastle_node::gates::zfs::Zfs;
+use sandcastle_node::seal::BackupKey;
+use sandcastle_node::store::Store;
 
-#[tokio::main]
-async fn main() {
-    let config = Config::parse();
-    if let Err(e) = config.check() {
-        eprintln!("sandcastled: {e}");
-        std::process::exit(2);
-    }
-    if let Err(e) = std::fs::create_dir_all(&config.state_dir) {
-        eprintln!("sandcastled: {}: {e}", config.state_dir.display());
-        std::process::exit(1);
-    }
-    let store = match Store::open(&config.state_dir.join("sandcastle.db")) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sandcastled: opening the state: {e}");
-            std::process::exit(1);
-        }
+fn main() -> ExitCode {
+    let command = Command::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a tokio runtime builds");
+    let result = match command {
+        Command::Serve(s) => runtime.block_on(serve(*s)),
+        Command::Reset(r) => runtime.block_on(sandcastled::reset::run(&r)),
     };
-    let engine = Msb { program: config.msb.clone(), home: config.msb_home.clone(), guest_deny: config.guest_deny.clone() };
-    if let Err(e) = engine.check_version(&config.msb_version).await {
-        eprintln!("sandcastled: {e}");
-        std::process::exit(1);
-    }
-    let disks = Zfs { parent: config.zfs_parent.clone(), home: config.msb_home.clone() };
-    // The parent must exist and be ours to use; a listing proves both.
-    if let Err(e) = disks.check_parent().await {
-        eprintln!("sandcastled: --zfs-parent {}: {e}", config.zfs_parent);
-        std::process::exit(1);
-    }
-    let tls = match sandcastled::router::tls_acceptor(&config.tls_cert, &config.tls_key) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("sandcastled: TLS: {e}");
-            std::process::exit(1);
-        }
-    };
-    let (listener, from) = match activated_listener() {
-        Ok(Some(std_listener)) => match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => (l, "a socket from systemd".to_string()),
-            Err(e) => {
-                eprintln!("sandcastled: the socket from systemd: {e}");
-                std::process::exit(1);
-            }
-        },
-        Ok(None) => match tokio::net::TcpListener::bind(config.listen).await {
-            Ok(l) => (l, config.listen.to_string()),
-            Err(e) => {
-                eprintln!("sandcastled: listening on {}: {e}", config.listen);
-                std::process::exit(1);
-            }
-        },
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sandcastled: {e}");
-            std::process::exit(2);
+            ExitCode::FAILURE
         }
-    };
-    eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
-    let backups = match &config.backup_bucket {
-        None => None,
-        Some(name) => {
-            let creds_path = config.backup_credentials.as_ref().expect("checked by Config::check");
-            let key_path = config.backup_key_file.as_ref().expect("checked by Config::check");
-            let creds = Credentials::from_env_file(creds_path).unwrap_or_else(|e| {
-                eprintln!("sandcastled: {e}");
-                std::process::exit(1);
-            });
-            let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| {
-                eprintln!("sandcastled: {}: {e}", key_path.display());
-                std::process::exit(1);
-            });
-            let key = BackupKey::from_hex(&key_hex).unwrap_or_else(|| {
-                eprintln!("sandcastled: {}: not 64 hex characters", key_path.display());
-                std::process::exit(1);
-            });
-            let bucket = Bucket::new(&config.backup_endpoint, &config.backup_region, name, creds).unwrap_or_else(|e| {
-                eprintln!("sandcastled: {e}");
-                std::process::exit(2);
-            });
-            Some((bucket, key))
-        }
-    };
-    let node_key = config.node_key_file.as_ref().map(|path| {
-        let hex = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            eprintln!("sandcastled: {}: {e}", path.display());
-            std::process::exit(1);
-        });
-        sandcastle_nip98::Keys::from_secret_hex(&hex).unwrap_or_else(|| {
-            eprintln!("sandcastled: {}: not a 64-hex secret key", path.display());
-            std::process::exit(1);
-        })
-    });
-    let mut app = App::new(config, store, engine, disks, backups);
-    if let Some(keys) = node_key {
-        eprintln!("sandcastled: the node's key is {}; credentials only from {:?}", keys.pubkey_hex(), app.config.credentials_origins);
-        app = app.with_credentials(Box::new(Https::new(keys)));
     }
-    let app = Arc::new(app);
-    tokio::spawn(sandcastled::supervisor::run(app.clone()));
-    tokio::spawn(sandcastled::backups::run(app.clone()));
-    // Computers keep running when the daemon stops: a restart re-adopts
-    // them from the store (the supervisor's first tick).
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler installs");
+}
+
+async fn serve(config: Serve) -> Result<(), String> {
+    config.check()?;
+    std::fs::create_dir_all(&config.state_dir).map_err(|e| format!("{}: {e}", config.state_dir.display()))?;
+    let store = Store::open(&config.state_dir.join(sandcastled::reset::STATE_FILE)).map_err(|e| format!("opening the state: {e}"))?;
+    let engine = Msb::new(config.engine.msb.clone(), config.engine.msb_home.clone(), config.guest_deny.clone());
+    engine.check_version().await.map_err(|f| f.detail)?;
+    let disks = Zfs::new(config.engine.zfs_parent.clone(), config.engine.msb_home.clone());
+    // The parent must exist and be ours to use; a listing proves both.
+    disks.check_parent().await.map_err(|f| format!("--zfs-parent {}: {}", config.engine.zfs_parent, f.detail))?;
+    let tls = sandcastled::router::tls_acceptor(&config.tls_cert, &config.tls_key).map_err(|e| format!("TLS: {e}"))?;
+    let (listener, from) = match activated_listener()? {
+        Some(l) => (tokio::net::TcpListener::from_std(l).map_err(|e| format!("the socket from systemd: {e}"))?, "a socket from systemd".to_string()),
+        None => (tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("listening on {}: {e}", config.listen))?, config.listen.to_string()),
+    };
+    let (objects, backup_key) = match &config.bucket.backup_bucket {
+        None => (None, None),
+        Some(name) => {
+            let creds = Credentials::from_env_file(config.bucket.backup_credentials.as_ref().expect("checked"))?;
+            let key_path = config.bucket.backup_key_file.as_ref().expect("checked");
+            let hex = std::fs::read_to_string(key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+            let key = BackupKey::from_hex(hex.trim()).ok_or_else(|| format!("{}: not 64 hex characters", key_path.display()))?;
+            (Some(Bucket::new(&config.bucket.backup_endpoint, &config.bucket.backup_region, name, creds)?), Some(key))
+        }
+    };
+    let source = match &config.node_key_file {
+        None => None,
+        Some(path) => {
+            let hex = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let keys = sandcastle_nip98::Keys::from_secret_hex(hex.trim()).ok_or_else(|| format!("{}: not a 64-hex secret key", path.display()))?;
+            eprintln!("sandcastled: the node's key is {}; credentials only from {:?}", keys.pubkey_hex(), config.credentials_origins);
+            Some(Https::new(keys, config.credentials_origins.clone()))
+        }
+    };
+    let world = Live { engine, disks, objects, source, prober: TcpProber, clock: SystemClock, random: OsRandom };
+    let part_bytes = usize::try_from(config.backup_part_mib).expect("checked") * 1024 * 1024;
+    let node = Arc::new(Node::new(store, world, config.policy(), backup_key, part_bytes));
+    eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
+    let daemon = Arc::new(Daemon::new(config, node.clone()));
+    // Computers keep running when the daemon stops: a restart picks them
+    // up from the store and the engine's listing.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| format!("a SIGTERM handler: {e}"))?;
     tokio::select! {
-        _ = sandcastled::router::serve(app, listener, tls) => {}
-        _ = tokio::signal::ctrl_c() => eprintln!("sandcastled: interrupted; computers keep running"),
-        _ = term.recv() => eprintln!("sandcastled: stopping; computers keep running"),
+        () = sandcastle_node::schedule::run(node) => unreachable!("the schedule runs until the process ends"),
+        e = sandcastled::router::serve(daemon, listener, tls) => Err(format!("the listener failed: {e}")),
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("sandcastled: interrupted; computers keep running");
+            Ok(())
+        }
+        _ = term.recv() => {
+            eprintln!("sandcastled: stopping; computers keep running");
+            Ok(())
+        }
     }
 }
 

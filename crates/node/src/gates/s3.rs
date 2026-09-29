@@ -245,6 +245,49 @@ impl Bucket {
     }
 }
 
+/// Pages of a listing read at most: a million keys.
+const LIST_PAGES_MAX: u32 = 1000;
+
+/// Calls only an operator's reset makes; the executor never lists or
+/// deletes.
+impl Bucket {
+    /// Every key under `prefix`, a page at a time.
+    pub async fn list(&self, prefix: &str) -> GateResult<Vec<String>> {
+        assert!(!prefix.is_empty(), "a listing is of a prefix, never the bucket");
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..LIST_PAGES_MAX {
+            let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix)];
+            if let Some(t) = &token {
+                query.push(("continuation-token", t));
+            }
+            let (_, body) = self.expect_ok("GET", "", &query, Bytes::new()).await?;
+            let text = std::str::from_utf8(&body).map_err(|_| fault(GateError::BadOutput, "a listing that is not UTF-8"))?;
+            for key in xml_values(text, "Key") {
+                if !key.starts_with(prefix) {
+                    return Err(fault(GateError::BadOutput, "a listing with a key outside its prefix"));
+                }
+                keys.push(key);
+            }
+            match (xml_value(text, "IsTruncated").as_deref(), xml_value(text, "NextContinuationToken")) {
+                (Some("true"), Some(next)) => token = Some(next),
+                (Some("true"), None) => return Err(fault(GateError::BadOutput, "a truncated listing with no continuation")),
+                _ => return Ok(keys),
+            }
+        }
+        Err(fault(GateError::BadOutput, format!("a listing over {LIST_PAGES_MAX} pages")))
+    }
+
+    /// Deletes an object; a missing one is deleted already.
+    pub async fn delete(&self, key: &str) -> GateResult<()> {
+        assert!(!key.is_empty());
+        match self.expect_ok("DELETE", key, &[], Bytes::new()).await {
+            Err(f) if f.error == GateError::Missing => Ok(()),
+            other => other.map(|_| ()),
+        }
+    }
+}
+
 /// An object's body as it arrives, each piece within its deadline.
 pub struct S3Body(hyper::body::Incoming);
 
@@ -329,6 +372,22 @@ fn xml_value(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+/// The text of every `<tag>…</tag>`, in order.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    // Bounded: each pass consumes the text through one closing tag.
+    while let Some(i) = rest.find(&open) {
+        let start = i + open.len();
+        let Some(len) = rest[start..].find(&close) else { break };
+        out.push(rest[start..start + len].to_string());
+        rest = &rest[start + len + close.len()..];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +395,14 @@ mod tests {
     /// Goal: our SigV4 agrees with AWS's own worked example ("Example: GET
     /// Object", Authenticating Requests: Using the Authorization Header,
     /// Amazon S3 API reference). Method: its inputs, its signature.
+    #[test]
+    fn listings_read_every_key() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>nodes/a/1</Key></Contents><Contents><Key>nodes/a/2</Key></Contents><NextContinuationToken>t</NextContinuationToken></ListBucketResult>";
+        assert_eq!(xml_values(xml, "Key"), ["nodes/a/1", "nodes/a/2"]);
+        assert_eq!(xml_value(xml, "NextContinuationToken").as_deref(), Some("t"));
+        assert!(xml_values("<a>", "Key").is_empty());
+    }
+
     #[test]
     fn signs_the_aws_worked_example() {
         let creds = Credentials { access_key_id: "AKIAIOSFODNN7EXAMPLE".into(), secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into() };

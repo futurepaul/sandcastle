@@ -1,21 +1,16 @@
 //! sandcastled: one node of sandcastle, the self-hosted computer service
-//! (docs/sandbox.md in fragment-next). A computer is a microVM made from an
-//! OCI image, with a durable disk, one service, and one URL. Principals are
-//! nostr keys; every API call is NIP-98 signed.
+//! (docs/sandbox.md in fragment-next). A thin layer over `sandcastle-node`:
+//! the configuration, the signed API, a computer's URL, the one listener,
+//! and the reset. Principals are nostr keys; every API call is NIP-98
+//! signed.
 
 pub mod api;
-pub mod app;
-pub mod backups;
-pub mod credentials;
-pub mod disks;
-pub mod engine;
+pub mod config;
+pub mod daemon;
 pub mod http;
 pub mod proxy;
+pub mod reset;
 pub mod router;
-pub mod s3;
-pub mod seal;
-pub mod store;
-pub mod supervisor;
 
 #[cfg(test)]
 mod tests;

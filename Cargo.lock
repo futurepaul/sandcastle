@@ -1203,29 +1203,25 @@ dependencies = [
 name = "sandcastled"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "clap",
  "hex",
- "hkdf",
- "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
- "rand_core",
  "rcgen",
- "rusqlite",
  "rustls",
  "rustls-pki-types",
+ "sandcastle-core",
  "sandcastle-nip98",
+ "sandcastle-node",
  "sandcastle-proto",
+ "sandcastle-sim",
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "url",
- "webpki-roots",
 ]
 
 [[package]]
