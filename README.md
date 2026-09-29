@@ -121,6 +121,13 @@ A value lives in the node's memory for one engine call, and in msb's
 host process for the machine's life. It never reaches the store, a view,
 a log, the guest, its disk, a snapshot, or a backup.
 
+On fragment the credential is the computer's own token for the
+platform's model route (`OPENAI_API_KEY`, for the platform's host), so
+its model calls are paid and counted there. Hermes then runs its bare
+custom provider: `HERMES_INFERENCE_PROVIDER=custom`, and both
+`CUSTOM_BASE_URL` and `OPENAI_BASE_URL` at the route (the first picks the
+endpoint; Hermes sends `OPENAI_API_KEY` only where the second points).
+
 Limits:
 
 - Only credentials that travel in headers to known hosts. Not a token in
