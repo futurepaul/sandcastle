@@ -51,6 +51,7 @@ pub struct Stats {
     pub deleted: u64,
     pub rotations: u64,
     pub withdrawals: u64,
+    pub wedges: u64,
 }
 
 pub struct Sim {
@@ -379,7 +380,12 @@ impl Sim {
                     d.written += 4096;
                 }
             }
-            7 | 8 => w.machines.get_mut(&id).expect("running").service_alive = false,
+            7 => w.machines.get_mut(&id).expect("running").service_alive = false,
+            8 => {
+                // The service may keep answering; its guest will not.
+                w.machines.get_mut(&id).expect("running").wedged = true;
+                self.stats.wedges += 1;
+            }
             _ => {
                 let m = w.machines.get_mut(&id).expect("running");
                 m.state = Machine::Other;
@@ -466,14 +472,15 @@ impl Sim {
 
     fn check_settled(&self, c: &sandcastle_core::model::Computer) {
         let seed = self.seed;
-        assert_ne!(c.desired, Desired::Deleted, "seed {seed}: {} was never deleted", c.name);
+        let story = self.story(40).join("\n  ");
+        assert_ne!(c.desired, Desired::Deleted, "seed {seed}: {} was never deleted; the last calls:\n  {story}", c.name);
         let w = self.world.lock();
         let machine = w.machines.get(&c.id);
         let (target, _) = c.target();
         let broken = target.image == "img:bad" || target.image == "img:silent";
         match c.desired {
             Desired::Running if !broken => {
-                assert_eq!(c.status, Status::Serving, "seed {seed}: {} is {:?}: {:?}", c.name, c.status, c.status_reason);
+                assert_eq!(c.status, Status::Serving, "seed {seed}: {} is {:?}: {:?}; the last calls:\n  {story}", c.name, c.status, c.status_reason);
                 assert_eq!(c.applied_seq, Some(target.seq), "seed {seed}: {} runs a stale generation", c.name);
                 assert!(machine.is_some_and(|m| m.service_alive), "seed {seed}: {} does not answer", c.name);
             }

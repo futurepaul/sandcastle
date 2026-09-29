@@ -35,13 +35,23 @@ fn decide(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     }
 }
 
-/// A clean stop: the service first, then the machine.
-fn halt(k: &Knowledge) -> Next {
-    if k.quiesced {
+/// A clean stop: the service first, then the machine. A service whose
+/// quiesce failed last time (a wedged guest) goes down with its machine,
+/// so no stop or deletion waits on a guest forever.
+fn halt(c: &Computer, k: &Knowledge) -> Next {
+    if k.quiesced || wedged(c) {
         Next::Do(Effect::Stop)
     } else {
         Next::Do(Effect::Quiesce)
     }
+}
+
+pub fn launch_failed(c: &Computer) -> bool {
+    c.failure.as_ref().is_some_and(|f| f.step == Step::Launch && f.kind == FaultKind::Node)
+}
+
+pub fn wedged(c: &Computer) -> bool {
+    c.failure.as_ref().is_some_and(|f| f.step == Step::Quiesce)
 }
 
 fn delete(c: &Computer, k: &Knowledge) -> Next {
@@ -49,7 +59,7 @@ fn delete(c: &Computer, k: &Knowledge) -> Next {
         return Next::Do(Effect::AbortUpload { key: u.key.clone(), id: u.id.clone() });
     }
     match k.machine {
-        Machine::Running => halt(k),
+        Machine::Running => halt(c, k),
         Machine::Stopped | Machine::Other => Next::Do(Effect::Remove),
         Machine::Absent if !c.has_disk() => Next::Do(Effect::DeleteRow),
         Machine::Absent => match &k.disk {
@@ -67,7 +77,7 @@ fn stopped(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
         if c.has_disk() && c.snapshot_due.is_none() {
             return Next::Note(Note::Owe { kind: SnapshotKind::Stop });
         }
-        return halt(k);
+        return halt(c, k);
     }
     if let Some(n) = owed_snapshot(c, k) {
         return n;
@@ -81,7 +91,7 @@ fn stopped(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
 
 fn running(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     if let Some(r) = &c.restore {
-        return restore(r, k);
+        return restore(c, r, k);
     }
     let (target, _) = c.target();
     let current = c.applied_seq == Some(target.seq);
@@ -92,7 +102,7 @@ fn running(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
         // (the snapshot is `make`'s, from what the disk shows).
         (Machine::Running, false) => match credentials_for(target, k) {
             Err(n) => n,
-            Ok(_) => halt(k),
+            Ok(_) => halt(c, k),
         },
         (Machine::Stopped, true) => start(c, target, k),
         // Absent, a stale generation, or a machine the engine lost track
@@ -159,10 +169,19 @@ fn launch_env(c: &Computer, target: &Generation) -> BTreeMap<String, String> {
     env
 }
 
+/// Launches the service, unless the guest would not take the last launch
+/// (a wedged agent, say): then the machine restarts, which clears it,
+/// before the next try (a quiesce that failed on the way is part of that
+/// restart).
+fn launch(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
+    if launch_failed(c) || wedged(c) {
+        return halt(c, k);
+    }
+    Next::Do(Effect::Launch { argv: target.argv.clone(), env: launch_env(c, target) })
+}
+
 fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Millis) -> Next {
-    let Some(launched) = c.launched_at else {
-        return Next::Do(Effect::Launch { argv: target.argv.clone(), env: launch_env(c, target) });
-    };
+    let Some(launched) = c.launched_at else { return launch(c, target, k) };
     let Some(answered) = k.probe else {
         return Next::Observe(Observe::Probe { port: c.host_port, path: target.health_path.clone() });
     };
@@ -176,7 +195,7 @@ fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Mi
     if served_since_launch {
         // It served, then stopped answering: launch it again (the launch
         // script keeps a live service rather than starting a second).
-        return Next::Do(Effect::Launch { argv: target.argv.clone(), env: launch_env(c, target) });
+        return launch(c, target, k);
     }
     if now < launched.saturating_add(p.startup_grace_ms) {
         return Next::Rest(None);
@@ -275,7 +294,7 @@ fn refresh_credentials(c: &Computer, target: &Generation, k: &Knowledge, now: Mi
             match held {
                 Some(h) if h.digest == fresh.digest && !h.withdrawn => Next::Note(Note::CredentialsCurrent),
                 Some(h) if h.shape == fresh.shape => Next::Do(Effect::Rotate { credentials: values.clone(), withdraw: false }),
-                _ => halt(k),
+                _ => halt(c, k),
             }
         }
     })
@@ -284,11 +303,11 @@ fn refresh_credentials(c: &Computer, target: &Generation, k: &Knowledge, now: Mi
 /// A new computer's disk, brought to its restore's target before its first
 /// machine: each link received in turn; a disk holding anything but a
 /// prefix of the chain is destroyed and the restore starts over.
-fn restore(r: &Restore, k: &Knowledge) -> Next {
+fn restore(c: &Computer, r: &Restore, k: &Knowledge) -> Next {
     if k.machine != Machine::Absent {
         // No machine can be this computer's yet: whatever the engine has
         // under its name goes before the disk is touched.
-        return halt_or_remove(k);
+        return halt_or_remove(c, k);
     }
     let Some(d) = &k.disk else { return Next::Observe(Observe::Disk) };
     if !d.exists {
@@ -305,9 +324,9 @@ fn restore(r: &Restore, k: &Knowledge) -> Next {
     Next::Do(Effect::Receive { link: r.chain[received].clone() })
 }
 
-fn halt_or_remove(k: &Knowledge) -> Next {
+fn halt_or_remove(c: &Computer, k: &Knowledge) -> Next {
     match k.machine {
-        Machine::Running => halt(k),
+        Machine::Running => halt(c, k),
         _ => Next::Do(Effect::Remove),
     }
 }

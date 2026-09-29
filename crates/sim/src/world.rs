@@ -53,6 +53,9 @@ pub struct SimMachine {
     pub service_alive: bool,
     /// The service was stopped cleanly since the machine last started.
     pub quiesced: bool,
+    /// The guest's agent stopped answering: every exec (launch, quiesce,
+    /// sync) times out until the machine stops.
+    pub wedged: bool,
     pub credentials: Vec<Credential>,
 }
 
@@ -250,6 +253,7 @@ impl gates::Engine for World {
                     has_disk: disk.is_some(),
                     service_alive: false,
                     quiesced: false,
+                    wedged: false,
                     credentials: credentials.to_vec(),
                 },
             );
@@ -280,6 +284,7 @@ impl gates::Engine for World {
             if let Some(m) = s.machines.get_mut(&id) {
                 m.state = Machine::Stopped;
                 m.service_alive = false;
+                m.wedged = false;
             }
             Ok(())
         })
@@ -319,6 +324,9 @@ impl gates::Engine for World {
             if m.state != Machine::Running {
                 return Err(fault(GateError::Failed, "not running"));
             }
+            if m.wedged {
+                return Err(fault(GateError::Timeout, "msb exec timed out"));
+            }
             if env.values().any(|v| v.contains("SECRET-")) {
                 s.violations.push(format!("{}: a credential's value reached the guest's environment", id.hex()));
             }
@@ -332,6 +340,7 @@ impl gates::Engine for World {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("quiesce {}", id.hex()));
         gated(roll, || match s.machines.get_mut(&id) {
+            Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "msb exec timed out")),
             Some(m) if m.state == Machine::Running => {
                 m.service_alive = false;
                 m.quiesced = true;
@@ -344,7 +353,11 @@ impl gates::Engine for World {
     async fn sync(&self, id: ComputerId) -> GateResult<()> {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("sync {}", id.hex()));
-        gated(roll, || if s.machines.get(&id).is_some_and(|m| m.state == Machine::Running) { Ok(()) } else { Err(fault(GateError::Failed, "not running")) })
+        gated(roll, || match s.machines.get(&id) {
+            Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "msb exec timed out")),
+            Some(m) if m.state == Machine::Running => Ok(()),
+            _ => Err(fault(GateError::Failed, "not running")),
+        })
     }
 }
 

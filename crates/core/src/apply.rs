@@ -84,6 +84,11 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
         // Facts about the world, which the batch's knowledge holds.
         Effect::Quiesce | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
         Effect::Stop => {
+            if crate::plan::wedged(c) || crate::plan::launch_failed(c) {
+                // Dealt with by the stop: the next stop quiesces first
+                // again, and the next boot launches.
+                n.failure = None;
+            }
             n.launched_at = None;
             n.status = if c.desired == Desired::Stopped { Status::Stopped } else { Status::Starting };
             n.status_reason = None;
@@ -138,6 +143,12 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
 
 fn failed(c: &Computer, effect: &Effect, fault: &Fault, now: Millis) -> Change {
     let mut n = c.clone();
+    if matches!(effect, Effect::Sync) {
+        // Advisory: the snapshot after it is crash-consistent without it
+        // (SQLite in WAL mode recovers from one), and a guest that cannot
+        // sync must not stop its backups. The executor logs the fault.
+        return Change { row: Some(n), shipped: None };
+    }
     if effect.is_duty() {
         match effect {
             // The bucket forgot the upload: nothing is left to abort.
@@ -152,18 +163,20 @@ fn failed(c: &Computer, effect: &Effect, fault: &Fault, now: Millis) -> Change {
         n.ship.retry_at = Some(now + backoff_ms(n.ship.failures));
         return Change { row: Some(n), shipped: None };
     }
-    let kind = fault_kind(c, effect);
+    let kind = fault_kind(c, effect, fault.error);
     record(&mut n, c, kind, effect.step(), &fault.detail, now);
     Change { row: Some(n), shipped: None }
 }
 
-/// Whose fault a failed effect is: making or launching a generation that
-/// has never served is the spec's; everything else is the node's.
-fn fault_kind(c: &Computer, effect: &Effect) -> FaultKind {
+/// Whose fault a failed effect is: the engine refusing to make or launch
+/// a generation that has never served is the spec's (no such image, a
+/// bad argv); an engine that timed out, could not run, or answered
+/// nonsense is the node's, like everything else.
+fn fault_kind(c: &Computer, effect: &Effect, error: GateError) -> FaultKind {
     let (target, _) = c.target();
     let unproven = c.good.as_ref().is_none_or(|g| g.seq != target.seq);
     match effect {
-        Effect::Create { .. } | Effect::Launch { .. } if unproven => FaultKind::Spec,
+        Effect::Create { .. } | Effect::Launch { .. } if unproven && error == GateError::Failed => FaultKind::Spec,
         _ => FaultKind::Node,
     }
 }
@@ -241,6 +254,12 @@ fn duty_done(n: &mut Computer) {
 /// What the batch knows after `effect` answered `outcome`: a changed
 /// world is observed again rather than guessed.
 pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
+    if matches!(effect, Effect::Sync) {
+        // Tried, whatever it answered (see `failed`).
+        k.synced = true;
+        k.disk = None;
+        return;
+    }
     if matches!(outcome, Outcome::Failed(_)) {
         k.disk = None;
         k.probe = None;
@@ -248,10 +267,7 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
     }
     match effect {
         Effect::Quiesce => k.quiesced = true,
-        Effect::Sync => {
-            k.synced = true;
-            k.disk = None;
-        }
+        Effect::Sync => unreachable!("learned above"),
         Effect::Stop => {
             k.machine = Machine::Stopped;
             k.probe = None;

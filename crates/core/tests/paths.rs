@@ -240,6 +240,26 @@ fn a_new_generation_that_fails_rolls_back() {
     r.expect_do(|e| matches!(e, Effect::Start { .. }));
 }
 
+/// Goal: an engine that times out or cannot run while making a new
+/// generation is the node's fault, not the spec's: a backoff, no rollback
+/// (an image pull on a slow link is not a bad image).
+#[test]
+fn an_engine_that_times_out_making_a_new_generation_does_not_roll_back() {
+    for error in [GateError::Timeout, GateError::Unavailable, GateError::BadOutput] {
+        let mut r = serving();
+        r.c.spec = generation(2, "img:huge");
+        r.k.machine = Machine::Stopped;
+        r.c.applied_seq = Some(1);
+        r.k.disk_ready = true;
+        r.k.disk = Some(disk(0, &[]));
+        r.expect_do(|e| matches!(e, Effect::Create { seq: 2, .. }));
+        r.answer(Outcome::Failed(Fault { error, detail: "msb create timed out".into() }));
+        assert_eq!(r.c.failed_seq, None, "{error:?}");
+        assert_eq!(r.c.failure.as_ref().map(|f| f.kind), Some(FaultKind::Node), "{error:?}");
+        assert!(r.c.retry_at.is_some(), "{error:?}");
+    }
+}
+
 /// Goal: a service that stays silent past its grace rolls back; the one
 /// that rolled back is replaced by the good one after a clean stop.
 #[test]
@@ -294,6 +314,48 @@ fn a_node_fault_during_a_rebase_does_not_roll_back() {
     assert_eq!(r.c.failed_seq, None);
     assert_eq!(r.c.failure.as_ref().map(|f| f.kind), Some(FaultKind::Node));
     assert!(r.c.retry_at.is_some());
+}
+
+/// Goal: a guest that never answers its quiesce does not hold a deletion
+/// forever: after one failed quiesce, the next halt stops the machine, and
+/// the stop after that quiesces first again.
+#[test]
+fn a_wedged_guest_is_stopped_after_one_failed_quiesce() {
+    let mut r = serving();
+    r.c.desired = Desired::Deleted;
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb exec timed out".into() }));
+    assert_eq!(r.c.failure.as_ref().map(|f| f.step), Some(Step::Quiesce));
+    let retry = r.c.retry_at.unwrap();
+    assert_eq!(r.next(), Next::Rest(Some(retry)), "it backs off first");
+    r.now = retry;
+    r.k = Knowledge::new(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.ok();
+    assert!(r.c.failure.is_none(), "dealt with");
+    r.expect_do(|e| matches!(e, Effect::Remove));
+}
+
+/// Goal: a guest that will not take a launch (a wedged agent) is
+/// restarted, which clears it, rather than asked again forever; the boot
+/// after the restart launches.
+#[test]
+fn a_launch_the_node_failed_restarts_the_machine() {
+    let mut r = serving();
+    r.c.launched_at = None;
+    r.expect_do(|e| matches!(e, Effect::Launch { .. }));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb exec timed out".into() }));
+    assert_eq!(r.c.failure.as_ref().map(|f| (f.kind, f.step)), Some((FaultKind::Node, Step::Launch)));
+    r.now = r.c.retry_at.unwrap();
+    r.k = Knowledge::new(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.ok();
+    assert!(r.c.failure.is_none());
+    r.expect_do(|e| matches!(e, Effect::Start { .. }));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Launch { .. }));
 }
 
 /// Goal: a deletion goes service, machine, removal, disk, row, observing
