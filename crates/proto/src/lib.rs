@@ -337,11 +337,13 @@ fn validate_abs_path(path: &str, what: &str) -> Result<(), Invalid> {
         return invalid(format!("{what} is an absolute path below /"));
     }
     let clean = path.split('/').all(|seg| seg != ".." && seg != ".");
-    let printable = path.bytes().all(|c| c.is_ascii_graphic());
-    if clean && printable {
+    // No ':', ',', or '=': a disk's mount path is spliced into the engine's
+    // mount option (`device:path:options`).
+    let plain = path.bytes().all(|c| c.is_ascii_alphanumeric() || b"/_.-".contains(&c));
+    if clean && plain {
         Ok(())
     } else {
-        invalid(format!("{what} has no '.', '..', spaces, or control characters"))
+        invalid(format!("{what} is [A-Za-z0-9/_.-] with no '.' or '..' segments"))
     }
 }
 
@@ -438,11 +440,14 @@ impl Credentials {
 
 impl ComputerSpec {
     pub fn validate(&self) -> Result<(), Invalid> {
+        // It is the engine's last argument: starting with a letter or a
+        // digit, it can never read as a flag.
         let image_ok = !self.image.is_empty()
             && self.image.len() <= IMAGE_BYTES_MAX
+            && self.image.as_bytes()[0].is_ascii_alphanumeric()
             && self.image.bytes().all(|c| c.is_ascii_alphanumeric() || b"./:-_@".contains(&c));
         if !image_ok {
-            return invalid(format!("an image is 1 to {IMAGE_BYTES_MAX} characters of [A-Za-z0-9./:-_@]"));
+            return invalid(format!("an image is 1 to {IMAGE_BYTES_MAX} characters of [A-Za-z0-9./:-_@], starting with a letter or digit"));
         }
         if self.vcpus == 0 || self.vcpus > VCPUS_MAX {
             return invalid(format!("vcpus is 1 to {VCPUS_MAX}"));
@@ -592,6 +597,8 @@ mod tests {
             ("data with no disk", Box::new(|s| s.data_gib = 0)),
             ("data at /", Box::new(|s| s.data_path = "/".into())),
             ("data path with ..", Box::new(|s| s.data_path = "/opt/../etc".into())),
+            ("data path with mount options", Box::new(|s| s.data_path = "/data:ro,fstype=xfs".into())),
+            ("image that reads as a flag", Box::new(|s| s.image = "-p0.0.0.0:22:22".into())),
             ("relative data path", Box::new(|s| s.data_path = "opt/data".into())),
             ("pet", Box::new(|s| s.storage = Storage::Pet)),
             ("ephemeral with a disk", Box::new(|s| s.storage = Storage::Ephemeral)),

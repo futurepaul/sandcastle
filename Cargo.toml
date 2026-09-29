@@ -4,7 +4,7 @@
 # already vetted where they overlap; new ones passed the two-week cooldown.
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/core", "crates/sandcastled", "crates/cli"]
+members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sandcastled", "crates/cli"]
 
 [workspace.package]
 edition = "2021"
@@ -14,6 +14,7 @@ license = "MIT"
 sandcastle-proto = { path = "crates/proto" }
 sandcastle-nip98 = { path = "crates/nip98" }
 sandcastle-core = { path = "crates/core" }
+sandcastle-node = { path = "crates/node" }
 aes-gcm = "=0.10.3"
 base64 = "=0.22.1"
 clap = { version = "=4.6.6", features = ["derive", "env"] }

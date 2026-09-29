@@ -32,6 +32,10 @@ pub fn computer(c: &Computer) {
     if c.ship.failures == 0 {
         assert!(c.ship.retry_at.is_none());
     }
+    assert_eq!(c.credentials.is_some(), c.credentials_at.is_some(), "credentials held are refreshed on a schedule, and only those");
+    if let Some(u) = &c.ship.upload {
+        assert!(!u.key.is_empty() && !u.id.is_empty());
+    }
     if c.status == Status::Serving {
         assert!(c.served_at.is_some(), "serving means it answered");
         assert!(c.applied_seq.is_some(), "serving means a machine");

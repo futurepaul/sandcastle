@@ -50,6 +50,9 @@ pub fn note(c: &Computer, note: &Note, p: &Policy, now: Millis) -> Change {
         Note::SnapshotTaken { name } => taken(&mut n, *name, p, now),
         Note::SnapshotSkipped { owed: true } => n.snapshot_due = None,
         Note::SnapshotSkipped { owed: false } => n.snapshot_at = Some(now + p.snapshot_every_ms),
+        // Nothing held (a machine the node never handed any to) has nothing
+        // to keep current: the next refresh restarts it with them.
+        Note::CredentialsCurrent if n.credentials.is_none() => {}
         Note::CredentialsCurrent => n.credentials_at = Some(now + p.credentials_every_ms),
         Note::Fault { kind, step, reason } => record(&mut n, c, *kind, *step, reason, now),
         Note::RestoreDone { last_seq } => {

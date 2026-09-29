@@ -1152,6 +1152,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-node"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "hex",
+ "hkdf",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand_core",
+ "rusqlite",
+ "rustls",
+ "rustls-pki-types",
+ "sandcastle-core",
+ "sandcastle-nip98",
+ "sandcastle-proto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
 name = "sandcastle-proto"
 version = "0.1.0"
 dependencies = [

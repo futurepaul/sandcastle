@@ -1,0 +1,30 @@
+[package]
+name = "sandcastle-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A sandcastle node's machinery: the store, the gates to the world, the executor that runs the core, and the commands the API calls."
+
+[dependencies]
+sandcastle-core.workspace = true
+sandcastle-proto.workspace = true
+sandcastle-nip98 = { workspace = true, features = ["sign"] }
+aes-gcm.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rand_core.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
