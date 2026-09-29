@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sandcastle_proto::{ComputerSpec, Observed, Storage};
+use sandcastle_proto::{ComputerSpec, Credential, Credentials, CredentialsAsk, Observed, Storage};
 
 use crate::app::App;
 use crate::backups::Objects;
 use crate::disks::{snapshot_name, Disks, SnapshotKind};
-use crate::engine::{machine_name, Disk, Engine, Machine, VmState};
+use crate::engine::{machine_name, placeholder, Disk, Engine, Machine, VmState};
 use crate::store::{Computer, DesiredState};
 
 pub const TICK: Duration = Duration::from_secs(2);
@@ -95,23 +95,70 @@ pub struct Track {
     last_error: Option<String>,
     /// When the next scheduled snapshot is due, once the computer serves.
     next_snapshot_at: Option<Instant>,
+    /// The credentials last handed to the engine, as a digest and their
+    /// names and hosts (never a value), and when to fetch them again.
+    credentials: Option<Held>,
+    next_credentials_at: Option<Instant>,
 }
 
-/// What a machine is made from, as one value: the image and the service
-/// (its argv, port, health path, and env). Any change to it rebases the
-/// machine onto its disk. The size is not in it because it cannot change.
+/// What the node remembers of credentials it handed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    digest: [u8; 32],
+    /// (name, hosts), in the source's order.
+    shape: Vec<(String, Vec<String>)>,
+}
+
+fn held(credentials: &[Credential]) -> Held {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for c in credentials {
+        // length-prefixed, so no two lists hash alike
+        for part in std::iter::once(&c.name).chain(std::iter::once(&c.value)).chain(c.hosts.iter()) {
+            h.update((part.len() as u64).to_be_bytes());
+            h.update(part.as_bytes());
+        }
+        h.update([0xff]);
+    }
+    Held { digest: h.finalize().into(), shape: credentials.iter().map(|c| (c.name.clone(), c.hosts.clone())).collect() }
+}
+
+/// Why a step toward serving failed.
+#[derive(Debug)]
+enum Step {
+    /// The spec's machine or service failed: a new generation rolls back.
+    Failed(String),
+    /// Something outside the spec did (its credential source): retried
+    /// with the same backoff, never rolled back from.
+    Waiting(String),
+}
+
+impl From<String> for Step {
+    fn from(reason: String) -> Step {
+        Step::Failed(reason)
+    }
+}
+
+/// What a machine is made from, as one value: the image, the service
+/// (its argv, port, health path, and env), and the credential source. Any
+/// change to it rebases the machine onto its disk. The size is not in it
+/// because it cannot change. A spec without a source hashes as it did
+/// before sources existed, so no running computer rebases for them.
 pub fn generation(spec: &sandcastle_proto::ComputerSpec) -> String {
     use sha2::Digest;
     // serde_json writes struct fields in declaration order and a BTreeMap
     // in key order, so equal values hash equal.
-    let canonical = serde_json::to_vec(&(&spec.image, &spec.service)).expect("a spec serializes");
-    hex::encode(sha2::Sha256::digest(&canonical))
+    let canonical = match &spec.credentials_url {
+        None => serde_json::to_vec(&(&spec.image, &spec.service)),
+        Some(url) => serde_json::to_vec(&(&spec.image, &spec.service, url)),
+    };
+    hex::encode(sha2::Sha256::digest(canonical.expect("a spec serializes")))
 }
 
 /// The machine a computer's `spec` makes (its own, or the good one it
 /// rolled back to: storage and size are the same in both), with the disk
 /// the node made for it.
-pub fn machine_of(c: &Computer, spec: &ComputerSpec, device: Option<std::path::PathBuf>) -> Machine {
+pub fn machine_of(c: &Computer, spec: &ComputerSpec, device: Option<std::path::PathBuf>, credentials: Vec<Credential>) -> Machine {
     let disk = device.map(|device| Disk { device, mount: spec.data_path.clone() });
     Machine {
         name: machine_name(&c.id),
@@ -121,6 +168,7 @@ pub fn machine_of(c: &Computer, spec: &ComputerSpec, device: Option<std::path::P
         host_port: c.host_port,
         guest_port: spec.service.port,
         disk,
+        credentials,
     }
 }
 
@@ -226,7 +274,7 @@ async fn converge<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
                 // that served, keeping the data (never rewound), and say so.
                 // The good spec itself failing is an ordinary failure, so
                 // the node never flips between the two.
-                Err(reason) if !rolled_back && c.good_spec.as_ref().is_some_and(|g| generation(g) != generation(&c.spec)) => {
+                Err(Step::Failed(reason)) if !rolled_back && c.good_spec.as_ref().is_some_and(|g| generation(g) != generation(&c.spec)) => {
                     let failed = generation(&c.spec);
                     if let Err(e) = app.store.set_failed(&c.name, Some((&failed, &reason)), app.now()) {
                         eprintln!("supervisor: recording {}'s rollback: {e}", c.name);
@@ -234,7 +282,7 @@ async fn converge<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
                     *track = Track::default();
                     Observed::Failed { reason: format!("rolling back: {reason}") }
                 }
-                Err(reason) => {
+                Err(Step::Failed(reason) | Step::Waiting(reason)) => {
                     track.last_error = Some(reason.clone());
                     track.failures += 1;
                     track.launched_at = None;
@@ -249,12 +297,31 @@ async fn converge<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
     }
 }
 
+/// `c`'s credentials from `spec`'s source, checked against the service's
+/// own variables; none without a source.
+async fn fetch_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec) -> Result<Vec<Credential>, Step> {
+    let Some(url) = &spec.credentials_url else { return Ok(vec![]) };
+    let source = app.credentials.as_ref().ok_or_else(|| Step::Waiting("credentials: this node has no key to fetch them with".into()))?;
+    let ask = CredentialsAsk { computer: c.name.clone(), id: c.id.clone(), node: app.config.node_name.clone(), owner: c.owner.clone() };
+    let answer: Credentials = source.fetch(url, &ask).await.map_err(|e| Step::Waiting(format!("credentials: {e}")))?;
+    answer.validate(&spec.service.env).map_err(|e| Step::Waiting(format!("credentials: {e}")))?;
+    Ok(answer.credentials)
+}
+
+/// Remembers what was handed to the engine, and when to fetch again.
+fn handed(app_every_s: u64, credentials: &[Credential], track: &mut Track) {
+    track.credentials = Some(held(credentials));
+    track.next_credentials_at = Some(Instant::now() + Duration::from_secs(app_every_s));
+}
+
 /// One step toward a running, serving computer made from `spec`.
-async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
+async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, Step> {
     let name = machine_name(&c.id);
     let wanted = generation(spec);
     let rebase_due = c.applied_generation.as_deref() != Some(wanted.as_str());
     if vm.is_none() || rebase_due {
+        // First, so a source that is down leaves the old machine serving.
+        let credentials = fetch_credentials(app, c, spec).await?;
         if vm == Some(VmState::Running) {
             // A rebase: the old service stops gracefully, the guest syncs,
             // and the machine stops cleanly before it is replaced; only
@@ -272,18 +339,25 @@ async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
             Storage::Data => Some(app.disks.ensure(&c.id, spec.data_gib).await.map_err(|e| format!("the disk: {e}"))?),
             Storage::Ephemeral | Storage::Pet => None,
         };
-        app.engine.create(&machine_of(c, spec, device)).await.map_err(|e| format!("creating: {e}"))?;
+        app.engine.create(&machine_of(c, spec, device, credentials.clone())).await.map_err(|e| format!("creating: {e}"))?;
+        handed(app.config.credentials_every_s, &credentials, track);
         app.store.set_applied_generation(&c.name, &wanted, app.now()).map_err(|e| format!("recording the generation: {e}"))?;
         launch(app, c, spec, track).await?;
         return Ok(Observed::Starting);
     }
     if vm != Some(VmState::Running) {
-        app.engine.start(&name).await.map_err(|e| format!("starting: {e}"))?;
+        // The engine keeps no value: they are fetched again, as they are now.
+        let credentials = fetch_credentials(app, c, spec).await?;
+        app.engine.start(&name, &credentials).await.map_err(|e| format!("starting: {e}"))?;
+        handed(app.config.credentials_every_s, &credentials, track);
         launch(app, c, spec, track).await?;
         return Ok(Observed::Starting);
     }
     if probe(c.host_port, &spec.service.health_path).await {
         scheduled_snapshot(app, c, track).await;
+        if scheduled_credentials(app, c, spec, track).await {
+            return Ok(Observed::Starting);
+        }
         return Ok(Observed::Serving);
     }
     let grace = Duration::from_secs(app.config.startup_grace_s);
@@ -291,20 +365,83 @@ async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Compu
         Some(t) if t.elapsed() < grace => Ok(Observed::Starting),
         // Launched by this process and still silent past its grace: a
         // failure (the caller rolls a new generation back).
-        Some(_) => Err(format!("the service did not answer {} within {} s", spec.service.health_path, grace.as_secs())),
+        Some(_) => Err(Step::Failed(format!("the service did not answer {} within {} s", spec.service.health_path, grace.as_secs()))),
         // Up but never launched by this process (a daemon restart): launch.
         // The script keeps a live service rather than starting a second.
+        // What the machine holds is unknown to this process, so its
+        // credentials are fetched and swapped in first.
         None => {
+            if track.credentials.is_none() && spec.credentials_url.is_some() {
+                let credentials = fetch_credentials(app, c, spec).await?;
+                app.engine.rotate(&name, &credentials).await.map_err(|e| format!("handing over credentials: {e}"))?;
+                handed(app.config.credentials_every_s, &credentials, track);
+            }
             launch(app, c, spec, track).await?;
             Ok(Observed::Starting)
         }
     }
 }
 
+/// A serving computer's credentials, fetched again every
+/// `credentials_every_s`. New values with the same names and hosts are
+/// swapped in live (the guest sees nothing change); new names or hosts
+/// stop the machine, and the next tick starts it with them, since the
+/// service reads its variables only when it starts. A failed fetch keeps
+/// what the machine holds and waits for the next slot: a platform that is
+/// down never takes a computer down. True when it stopped the machine.
+async fn scheduled_credentials<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> bool {
+    if spec.credentials_url.is_none() || track.next_credentials_at.is_some_and(|t| Instant::now() < t) {
+        return false;
+    }
+    track.next_credentials_at = Some(Instant::now() + Duration::from_secs(app.config.credentials_every_s));
+    let credentials = match fetch_credentials(app, c, spec).await {
+        Ok(cr) => cr,
+        Err(Step::Failed(e) | Step::Waiting(e)) => {
+            eprintln!("supervisor: {}: {e}; keeping what it holds", c.name);
+            return false;
+        }
+    };
+    let now = held(&credentials);
+    let name = machine_name(&c.id);
+    match &track.credentials {
+        Some(before) if before.digest == now.digest => false,
+        Some(before) if before.shape == now.shape => {
+            match app.engine.rotate(&name, &credentials).await {
+                Ok(()) => {
+                    eprintln!("supervisor: {}: new credential values swapped in", c.name);
+                    handed(app.config.credentials_every_s, &credentials, track);
+                }
+                Err(e) => eprintln!("supervisor: {}: swapping in new credential values: {e}", c.name),
+            }
+            false
+        }
+        _ => {
+            eprintln!("supervisor: {}: its credentials' names or hosts changed; restarting it", c.name);
+            quiesce(app, &name).await;
+            if let Err(e) = app.engine.stop(&name).await {
+                eprintln!("supervisor: {}: stopping for new credentials: {e}", c.name);
+            }
+            track.credentials = None;
+            true
+        }
+    }
+}
+
+/// The service's own variables, and each credential's placeholder.
+fn service_env(spec: &ComputerSpec, track: &Track) -> std::collections::BTreeMap<String, String> {
+    let mut env = spec.service.env.clone();
+    for (name, _) in track.credentials.iter().flat_map(|h| h.shape.iter()) {
+        // validate() refused a credential named like one of these
+        assert!(!spec.service.env.contains_key(name));
+        env.insert(name.clone(), placeholder(name));
+    }
+    env
+}
+
 async fn launch<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
     let mut argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), LAUNCH_SCRIPT.into(), "sandcastle-launch".into()];
     argv.extend(spec.service.argv.iter().cloned());
-    let env = env_file(&spec.service.env);
+    let env = env_file(&service_env(spec, track));
     let out = app
         .engine
         .exec(&machine_name(&c.id), &argv, env.as_bytes(), EXEC_TIMEOUT)

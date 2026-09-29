@@ -81,7 +81,8 @@ pub async fn handle<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, req: Re
     let path_and_query = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let path = req.uri().path().to_string();
     if method == Method::GET && path == "/v1/health" {
-        return json(StatusCode::OK, &serde_json::json!({"ok": true, "version": env!("CARGO_PKG_VERSION")}));
+        let node_key = app.credentials.as_ref().map(|c| c.pubkey().to_string());
+        return json(StatusCode::OK, &serde_json::json!({"ok": true, "version": env!("CARGO_PKG_VERSION"), "node_key": node_key}));
     }
     let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
     let body = match Limited::new(req.into_body(), BODY_BYTES_MAX).collect().await {
@@ -216,6 +217,15 @@ async fn put_computer<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signe
     if let Err(e) = spec.validate() {
         return error(StatusCode::BAD_REQUEST, "invalid", e.to_string());
     }
+    if let Some(url) = &spec.credentials_url {
+        if app.credentials.is_none() {
+            return error(StatusCode::BAD_REQUEST, "no_credentials", "this node has no key to fetch credentials with");
+        }
+        if !app.config.credentials_origin_allowed(url) {
+            let from = app.config.credentials_origins.join(", ");
+            return error(StatusCode::BAD_REQUEST, "credentials_origin", format!("this node fetches credentials only from: {from}"));
+        }
+    }
     let grant = match app.store.grant(signer) {
         Ok(Some((g, _))) => g,
         Ok(None) => return error(StatusCode::FORBIDDEN, "no_grant", "this key holds no grant on this node"),
@@ -272,7 +282,7 @@ async fn put_computer<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signe
         Some(_) => error(
             StatusCode::CONFLICT,
             "spec_conflict",
-            "a computer's storage and size are fixed; its image, service, and url_auth can change",
+            "a computer's storage and size are fixed; its image, service, url_auth, and credentials_url can change",
         ),
     }
 }

@@ -591,6 +591,7 @@ pub mod tests {
             data_path: "/data".into(),
             service: Service { argv: vec!["/bin/sh".into()], port: 8080, health_path: "/".into(), env: Default::default() },
             url_auth: UrlAuth::Owner,
+            credentials_url: None,
         }
     }
 

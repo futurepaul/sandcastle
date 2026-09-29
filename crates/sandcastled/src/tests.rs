@@ -13,22 +13,26 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{HeaderMap, Request, StatusCode};
 use sandcastle_nip98::Keys;
-use sandcastle_proto::{ComputerSpec, ComputerView, GrantSpec, Observed, Service, Storage, Ticket, UrlAuth};
+use sandcastle_proto::{ComputerSpec, ComputerView, Credential, GrantSpec, Observed, Service, Storage, Ticket, UrlAuth};
 
 use crate::app::{App, Config};
 use crate::backups::fake::FakeObjects;
+use crate::credentials::fake::FakeSource;
 use crate::disks::fake::FakeDisks;
 use crate::engine::fake::Fake;
 use crate::store::Store;
 use crate::supervisor::{self, Track};
 
 const DOMAIN: &str = "sc.test";
+/// The one origin test nodes fetch credentials from.
+const PLATFORM: &str = "https://platform.test";
 
 struct Node {
     app: Arc<App<Fake, FakeDisks, FakeObjects>>,
     engine: Fake,
     disks: FakeDisks,
     objects: FakeObjects,
+    source: FakeSource,
     addr: SocketAddr,
     connector: tokio_rustls::TlsConnector,
     dir: PathBuf,
@@ -92,12 +96,16 @@ impl Node {
             backup_credentials: Some(dir.join("unused.env")),
             backup_key_file: Some(dir.join("unused.key")),
             backup_part_mib: 1,
+            node_key_file: Some(dir.join("unused-node.key")),
+            credentials_origins: vec![PLATFORM.into()],
+            credentials_every_s: 1,
         };
         config.check().unwrap();
         let store = Store::open(&dir.join("sandcastle.db")).unwrap();
         let objects = FakeObjects::default();
         let backup_key = crate::seal::BackupKey::from_hex(&"42".repeat(32)).unwrap();
-        let app = Arc::new(App::new(config, store, engine.clone(), disks.clone(), Some((objects.clone(), backup_key))));
+        let source = FakeSource::default();
+        let app = Arc::new(App::new(config, store, engine.clone(), disks.clone(), Some((objects.clone(), backup_key))).with_credentials(Box::new(source.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = crate::router::tls_acceptor(&cert, &key).unwrap();
@@ -111,7 +119,7 @@ impl Node {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        Node { app, engine, disks, objects, addr, connector, dir, tracks: HashMap::new(), server }
+        Node { app, engine, disks, objects, source, addr, connector, dir, tracks: HashMap::new(), server }
     }
 
     async fn connect(&self, host: &str) -> hyper::client::conn::http1::SendRequest<Full<Bytes>> {
@@ -187,6 +195,7 @@ fn spec() -> ComputerSpec {
             env: [("DASH_PASSWORD".to_string(), "it's secret".to_string())].into(),
         },
         url_auth: UrlAuth::Owner,
+        credentials_url: None,
     }
 }
 
@@ -809,4 +818,252 @@ async fn pruning_keeps_the_shipped_base() {
     let shipped = node.app.store.backups_of_computer(&id).unwrap();
     assert_eq!(shipped[1].base.as_deref(), Some(base.as_str()), "the next one is incremental from it");
     std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+const CREDS_URL: &str = "https://platform.test/api/sandcastle/credentials";
+const KEY_V1: &str = "sk-or-v1-first-value-0001";
+const KEY_V2: &str = "sk-or-v1-second-value-0002";
+
+fn model_key(value: &str) -> Credential {
+    Credential { name: "OPENROUTER_API_KEY".into(), value: value.into(), hosts: vec!["openrouter.ai".into()] }
+}
+
+fn with_source(mut s: ComputerSpec) -> ComputerSpec {
+    s.credentials_url = Some(CREDS_URL.into());
+    s
+}
+
+/// Every byte of every file under `dir` (the store and its WAL included).
+fn all_bytes(dir: &std::path::Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(all_bytes(&path));
+        } else {
+            out.extend(std::fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+
+impl Node {
+    fn machine_credentials(&self) -> Vec<Credential> {
+        self.engine.0.lock().unwrap().credentials.values().next().cloned().unwrap_or_default()
+    }
+
+    fn last_env(&self) -> String {
+        self.engine.0.lock().unwrap().last_env.values().next().cloned().unwrap_or_default()
+    }
+
+    /// Past `credentials_every_s` (1 s here).
+    async fn after_credentials_interval(&mut self) {
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        self.tick().await;
+    }
+}
+
+/// Goal: a credential's value reaches the engine and nothing else: not the
+/// guest's environment (a placeholder there), the store, a view, or a
+/// log-shaped debug print; the source hears which computer and owner.
+/// Method: a fake source; the fake engine records what it was handed; the
+/// node's state directory is read byte by byte.
+#[tokio::test]
+async fn credentials_reach_the_engine_and_nothing_else() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    let (status, body) = node.call(&grantor, "GET", "/v1/health", None).await;
+    assert_eq!((status, body["node_key"].as_str()), (StatusCode::OK, Some(crate::credentials::fake::PUBKEY)), "a platform learns the node's key here");
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V1)]));
+    assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&with_source(spec()))).await.0, StatusCode::CREATED);
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V1)], "the engine holds the value");
+    let env = node.last_env();
+    assert!(env.contains("OPENROUTER_API_KEY='$MSB_OPENROUTER_API_KEY'\n"), "the guest sees the placeholder: {env}");
+    assert!(!env.contains(KEY_V1), "never the value: {env}");
+    let asks = node.source.asks();
+    let c = node.app.store.computer("hermes").unwrap().unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].0, CREDS_URL);
+    assert_eq!((asks[0].1.computer.as_str(), asks[0].1.id.as_str(), asks[0].1.node.as_str(), asks[0].1.owner.as_str()), ("hermes", c.id.as_str(), "test-node", alice.pubkey_hex()));
+
+    let (_, view) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(view["spec"]["credentials_url"], CREDS_URL);
+    assert!(!view.to_string().contains(KEY_V1), "a view never holds one");
+    assert!(!format!("{:?}", node.machine_credentials()).contains(KEY_V1), "nor a debug print");
+    assert!(!contains(&all_bytes(&node.dir), KEY_V1), "nor the node's state");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: the node fetches only from origins its operator listed, and says
+/// what it may fetch from.
+#[tokio::test]
+async fn a_credential_source_must_be_listed() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    for url in ["https://evil.test/api/sandcastle/credentials", "https://platform.test:8443/c", "https://sub.platform.test/c"] {
+        let mut s = spec();
+        s.credentials_url = Some(url.into());
+        let (status, body) = node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&s)).await;
+        assert_eq!((status, body["code"].as_str()), (StatusCode::BAD_REQUEST, Some("credentials_origin")), "{url}");
+        assert!(body["message"].as_str().unwrap().contains(PLATFORM));
+    }
+    assert!(node.source.asks().is_empty(), "nothing was fetched");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a new value is swapped in live (no stop, no relaunch); new names
+/// restart the machine so the service reads its new variables; a source
+/// that fails keeps what the machine holds. Method: the fake source's
+/// answer changes between ticks past the 1 s refetch interval.
+#[tokio::test]
+async fn credentials_rotate_live_and_a_new_shape_restarts() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V1)]));
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&with_source(spec()))).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+
+    // the same answer again: nothing happens
+    let before = node.engine.calls().len();
+    node.after_credentials_interval().await;
+    assert!(node.engine.calls()[before..].iter().all(|c| !c.starts_with("rotate")), "{:?}", node.engine.calls());
+    assert_eq!(node.source.asks().len(), 2, "but it asked");
+
+    // a new value: swapped in, the guest untouched
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V2)]));
+    let before = node.engine.calls().len();
+    node.after_credentials_interval().await;
+    let after = node.engine.calls()[before..].to_vec();
+    assert!(after.iter().any(|c| c.starts_with("rotate sc-")), "{after:?}");
+    assert!(after.iter().all(|c| !c.starts_with("stop") && !c.ends_with("launch")), "live: {after:?}");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+
+    // the source fails: what the machine holds stays
+    node.source.answer(CREDS_URL, Err("platform.test answered 503".into()));
+    node.after_credentials_interval().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving, "a platform that is down takes no computer down");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
+
+    // a new name: the machine restarts with it, and the service sees it
+    let gh = Credential { name: "GH_TOKEN".into(), value: "ghp-token-value".into(), hosts: vec!["api.github.com".into()] };
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V2), gh.clone()]));
+    let before = node.engine.calls().len();
+    node.after_credentials_interval().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Starting);
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    let after = node.engine.calls()[before..].to_vec();
+    assert!(after.iter().any(|c| c.starts_with("stop sc-")) && after.iter().any(|c| c.starts_with("start sc-")), "{after:?}");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2), gh]);
+    let env = node.last_env();
+    assert!(env.contains("GH_TOKEN='$MSB_GH_TOKEN'\n") && !env.contains("ghp-token-value"), "{env}");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a source that is down, or answers something the node refuses,
+/// holds a new generation back without rolling it back or stopping the one
+/// that serves; once it answers, the rebase goes ahead. Method: a serving
+/// computer gains a credential source that first fails, then answers a
+/// credential shadowing a service variable, then answers well.
+#[tokio::test]
+async fn a_source_that_fails_holds_a_rebase_back_without_rolling_back() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+
+    node.source.answer(CREDS_URL, Err("platform.test answered 503: down".into()));
+    let newer = with_source(spec());
+    assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&newer)).await.0, StatusCode::OK);
+    let before = node.engine.calls().len();
+    node.tick().await;
+    let Observed::Failed { reason } = node.app.observed("hermes") else { panic!("{:?}", node.app.observed("hermes")) };
+    assert!(reason.contains("credentials: platform.test answered 503"), "{reason}");
+    assert!(node.engine.calls()[before..].is_empty(), "the old machine was left serving: {:?}", node.engine.calls());
+    let (_, view) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert!(view["rollback"].is_null(), "not the spec's fault: {view}");
+
+    // an answer that would shadow the service's own variable is refused
+    let shadow = Credential { name: "DASH_PASSWORD_KEY".into(), value: "x".into(), hosts: vec!["a.example".into()] };
+    let mut clash = newer.clone();
+    clash.service.env.insert("DASH_PASSWORD_KEY".into(), "mine".into());
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&clash)).await;
+    node.source.answer(CREDS_URL, Ok(vec![shadow]));
+    node.tick().await;
+    let Observed::Failed { reason } = node.app.observed("hermes") else { panic!() };
+    assert!(reason.contains("also one of the service's own variables"), "{reason}");
+
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&newer)).await;
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V1)]));
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    let c = node.app.store.computer("hermes").unwrap().unwrap();
+    assert_eq!(c.applied_generation, Some(supervisor::generation(&newer)));
+    assert_ne!(supervisor::generation(&newer), supervisor::generation(&spec()), "a new source is a new generation");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V1)]);
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: after a daemon restart, a machine whose service must be launched
+/// again gets its credentials fetched and swapped in first, so the service
+/// never starts on values this process cannot vouch for.
+#[tokio::test]
+async fn a_restarted_node_hands_over_credentials_before_relaunching() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V1)]));
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&with_source(spec()))).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    // the daemon restarts (its memory is gone) and the service has died
+    node.tracks.clear();
+    let name = crate::engine::machine_name(&node.app.store.computer("hermes").unwrap().unwrap().id);
+    let service = node.engine.0.lock().unwrap().services.remove(&name).unwrap();
+    service.abort();
+    let _ = service.await;
+    node.source.answer(CREDS_URL, Ok(vec![model_key(KEY_V2)]));
+    let before = node.engine.calls().len();
+    node.tick().await;
+    let after = node.engine.calls()[before..].to_vec();
+    let rotate = after.iter().position(|c| c.starts_with("rotate")).expect("swapped in");
+    let launch = after.iter().position(|c| c.ends_with("launch")).expect("relaunched");
+    assert!(rotate < launch, "{after:?}");
+    assert_eq!(node.machine_credentials(), vec![model_key(KEY_V2)]);
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a node refuses a configuration that would fetch unsigned or from
+/// a vague origin.
+#[test]
+fn credential_settings_are_checked() {
+    use clap::Parser;
+    let base = ["sandcastled", "--state-dir", "/tmp/x", "--domain", "sc.test", "--tls-cert", "c", "--tls-key", "k", "--grantor", &"ab".repeat(32), "--zfs-parent", "tank/sc", "--node-name", "n"];
+    let parse = |extra: &[&str]| Config::try_parse_from(base.iter().copied().chain(extra.iter().copied())).unwrap().check();
+    assert_eq!(parse(&[]), Ok(()));
+    assert_eq!(parse(&["--node-key-file", "/k", "--credentials-origin", "https://fragment.club"]), Ok(()));
+    assert!(parse(&["--credentials-origin", "https://fragment.club"]).unwrap_err().contains("--node-key-file"));
+    for bad in ["http://fragment.club", "https://fragment.club/api", "https://fragment.club/?a=1", "https://user@fragment.club", "fragment.club"] {
+        assert!(parse(&["--node-key-file", "/k", "--credentials-origin", bad]).is_err(), "{bad}");
+    }
 }

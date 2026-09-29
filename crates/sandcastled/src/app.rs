@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use sandcastle_proto::Observed;
 
 use crate::backups::Objects;
+use crate::credentials::Source;
 use crate::disks::Disks;
 use crate::seal::BackupKey;
 use crate::engine::Engine;
@@ -98,6 +99,20 @@ pub struct Config {
     /// Upload part size, MiB (S3's floor is 5).
     #[arg(long, default_value_t = 16)]
     pub backup_part_mib: u32,
+    /// A file holding the node's own key (64 hex): it signs the node's
+    /// fetches of computers' credentials, and a platform lists its public
+    /// key to trust them (`GET /v1/health` shows it).
+    #[arg(long)]
+    pub node_key_file: Option<PathBuf>,
+    /// An origin (`https://host[:port]`) a computer's `credentials_url`
+    /// may name: the node fetches from nowhere else. Repeatable; needs
+    /// `--node-key-file`.
+    #[arg(long = "credentials-origin")]
+    pub credentials_origins: Vec<String>,
+    /// How often a serving computer's credentials are fetched again; a
+    /// changed value is swapped in without touching the guest.
+    #[arg(long, default_value_t = 900)]
+    pub credentials_every_s: u64,
 }
 
 impl Config {
@@ -111,6 +126,14 @@ impl Config {
 
     pub fn computer_url(&self, name: &str) -> String {
         format!("https://{name}.{}/", self.domain)
+    }
+
+    /// Whether a computer may fetch its credentials from `url`: its origin
+    /// is one the operator listed.
+    pub fn credentials_origin_allowed(&self, url: &str) -> bool {
+        let Ok(u) = url::Url::parse(url) else { return false };
+        let origin = u.origin().ascii_serialization();
+        self.credentials_origins.iter().any(|o| url::Url::parse(o).is_ok_and(|l| l.origin().ascii_serialization() == origin))
     }
 
     pub fn ports(&self) -> std::ops::Range<u16> {
@@ -170,6 +193,18 @@ impl Config {
         if self.auth_window_s <= 0 || self.auth_window_s > 600 {
             return Err("--auth-window-s is 1 to 600".into());
         }
+        for o in &self.credentials_origins {
+            let bare = url::Url::parse(o).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some() && u.path() == "/" && u.query().is_none() && u.username().is_empty());
+            if !bare {
+                return Err(format!("--credentials-origin {o:?} is https://host[:port], nothing more"));
+            }
+        }
+        if !self.credentials_origins.is_empty() && self.node_key_file.is_none() {
+            return Err("--credentials-origin needs --node-key-file: the node signs its fetches".into());
+        }
+        if (self.credentials_every_s < 60 && !cfg!(test)) || self.credentials_every_s > 86_400 {
+            return Err("--credentials-every-s is 60 to 86400".into());
+        }
         Ok(())
     }
 }
@@ -182,6 +217,8 @@ pub struct App<E: Engine, D: Disks, O: Objects> {
     /// The backup bucket, when the node has one.
     pub objects: Option<O>,
     pub backup_key: Option<BackupKey>,
+    /// Where computers' credentials come from, when the node has a key.
+    pub credentials: Option<Box<dyn Source>>,
     observed: Mutex<HashMap<String, Observed>>,
 }
 
@@ -191,7 +228,13 @@ impl<E: Engine, D: Disks, O: Objects> App<E, D, O> {
             Some((o, k)) => (Some(o), Some(k)),
             None => (None, None),
         };
-        App { config, store, engine, disks, objects, backup_key, observed: Mutex::new(HashMap::new()) }
+        App { config, store, engine, disks, objects, backup_key, credentials: None, observed: Mutex::new(HashMap::new()) }
+    }
+
+    /// The node fetches computers' credentials from `source`.
+    pub fn with_credentials(mut self, source: Box<dyn Source>) -> App<E, D, O> {
+        self.credentials = Some(source);
+        self
     }
 
     pub fn now(&self) -> i64 {

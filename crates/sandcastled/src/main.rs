@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use sandcastled::app::{App, Config};
+use sandcastled::credentials::Https;
 use sandcastled::disks::Zfs;
 use sandcastled::s3::{Bucket, Credentials};
 use sandcastled::seal::BackupKey;
@@ -89,7 +90,22 @@ async fn main() {
             Some((bucket, key))
         }
     };
-    let app = Arc::new(App::new(config, store, engine, disks, backups));
+    let node_key = config.node_key_file.as_ref().map(|path| {
+        let hex = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("sandcastled: {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        sandcastle_nip98::Keys::from_secret_hex(&hex).unwrap_or_else(|| {
+            eprintln!("sandcastled: {}: not a 64-hex secret key", path.display());
+            std::process::exit(1);
+        })
+    });
+    let mut app = App::new(config, store, engine, disks, backups);
+    if let Some(keys) = node_key {
+        eprintln!("sandcastled: the node's key is {}; credentials only from {:?}", keys.pubkey_hex(), app.config.credentials_origins);
+        app = app.with_credentials(Box::new(Https::new(keys)));
+    }
+    let app = Arc::new(app);
     tokio::spawn(sandcastled::supervisor::run(app.clone()));
     tokio::spawn(sandcastled::backups::run(app.clone()));
     // Computers keep running when the daemon stops: a restart re-adopts

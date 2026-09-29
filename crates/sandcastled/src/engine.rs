@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use sandcastle_proto::Credential;
 use tokio::io::AsyncReadExt;
 
 /// Bytes kept of each of a command's stdout and stderr. The rest is read
@@ -60,6 +61,10 @@ pub struct Machine {
     pub host_port: u16,
     pub guest_port: u16,
     pub disk: Option<Disk>,
+    /// Credentials for the engine's swap: the guest sees `placeholder`
+    /// in each one's variable, and the engine puts the value in its place
+    /// only in requests to the credential's hosts.
+    pub credentials: Vec<Credential>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,12 @@ pub fn machine_name(id: &str) -> String {
     format!("sc-{id}")
 }
 
+/// What the guest sees in a credential's variable: microsandbox's own
+/// placeholder, which its swap replaces on the way out.
+pub fn placeholder(name: &str) -> String {
+    format!("$MSB_{name}")
+}
+
 pub trait Engine: Send + Sync + 'static {
     /// Every machine this node made (named `sc-…`), in one call.
     fn list(&self) -> impl Future<Output = Result<HashMap<String, VmState>, EngineError>> + Send;
@@ -80,7 +91,13 @@ pub trait Engine: Send + Sync + 'static {
     /// idle: the service is launched separately. The disk is the node's,
     /// so replacing a machine never touches it.
     fn create(&self, machine: &Machine) -> impl Future<Output = Result<(), EngineError>> + Send;
-    fn start(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Boots a stopped machine. The engine keeps no credential value, so
+    /// its credentials are handed over again, as they are now.
+    fn start(&self, name: &str, credentials: &[Credential]) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Swaps new values in on a running machine: later requests carry
+    /// them, and the guest sees nothing change. The names and hosts are
+    /// the ones the machine was made or started with.
+    fn rotate(&self, name: &str, credentials: &[Credential]) -> impl Future<Output = Result<(), EngineError>> + Send;
     fn stop(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
     /// Removes the machine; absent is success.
     fn remove(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
@@ -128,6 +145,27 @@ mod msb_tests {
         let open = Msb { program: "msb".into(), home: "/".into(), guest_deny: vec![] };
         assert_eq!(open.net_rule(), "allow@public");
     }
+
+    /// Goal: a value reaches msb in its environment only. Method: run a
+    /// stand-in `msb` that prints its argv and its environment.
+    #[tokio::test]
+    async fn a_credential_goes_in_the_environment_never_the_arguments() {
+        let dir = std::env::temp_dir().join(format!("sandcastle-msb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("msb");
+        std::fs::write(&program, "#!/bin/sh\necho \"argv: $*\"\nenv\n").unwrap();
+        std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let msb = Msb { program, home: dir.clone(), guest_deny: vec![] };
+        let cred = Credential { name: "OPENROUTER_API_KEY".into(), value: "sk-or-v1-in-the-env".into(), hosts: vec!["openrouter.ai".into(), "*.openrouter.ai".into()] };
+        let args: Vec<String> = vec!["modify".into(), "sc-x".into(), "--secret".into(), secret_arg(&cred)];
+        let out = msb.run_ok_with("msb modify", &args, std::slice::from_ref(&cred), LIFECYCLE_TIMEOUT).await.unwrap();
+        let argv = out.stdout.lines().next().unwrap();
+        assert_eq!(argv, "argv: modify sc-x --secret OPENROUTER_API_KEY@openrouter.ai,*.openrouter.ai");
+        assert!(out.stdout.lines().any(|l| l == "OPENROUTER_API_KEY=sk-or-v1-in-the-env"), "{}", out.stdout);
+        let plain = msb.run_ok("msb ls", &["ls".into()], LIFECYCLE_TIMEOUT).await.unwrap();
+        assert!(!plain.stdout.contains("sk-or-v1"), "another call carries no credential: {}", plain.stdout);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -150,17 +188,24 @@ impl Msb {
     }
 
     async fn run(&self, what: &str, args: &[String], timeout: Duration) -> Result<ExecOutput, EngineError> {
-        self.run_with_stdin(what, args, &[], timeout).await
+        self.run_with_stdin(what, args, &[], &[], timeout).await
     }
 
-    async fn run_with_stdin(&self, what: &str, args: &[String], stdin: &[u8], timeout: Duration) -> Result<ExecOutput, EngineError> {
+    /// Runs `msb` with `args`, `stdin`, and an environment of its own plus
+    /// `credentials`' values, each under its name: msb reads a secret's
+    /// value from its environment (`--secret NAME@HOST`), so no value is
+    /// ever on a command line.
+    async fn run_with_stdin(&self, what: &str, args: &[String], stdin: &[u8], credentials: &[Credential], timeout: Duration) -> Result<ExecOutput, EngineError> {
         let mut cmd = tokio::process::Command::new(&self.program);
         // An explicit environment: nothing of the daemon's own (least of
-        // all a secret) reaches the engine by accident.
-        cmd.env_clear()
-            .env("HOME", &self.home)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .args(args)
+        // all a secret) reaches the engine by accident. A credential's name
+        // is never one the engine reads (`valid_credential_name`).
+        cmd.env_clear().env("HOME", &self.home).env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        for c in credentials {
+            assert!(sandcastle_proto::valid_credential_name(&c.name), "checked when fetched");
+            cmd.env(&c.name, &c.value);
+        }
+        cmd.args(args)
             // `msb exec` waits for its stdin to end, so it always gets one
             // that ends: /dev/null, or a pipe closed after `stdin`.
             .stdin(if stdin.is_empty() { Stdio::null() } else { Stdio::piped() })
@@ -191,7 +236,11 @@ impl Msb {
     }
 
     async fn run_ok(&self, what: &str, args: &[String], timeout: Duration) -> Result<ExecOutput, EngineError> {
-        let out = self.run(what, args, timeout).await?;
+        self.run_ok_with(what, args, &[], timeout).await
+    }
+
+    async fn run_ok_with(&self, what: &str, args: &[String], credentials: &[Credential], timeout: Duration) -> Result<ExecOutput, EngineError> {
+        let out = self.run_with_stdin(what, args, &[], credentials, timeout).await?;
         if out.code == Some(0) {
             Ok(out)
         } else {
@@ -265,12 +314,25 @@ impl Engine for Msb {
             args.push("--mount-disk".into());
             args.push(format!("{}:{}:format=raw,fstype=ext4", d.device.display(), d.mount));
         }
+        for c in &m.credentials {
+            args.push("--secret".into());
+            args.push(secret_arg(c));
+        }
         args.push(m.image.clone());
-        self.run_ok("msb create", &args, CREATE_TIMEOUT).await.map(|_| ())
+        self.run_ok_with("msb create", &args, &m.credentials, CREATE_TIMEOUT).await.map(|_| ())
     }
 
-    async fn start(&self, name: &str) -> Result<(), EngineError> {
-        self.run_ok("msb start", &["start".into(), name.into()], LIFECYCLE_TIMEOUT).await.map(|_| ())
+    async fn start(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
+        self.run_ok_with("msb start", &["start".into(), name.into()], credentials, LIFECYCLE_TIMEOUT).await.map(|_| ())
+    }
+
+    async fn rotate(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
+        let mut args: Vec<String> = vec!["modify".into(), name.into()];
+        for c in credentials {
+            args.push("--secret".into());
+            args.push(secret_arg(c));
+        }
+        self.run_ok_with("msb modify", &args, credentials, LIFECYCLE_TIMEOUT).await.map(|_| ())
     }
 
     async fn stop(&self, name: &str) -> Result<(), EngineError> {
@@ -288,8 +350,14 @@ impl Engine for Msb {
         assert!(!argv.is_empty());
         let mut args: Vec<String> = vec!["exec".into(), name.into(), "--".into()];
         args.extend(argv.iter().cloned());
-        self.run_with_stdin("msb exec", &args, stdin, timeout).await
+        self.run_with_stdin("msb exec", &args, stdin, &[], timeout).await
     }
+}
+
+/// `--secret NAME@HOST[,HOST…]`: the name of the variable holding the
+/// value in msb's environment, and where the value may go.
+fn secret_arg(c: &Credential) -> String {
+    format!("{}@{}", c.name, c.hosts.join(","))
 }
 
 /// An engine for tests: machines are map entries, and launching a service
@@ -312,6 +380,8 @@ pub mod fake {
         pub silent_for: Option<String>,
         /// The env file each machine's last launch was handed.
         pub last_env: HashMap<String, String>,
+        /// The credentials each machine holds now (made, started, or rotated with).
+        pub credentials: HashMap<String, Vec<Credential>>,
     }
 
     #[derive(Clone)]
@@ -409,12 +479,14 @@ pub mod fake {
                 return Err(EngineError::Failed { what: "fake create".into(), code: Some(1), stderr: "no such image".into() });
             }
             s.machines.insert(m.name.clone(), (m.clone(), VmState::Running));
+            s.credentials.insert(m.name.clone(), m.credentials.clone());
             Ok(())
         }
 
-        async fn start(&self, name: &str) -> Result<(), EngineError> {
+        async fn start(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
             let mut s = self.0.lock().unwrap();
             s.calls.push(format!("start {name}"));
+            s.credentials.insert(name.to_string(), credentials.to_vec());
             match s.machines.get_mut(name) {
                 Some((_, st)) => {
                     *st = VmState::Running;
@@ -422,6 +494,16 @@ pub mod fake {
                 }
                 None => Err(EngineError::Failed { what: "fake start".into(), code: Some(1), stderr: "not found".into() }),
             }
+        }
+
+        async fn rotate(&self, name: &str, credentials: &[Credential]) -> Result<(), EngineError> {
+            let mut s = self.0.lock().unwrap();
+            s.calls.push(format!("rotate {name}"));
+            if !matches!(s.machines.get(name), Some((_, VmState::Running))) {
+                return Err(EngineError::Failed { what: "fake modify".into(), code: Some(1), stderr: "not running".into() });
+            }
+            s.credentials.insert(name.to_string(), credentials.to_vec());
+            Ok(())
         }
 
         async fn stop(&self, name: &str) -> Result<(), EngineError> {

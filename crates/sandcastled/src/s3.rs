@@ -2,8 +2,6 @@
 //! hyper and rustls, path-style URLs, and only the calls the node makes
 //! (put, get, delete, multipart). Tigris is the bucket today; any S3 works.
 
-use std::sync::Arc;
-
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use sha2::{Digest, Sha256};
@@ -160,15 +158,7 @@ impl Bucket {
         if !bucket_ok {
             return Err("--backup-bucket is an S3 bucket name".into());
         }
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("ring supports the default versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tls = crate::http::tls_connector();
         Ok(Bucket { endpoint, region: region.to_string(), name: name.to_string(), creds, tls })
     }
 

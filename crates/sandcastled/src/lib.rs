@@ -6,6 +6,7 @@
 pub mod api;
 pub mod app;
 pub mod backups;
+pub mod credentials;
 pub mod disks;
 pub mod engine;
 pub mod http;

@@ -26,6 +26,13 @@ pub const ENV_VALUE_BYTES_MAX: usize = 4 * 1024;
 pub const COMPUTERS_PER_GRANT_MAX: u32 = 1000;
 /// A ticket opens a computer's URL once, soon after it is minted.
 pub const TICKET_TTL_S: i64 = 60;
+pub const URL_BYTES_MAX: usize = 512;
+/// A credential source's answer: its credentials, each value's size, each
+/// one's hosts, and the whole body as read.
+pub const CREDENTIALS_MAX: usize = 16;
+pub const CREDENTIAL_VALUE_BYTES_MAX: usize = 8 * 1024;
+pub const CREDENTIAL_HOSTS_MAX: usize = 8;
+pub const CREDENTIALS_BODY_BYTES_MAX: usize = 64 * 1024;
 
 /// What survives a computer's machine (docs/sandbox.md, decision 3).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,8 +73,8 @@ pub struct Service {
     /// The service's own settings (Hermes' dashboard login, say). The node
     /// hands them to the guest through an exec's stdin into a root-only
     /// file, never on a command line. Not for credentials the service
-    /// spends outbound: those come from the credential source and never
-    /// enter the guest (docs/sandbox.md, Credentials).
+    /// spends outbound: those come from `credentials_url` and never enter
+    /// the guest.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -87,6 +94,15 @@ pub struct ComputerSpec {
     pub data_path: String,
     pub service: Service,
     pub url_auth: UrlAuth,
+    /// Where the node fetches the credentials the service spends outbound
+    /// (docs/sandbox.md, Credentials): the node POSTs a `CredentialsAsk`
+    /// there, NIP-98 signed with its own key, at every boot and on a
+    /// schedule, and hands the answer to the engine's credential swap. The
+    /// guest sees a placeholder in each credential's variable; the value
+    /// reaches only the credential's hosts, in the request as it leaves.
+    /// The node fetches only from the origins its operator lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_url: Option<String>,
 }
 
 /// What a caller wants a computer to be doing.
@@ -186,6 +202,43 @@ pub struct SnapshotList {
     pub snapshots: Vec<SnapshotView>,
 }
 
+/// What a node POSTs to a computer's `credentials_url`, NIP-98 signed with
+/// its own key. The platform answers with `Credentials` for the owner (or
+/// refuses); it trusts the node's word on who that is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialsAsk {
+    /// The computer's name and id on the node, and the node's name.
+    pub computer: String,
+    pub id: String,
+    pub node: String,
+    /// The key that owns the computer (64 hex).
+    pub owner: String,
+}
+
+/// A credential source's answer.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Credentials {
+    pub credentials: Vec<Credential>,
+}
+
+/// One credential: the variable the service reads it from (holding a
+/// placeholder), its value, and the hosts it may reach.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Credential {
+    pub name: String,
+    pub value: String,
+    pub hosts: Vec<String>,
+}
+
+/// A credential's value never reaches a log.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential").field("name", &self.name).field("value", &"(set)").field("hosts", &self.hosts).finish()
+    }
+}
+
 /// The body of `PUT /v1/grants/{pubkey}`, written by a grantor: what that
 /// key may hold on this node.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +331,74 @@ fn validate_abs_path(path: &str, what: &str) -> Result<(), Invalid> {
     }
 }
 
+/// `https://` and at most `URL_BYTES_MAX` printable bytes; the node
+/// parses it fully and checks its origin.
+fn validate_url(url: &str, what: &str) -> Result<(), Invalid> {
+    let ok = url.len() <= URL_BYTES_MAX && url.len() > "https://".len() && url.starts_with("https://") && url.bytes().all(|c| c.is_ascii_graphic());
+    if ok {
+        Ok(())
+    } else {
+        invalid(format!("{what} is an https URL of at most {URL_BYTES_MAX} printable bytes"))
+    }
+}
+
+/// A DNS name, or `*.` and one: lowercase letters, digits, '-' and '.'.
+fn valid_host(host: &str) -> bool {
+    let name = host.strip_prefix("*.").unwrap_or(host);
+    let labels_ok = name.split('.').all(|l| {
+        !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    });
+    !name.is_empty() && name.len() <= 253 && name.contains('.') && labels_ok
+}
+
+/// The variables a credential may be: an uppercase name ending in `_KEY`,
+/// `_TOKEN`, or `_SECRET`. The node hands each value to the engine in the
+/// engine's own environment, under this name, so no name may be one the
+/// engine or its host reads (`PATH`, `HOME`, `MSB_*`, `LD_*`, proxies):
+/// the suffix rule keeps every such name out.
+pub fn valid_credential_name(name: &str) -> bool {
+    let shaped = !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_uppercase()
+        && name.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+    let suffixed = ["_KEY", "_TOKEN", "_SECRET"].iter().any(|s| name.len() > s.len() && name.ends_with(s));
+    shaped && suffixed && !name.starts_with("MSB_")
+}
+
+impl Credentials {
+    /// Checks a source's answer before the node uses any of it. `taken` are
+    /// the service's own variables, which a credential may not shadow.
+    pub fn validate(&self, taken: &BTreeMap<String, String>) -> Result<(), Invalid> {
+        if self.credentials.len() > CREDENTIALS_MAX {
+            return invalid(format!("at most {CREDENTIALS_MAX} credentials"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &self.credentials {
+            if !valid_credential_name(&c.name) {
+                return invalid(format!("credential name {:?} is [A-Z][A-Z0-9_]* ending in _KEY, _TOKEN, or _SECRET, at most 64, not MSB_*", c.name));
+            }
+            if !seen.insert(c.name.as_str()) {
+                return invalid(format!("credential {} is named twice", c.name));
+            }
+            if taken.contains_key(&c.name) {
+                return invalid(format!("credential {} is also one of the service's own variables", c.name));
+            }
+            // It travels in a header: printable ASCII, no spaces.
+            let value_ok = !c.value.is_empty() && c.value.len() <= CREDENTIAL_VALUE_BYTES_MAX && c.value.bytes().all(|b| b.is_ascii_graphic());
+            if !value_ok {
+                return invalid(format!("credential {} is 1 to {CREDENTIAL_VALUE_BYTES_MAX} printable ASCII bytes with no spaces", c.name));
+            }
+            if c.hosts.is_empty() || c.hosts.len() > CREDENTIAL_HOSTS_MAX {
+                return invalid(format!("credential {} names 1 to {CREDENTIAL_HOSTS_MAX} hosts", c.name));
+            }
+            if let Some(bad) = c.hosts.iter().find(|h| !valid_host(h)) {
+                return invalid(format!("credential {}: {bad:?} is not a host name (or *. and one)", c.name));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ComputerSpec {
     pub fn validate(&self) -> Result<(), Invalid> {
         let image_ok = !self.image.is_empty()
@@ -343,14 +464,18 @@ impl ComputerSpec {
         if !health_ok {
             return invalid(format!("service.health_path starts with '/' and is at most {PATH_BYTES_MAX} printable bytes"));
         }
+        if let Some(url) = &self.credentials_url {
+            validate_url(url, "credentials_url")?;
+        }
         Ok(())
     }
 
     /// Whether this computer may become `other`: everything fixed for a
     /// computer's life is the same (its storage and its size), and
-    /// something that can change did (the image, the service, or who the
-    /// URL admits). A new image or service rebases the machine onto its
-    /// disk; the size is fixed until resizing is built.
+    /// something that can change did (the image, the service, who the URL
+    /// admits, or the credential source). A new image, service, or source
+    /// rebases the machine onto its disk; the size is fixed until resizing
+    /// is built.
     pub fn can_become(&self, other: &ComputerSpec) -> bool {
         let fixed_same = self.storage == other.storage
             && self.data_gib == other.data_gib
@@ -403,6 +528,7 @@ mod tests {
                 env: BTreeMap::new(),
             },
             url_auth: UrlAuth::Owner,
+            credentials_url: None,
         }
     }
 
@@ -442,6 +568,10 @@ mod tests {
             ("env name with a digit first", Box::new(|s| { s.service.env.insert("1A".into(), "x".into()); })),
             ("newline in an env value", Box::new(|s| { s.service.env.insert("A".into(), "x\ny".into()); })),
             ("too many env vars", Box::new(|s| { for i in 0..=ENV_VARS_MAX { s.service.env.insert(format!("V{i}"), "x".into()); } })),
+            ("plain http credentials", Box::new(|s| s.credentials_url = Some("http://platform.example/c".into()))),
+            ("credentials url with a space", Box::new(|s| s.credentials_url = Some("https://platform.example/a b".into()))),
+            ("bare scheme", Box::new(|s| s.credentials_url = Some("https://".into()))),
+            ("long credentials url", Box::new(|s| s.credentials_url = Some(format!("https://a.example/{}", "x".repeat(URL_BYTES_MAX))))),
         ];
         for (what, change) in cases {
             let mut s = hermes();
@@ -453,6 +583,64 @@ mod tests {
         eph.data_gib = 0;
         eph.data_path.clear();
         assert_eq!(eph.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_spec_without_a_credential_source_reads_as_before() {
+        let mut v = serde_json::to_value(hermes()).unwrap();
+        assert!(v.get("credentials_url").is_none(), "absent, not null");
+        v.as_object_mut().unwrap().remove("credentials_url");
+        assert_eq!(serde_json::from_value::<ComputerSpec>(v).unwrap(), hermes());
+        let mut with = hermes();
+        with.credentials_url = Some("https://platform.example/api/credentials".into());
+        assert_eq!(with.validate(), Ok(()));
+        assert!(hermes().can_become(&with), "a new source is a change");
+    }
+
+    fn cred(name: &str, value: &str, hosts: &[&str]) -> Credential {
+        Credential { name: name.into(), value: value.into(), hosts: hosts.iter().map(|h| h.to_string()).collect() }
+    }
+
+    #[test]
+    fn credentials_valid_and_invalid() {
+        let none = BTreeMap::new();
+        let ok = Credentials { credentials: vec![cred("OPENROUTER_API_KEY", "sk-or-v1-abc", &["openrouter.ai"]), cred("GH_TOKEN", "t", &["*.github.com", "github.com"])] };
+        assert_eq!(ok.validate(&none), Ok(()));
+        let bad: Vec<(&str, Credential)> = vec![
+            ("PATH", cred("PATH", "x", &["a.example"])),
+            ("no suffix", cred("OPENROUTER", "x", &["a.example"])),
+            ("only a suffix", cred("_KEY", "x", &["a.example"])),
+            ("the engine's own", cred("MSB_REGISTRY_TOKEN", "x", &["a.example"])),
+            ("lowercase", cred("api_key", "x", &["a.example"])),
+            ("empty value", cred("A_KEY", "", &["a.example"])),
+            ("a space in the value", cred("A_KEY", "a b", &["a.example"])),
+            ("a newline in the value", cred("A_KEY", "a\nb", &["a.example"])),
+            ("a long value", cred("A_KEY", &"x".repeat(CREDENTIAL_VALUE_BYTES_MAX + 1), &["a.example"])),
+            ("no hosts", cred("A_KEY", "x", &[])),
+            ("any host", cred("A_KEY", "x", &["*"])),
+            ("a bare name", cred("A_KEY", "x", &["localhost"])),
+            ("an address with a port", cred("A_KEY", "x", &["a.example:443"])),
+            ("an uppercase host", cred("A_KEY", "x", &["A.example"])),
+            ("too many hosts", cred("A_KEY", "x", &["a.example"; CREDENTIAL_HOSTS_MAX + 1])),
+        ];
+        for (what, c) in bad {
+            assert!(Credentials { credentials: vec![c] }.validate(&none).is_err(), "{what} should be refused");
+        }
+        let twice = Credentials { credentials: vec![cred("A_KEY", "x", &["a.example"]), cred("A_KEY", "y", &["a.example"])] };
+        assert!(twice.validate(&none).is_err());
+        let many = Credentials { credentials: (0..=CREDENTIALS_MAX).map(|i| cred(&format!("K{i}_KEY"), "x", &["a.example"])).collect() };
+        assert!(many.validate(&none).is_err());
+        let mut taken = BTreeMap::new();
+        taken.insert("OPENROUTER_API_KEY".to_string(), "mine".to_string());
+        assert!(ok.validate(&taken).is_err(), "a credential never shadows the service's own variable");
+    }
+
+    #[test]
+    fn a_credential_value_never_prints() {
+        let c = cred("A_KEY", "sk-very-secret", &["a.example"]);
+        let shown = format!("{c:?} {:?}", Credentials { credentials: vec![c.clone()] });
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(shown.contains("A_KEY"));
     }
 
     #[test]
