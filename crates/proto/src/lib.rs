@@ -136,6 +136,10 @@ pub enum Observed {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ComputerView {
     pub name: String,
+    /// The computer's id (16 hex): what a restore names
+    /// (`restore=<id>@<snapshot>`), and its machine's name on the node
+    /// (`sc-<id>`). A name can be reused; an id never is.
+    pub id: String,
     pub owner: String,
     /// The spec, with each `service.env` value replaced by "(set)": a view
     /// never echoes a service's secrets, so it is not a body to PUT back.

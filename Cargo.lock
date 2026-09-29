@@ -1139,6 +1139,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-e2e"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand_core",
+ "rustls",
+ "rustls-pki-types",
+ "sandcastle-nip98",
+ "sandcastle-proto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
+
+[[package]]
 name = "sandcastle-nip98"
 version = "0.1.0"
 dependencies = [

@@ -403,5 +403,5 @@ pub fn view(c: &Computer, url: String) -> ComputerView {
         Desired::Stopped => sandcastle_proto::Desired::Stopped,
         Desired::Deleted => sandcastle_proto::Desired::Deleted,
     };
-    ComputerView { name: c.name.clone(), owner: c.owner.clone(), spec, desired, observed, pending: !settled, rollback, url }
+    ComputerView { name: c.name.clone(), id: c.id.hex(), owner: c.owner.clone(), spec, desired, observed, pending: !settled, rollback, url }
 }
