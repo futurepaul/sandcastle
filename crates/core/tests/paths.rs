@@ -131,7 +131,7 @@ fn serving() -> Run {
     r.ok();
     assert!(matches!(r.next(), Next::Observe(Observe::Probe { port: 20000, .. })));
     r.k.probe = Some(true);
-    assert_eq!(r.next(), Next::Note(Note::Served));
+    assert_eq!(r.next(), Next::Note(Note::Served { seq: 1 }));
     r.noted();
     assert_eq!(r.c.status, Status::Serving);
     assert_eq!(r.c.good.as_ref().map(|g| g.seq), Some(1));
@@ -220,7 +220,7 @@ fn a_silent_new_generation_rolls_back_after_its_grace() {
     r.k.probe = Some(false);
     assert_eq!(r.next(), Next::Rest(None), "inside the grace it waits");
     r.now += 3 * MIN;
-    assert_eq!(r.next(), Next::Note(Note::GraceExpired));
+    assert_eq!(r.next(), Next::Note(Note::GraceExpired { seq: 2 }));
     r.noted();
     assert_eq!(r.c.failed_seq, Some(2));
     r.expect_do(|e| matches!(e, Effect::Quiesce));
@@ -475,4 +475,19 @@ fn snapshot_names_round_trip_and_refuse_others() {
     assert_eq!(ComputerId::parse("0123456789abcdef").unwrap().machine_name(), "sc-0123456789abcdef");
     assert_eq!(ComputerId::parse("0123456789ABCDEF"), None);
     assert_eq!(bounded_reason(&"é".repeat(400)).len(), 512);
+}
+
+/// Goal: a decision about one generation is dropped when the owner asked
+/// for another between the plan and the record (the executor records
+/// against the row as it is then): the new spec is never called good for
+/// what the old machine did.
+#[test]
+fn a_stale_served_does_not_bless_a_newer_spec() {
+    let mut r = serving();
+    r.c.status = Status::Starting;
+    let stale = Note::Served { seq: 1 };
+    r.c.spec = generation(2, "img:2");
+    let after = note(&r.c, &stale, &r.p, r.now).row.unwrap();
+    assert_eq!(after.good.as_ref().map(|g| g.seq), Some(1), "generation 2 never served");
+    assert_eq!(after.status, Status::Starting);
 }

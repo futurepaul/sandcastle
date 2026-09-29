@@ -28,13 +28,21 @@ pub fn apply(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
     change
 }
 
+/// Whether a decision about generation `seq` still concerns the row: the
+/// executor records against the row as it is now, and the owner may have
+/// asked for another generation meanwhile.
+fn still_about(c: &Computer, seq: u32) -> bool {
+    c.applied_seq == Some(seq) && c.target().0.seq == seq
+}
+
 /// The row after a decision made with no gate.
 pub fn note(c: &Computer, note: &Note, p: &Policy, now: Millis) -> Change {
     check::computer(c);
     let mut n = c.clone();
     match note {
-        Note::Served => served(&mut n, p, now),
-        Note::GraceExpired => {
+        Note::Served { seq } | Note::GraceExpired { seq } if !still_about(c, *seq) => {}
+        Note::Served { .. } => served(&mut n, p, now),
+        Note::GraceExpired { .. } => {
             let reason = format!("the service did not answer within {} s of its launch", p.startup_grace_ms / 1000);
             n.launched_at = None;
             record(&mut n, c, FaultKind::Spec, Step::Grace, &reason, now);

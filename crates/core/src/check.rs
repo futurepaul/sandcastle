@@ -81,8 +81,9 @@ fn restore_state(c: &Computer) {
 /// only ever asked for in the one state that allows them.
 pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
     let Next::Do(effect) = next else {
-        if let Next::Note(Note::Served) = next {
+        if let Next::Note(Note::Served { seq }) = next {
             assert_eq!(k.probe, Some(true), "served means it answered, this batch");
+            assert_eq!(c.applied_seq, Some(*seq), "what answered is the machine's generation");
         }
         return;
     };

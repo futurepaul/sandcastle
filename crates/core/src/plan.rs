@@ -156,7 +156,7 @@ fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Mi
     };
     if answered {
         if c.status != Status::Serving || c.served_at.is_none() {
-            return Next::Note(Note::Served);
+            return Next::Note(Note::Served { seq: target.seq });
         }
         return serving_duties(c, target, k, p, now).unwrap_or(Next::Rest(None));
     }
@@ -169,7 +169,7 @@ fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Mi
     if now < launched.saturating_add(p.startup_grace_ms) {
         return Next::Rest(None);
     }
-    Next::Note(Note::GraceExpired)
+    Next::Note(Note::GraceExpired { seq: target.seq })
 }
 
 fn serving_duties(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Millis) -> Option<Next> {

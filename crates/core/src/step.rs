@@ -106,10 +106,10 @@ impl Effect {
 /// A decision recorded with no gate.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Note {
-    /// The service answered: the computer serves its target generation.
-    Served,
-    /// The service stayed silent past the grace.
-    GraceExpired,
+    /// The service of generation `seq` answered: the computer serves it.
+    Served { seq: u32 },
+    /// The service of generation `seq` stayed silent past the grace.
+    GraceExpired { seq: u32 },
     /// A snapshot owed or scheduled was already on the disk (taken before
     /// a crash), or is not needed (nothing written, or no disk).
     SnapshotTaken { name: SnapshotName },
