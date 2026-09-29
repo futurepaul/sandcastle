@@ -155,7 +155,7 @@ fn a_rebase_stops_cleanly_and_snapshots_before_replacing() {
     r.restart(Machine::Running);
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
     assert_eq!(r.next(), Next::Observe(Observe::Disk), "before replacing, it looks at what the old machine wrote");
     r.k.disk = Some(disk(4096, &[]));
@@ -194,7 +194,7 @@ fn a_stop_owes_its_snapshot_first() {
     r.noted();
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     // a crash: the stop happened, its record did not
     r.restart(Machine::Stopped);
     assert_eq!(r.c.snapshot_due, Some(SnapshotKind::Stop), "owed in the row already");
@@ -306,7 +306,7 @@ fn a_node_fault_during_a_rebase_does_not_roll_back() {
     r.c.spec = generation(2, "img:2");
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
     r.k.disk = Some(disk(10, &[]));
     r.expect_do(|e| matches!(e, Effect::Snapshot { .. }));
@@ -330,7 +330,7 @@ fn a_wedged_guest_is_stopped_after_one_failed_quiesce() {
     assert_eq!(r.next(), Next::Rest(Some(retry)), "it backs off first");
     r.now = retry;
     r.k = Knowledge::new(Machine::Running);
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
     assert!(r.c.failure.is_none(), "dealt with");
     r.expect_do(|e| matches!(e, Effect::Remove));
@@ -350,12 +350,73 @@ fn a_launch_the_node_failed_restarts_the_machine() {
     r.k = Knowledge::new(Machine::Running);
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
     assert!(r.c.failure.is_none());
     r.expect_do(|e| matches!(e, Effect::Start { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Launch { .. }));
+}
+
+/// Goal: a machine that will not power off does not hold a deletion
+/// forever: after a failed graceful stop, the next stop kills it.
+#[test]
+fn a_machine_that_will_not_stop_is_killed_after_one_failed_stop() {
+    let mut r = serving();
+    r.c.desired = Desired::Deleted;
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb stop: no answer within 60 s".into() }));
+    r.now = r.c.retry_at.unwrap();
+    r.k = Knowledge::new(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Stop { force: true }));
+    r.ok();
+    assert!(r.c.failure.is_none(), "dealt with");
+    r.expect_do(|e| matches!(e, Effect::Remove));
+}
+
+/// Goal: a wedged guest on a machine that will not power off: the failed
+/// quiesce and the failed stop never alternate forever.
+#[test]
+fn a_wedged_guest_on_a_hung_machine_is_killed() {
+    let mut r = serving();
+    r.c.desired = Desired::Stopped;
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "exec".into() }));
+    r.now = r.c.retry_at.unwrap();
+    r.k = Knowledge::new(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "stop".into() }));
+    r.now = r.c.retry_at.unwrap();
+    r.k = Knowledge::new(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Stop { force: true }));
+    r.ok();
+}
+
+/// Goal: a restart for a failed launch goes on through a failed quiesce
+/// and a failed stop (the simulator's seed 87 relaunched after the stop
+/// failed, and looped).
+#[test]
+fn a_restart_goes_on_through_its_own_failures() {
+    let mut r = serving();
+    r.c.launched_at = None;
+    let fail = |r: &mut Run, what: &str| {
+        r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: what.into() }));
+        r.now = r.c.retry_at.unwrap();
+        r.k = Knowledge::new(Machine::Running);
+    };
+    r.expect_do(|e| matches!(e, Effect::Launch { .. }));
+    fail(&mut r, "launch");
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    fail(&mut r, "quiesce");
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    fail(&mut r, "stop");
+    r.expect_do(|e| matches!(e, Effect::Stop { force: true }));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Start { .. }));
 }
 
 /// Goal: a deletion goes service, machine, removal, disk, row, observing
@@ -366,7 +427,7 @@ fn a_deletion_goes_in_order() {
     r.c.desired = Desired::Deleted;
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop));
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Remove));
     r.ok();

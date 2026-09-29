@@ -49,8 +49,9 @@ pub enum Effect {
     /// Stop the service gracefully (SIGTERM, then SIGKILL after 10 s) and
     /// sync the guest.
     Quiesce,
-    /// Stop the machine.
-    Stop,
+    /// Stop the machine; `force`: kill it, because its last graceful stop
+    /// failed (msb waits for a guest to power off with no deadline).
+    Stop { force: bool },
     /// Flush the running guest's writes to its disk.
     Sync,
     Snapshot { name: SnapshotName },
@@ -79,7 +80,7 @@ impl Effect {
     pub fn step(&self) -> Step {
         match self {
             Effect::Quiesce => Step::Quiesce,
-            Effect::Stop => Step::Stop,
+            Effect::Stop { .. } => Step::Stop,
             Effect::Sync | Effect::Snapshot { .. } => Step::Snapshot,
             Effect::Prune { .. } => Step::Prune,
             Effect::EnsureDisk { .. } => Step::Disk,
@@ -100,6 +101,15 @@ impl Effect {
     /// (shipping) rather than the computer's lifecycle.
     pub fn is_duty(&self) -> bool {
         matches!(self, Effect::StartUpload { .. } | Effect::Upload { .. } | Effect::AbortUpload { .. } | Effect::WriteManifest | Effect::Prune { .. })
+    }
+
+    /// Whether its failure is only logged: the row is unchanged and the
+    /// batch goes on as if it had been done. A guest's sync, whose
+    /// snapshot is crash-consistent without it (SQLite in WAL mode
+    /// recovers from one): a guest that cannot sync must not stop its
+    /// backups.
+    pub fn is_advisory(&self) -> bool {
+        matches!(self, Effect::Sync)
     }
 }
 

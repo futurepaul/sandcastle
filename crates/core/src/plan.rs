@@ -37,13 +37,20 @@ fn decide(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
 
 /// A clean stop: the service first, then the machine. A service whose
 /// quiesce failed last time (a wedged guest) goes down with its machine,
-/// so no stop or deletion waits on a guest forever.
+/// and a machine whose stop failed (its quiesce was tried before it) is
+/// killed, so no stop or deletion waits on a guest or a VMM forever.
 fn halt(c: &Computer, k: &Knowledge) -> Next {
-    if k.quiesced || wedged(c) {
-        Next::Do(Effect::Stop)
+    if k.quiesced || wedged(c) || stop_failed(c) {
+        Next::Do(Effect::Stop { force: stop_failed(c) })
     } else {
         Next::Do(Effect::Quiesce)
     }
+}
+
+/// The last graceful stop failed: the next one kills the machine, so no
+/// stop or deletion waits on a machine that will not power off.
+pub fn stop_failed(c: &Computer) -> bool {
+    c.failure.as_ref().is_some_and(|f| f.step == Step::Stop)
 }
 
 pub fn launch_failed(c: &Computer) -> bool {
@@ -171,10 +178,10 @@ fn launch_env(c: &Computer, target: &Generation) -> BTreeMap<String, String> {
 
 /// Launches the service, unless the guest would not take the last launch
 /// (a wedged agent, say): then the machine restarts, which clears it,
-/// before the next try (a quiesce that failed on the way is part of that
-/// restart).
+/// before the next try. A quiesce or a stop that failed on the way is part
+/// of that restart, so the restart goes on through them.
 fn launch(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
-    if launch_failed(c) || wedged(c) {
+    if launch_failed(c) || wedged(c) || stop_failed(c) {
         return halt(c, k);
     }
     Next::Do(Effect::Launch { argv: target.argv.clone(), env: launch_env(c, target) })

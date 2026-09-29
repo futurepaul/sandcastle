@@ -52,6 +52,7 @@ pub struct Stats {
     pub rotations: u64,
     pub withdrawals: u64,
     pub wedges: u64,
+    pub kills: u64,
 }
 
 pub struct Sim {
@@ -239,10 +240,9 @@ impl Sim {
                 }
                 self.node.record(id, &effect, &outcome).expect("record");
                 self.after_record(&c);
-                let failed = matches!(outcome, sandcastle_core::step::Outcome::Failed(_));
                 sandcastle_core::learn(&mut k, &effect, &outcome);
                 self.knowledge.insert(id, k);
-                !failed
+                sandcastle_core::goes_on(&effect, &outcome)
             }
         };
         if crashes && self.rng.chance(CRASH_BETWEEN) {
@@ -273,6 +273,7 @@ impl Sim {
             Effect::Snapshot { .. } => self.stats.snapshots += 1,
             Effect::Upload { .. } => self.stats.shipped += 1,
             Effect::DeleteRow => self.stats.deleted += 1,
+            Effect::Stop { force: true } => self.stats.kills += 1,
             Effect::Rotate { withdraw: false, .. } => self.stats.rotations += 1,
             Effect::Rotate { withdraw: true, .. } => self.stats.withdrawals += 1,
             _ => {}
@@ -382,8 +383,11 @@ impl Sim {
             }
             7 => w.machines.get_mut(&id).expect("running").service_alive = false,
             8 => {
-                // The service may keep answering; its guest will not.
-                w.machines.get_mut(&id).expect("running").wedged = true;
+                // The service may keep answering; its guest will not, and
+                // sometimes neither will its machine's power-off.
+                let m = w.machines.get_mut(&id).expect("running");
+                m.wedged = true;
+                m.hung = self.rng.chance(300);
                 self.stats.wedges += 1;
             }
             _ => {
@@ -488,8 +492,8 @@ impl Sim {
             _ => {}
         }
         if c.has_disk() && w.disks.contains_key(&c.id) && c.restore.is_none() {
-            assert!(c.ship.upload.is_none(), "seed {seed}: {} left an upload open", c.name);
-            assert!(!c.ship.manifest_due, "seed {seed}: {}'s manifest is owed", c.name);
+            assert!(c.ship.upload.is_none(), "seed {seed}: {} left an upload open: {:?}; the last calls:\n  {story}", c.name, c.ship);
+            assert!(!c.ship.manifest_due, "seed {seed}: {}'s manifest is owed: {:?}; the last calls:\n  {story}", c.name, c.ship);
         }
     }
 

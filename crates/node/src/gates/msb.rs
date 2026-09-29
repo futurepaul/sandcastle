@@ -130,10 +130,18 @@ impl Msb {
         }
     }
 
-    /// Runs `argv` in the machine as root, with `stdin` then end of file.
+    /// Runs `argv` in the machine as root, with `stdin` then end of file
+    /// (msb reads a stdin that is not a terminal to its end before it
+    /// starts the command); msb exits with the command's code. `-q`: no
+    /// progress text in the stdout the node reads.
+    ///
+    /// msb 0.7.4 boots a Stopped or Crashed machine for an exec and stops
+    /// it after, with no flag to refuse; the core execs only a machine its
+    /// batch's listing showed Running, so that happens only if the machine
+    /// went down in between, and the next listing sees it as it is.
     async fn exec(&self, what: &'static str, id: ComputerId, argv: &[String], stdin: &[u8]) -> GateResult<process::Output> {
         assert!(!argv.is_empty());
-        let mut args: Vec<String> = vec!["exec".into(), id.machine_name(), "--".into()];
+        let mut args: Vec<String> = vec!["exec".into(), "-q".into(), id.machine_name(), "--".into()];
         args.extend(argv.iter().cloned());
         self.run_ok(what, &args, stdin, &[], EXEC_DEADLINE).await
     }
@@ -249,7 +257,12 @@ struct Listed {
     status: String,
 }
 
-/// The node's machines in `msb ls --format json`.
+/// The node's machines in `msb ls --format json`: `Running` and
+/// `Stopped` as they are; anything else (`Crashed`, `Created`, `Paused`,
+/// and `Starting` or `Draining`, which only a daemon that died mid-create
+/// or mid-stop leaves to be seen, since msb's create, start, and stop
+/// wait for their machine) is `Other`, which the core replaces after a
+/// snapshot of what its disk holds.
 fn parse_list(text: &str) -> Option<HashMap<ComputerId, Machine>> {
     let listed: Vec<Listed> = serde_json::from_str(text).ok()?;
     let mut machines = HashMap::new();
@@ -294,8 +307,16 @@ impl super::Engine for Msb {
         self.run_ok("msb start", &["start".into(), id.machine_name()], &[], credentials, LIFECYCLE_DEADLINE).await.map(|_| ())
     }
 
-    async fn stop(&self, id: ComputerId) -> GateResult<()> {
-        self.run_ok("msb stop", &["stop".into(), id.machine_name()], &[], &[], LIFECYCLE_DEADLINE).await.map(|_| ())
+    async fn stop(&self, id: ComputerId, force: bool) -> GateResult<()> {
+        // Graceful: agentd ends the guest's processes and powers it off,
+        // and msb waits for that with no deadline of its own, so this
+        // call's deadline is the one. Forced: the VMM is killed.
+        let mut args: Vec<String> = vec!["stop".into()];
+        if force {
+            args.push("-f".into());
+        }
+        args.push(id.machine_name());
+        self.run_ok("msb stop", &args, &[], &[], LIFECYCLE_DEADLINE).await.map(|_| ())
     }
 
     async fn remove(&self, id: ComputerId) -> GateResult<()> {

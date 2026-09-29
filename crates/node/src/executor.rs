@@ -14,7 +14,7 @@ use hyper::body::Bytes;
 use sandcastle_core::limits::STEPS_PER_TICK_MAX;
 use sandcastle_core::model::{Computer, ComputerId, Fetched, FaultKind, Knowledge, Machine, Policy, Step, Upload};
 use sandcastle_core::step::{Effect, GateError, Next, Note, Observe, Outcome};
-use sandcastle_core::{apply, learn, note, plan};
+use sandcastle_core::{apply, goes_on, learn, note, plan};
 use sandcastle_proto::{Credentials, CredentialsAsk};
 
 use crate::gates::{fault, Disks, Engine, GateResult, ObjectBody, Objects, Prober, Random, ReceiveSink, SendStream, Source, World, Clock};
@@ -98,9 +98,8 @@ impl<W: World> Node<W> {
             Next::Do(effect) => {
                 let outcome = self.perform(&c, &effect).await;
                 self.record(id, &effect, &outcome)?;
-                let failed = matches!(outcome, Outcome::Failed(_));
                 learn(k, &effect, &outcome);
-                Ok(if failed { Stepped::Done } else { Stepped::Acted })
+                Ok(if goes_on(&effect, &outcome) { Stepped::Acted } else { Stepped::Done })
             }
         }
     }
@@ -186,7 +185,7 @@ impl<W: World> Node<W> {
         match effect {
             Effect::Quiesce => done(engine.quiesce(c.id).await),
             Effect::Sync => done(engine.sync(c.id).await),
-            Effect::Stop => done(engine.stop(c.id).await),
+            Effect::Stop { force } => done(engine.stop(c.id, *force).await),
             Effect::Snapshot { name } => done(disks.snapshot(c.id, *name).await),
             Effect::Prune { names } => done(disks.destroy_snapshots(c.id, names).await),
             Effect::EnsureDisk { gib } => done(disks.ensure(c.id, *gib).await.map(|_| ())),

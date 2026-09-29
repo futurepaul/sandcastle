@@ -83,8 +83,8 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
     match effect {
         // Facts about the world, which the batch's knowledge holds.
         Effect::Quiesce | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
-        Effect::Stop => {
-            if crate::plan::wedged(c) || crate::plan::launch_failed(c) {
+        Effect::Stop { .. } => {
+            if crate::plan::wedged(c) || crate::plan::launch_failed(c) || crate::plan::stop_failed(c) {
                 // Dealt with by the stop: the next stop quiesces first
                 // again, and the next boot launches.
                 n.failure = None;
@@ -143,10 +143,8 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
 
 fn failed(c: &Computer, effect: &Effect, fault: &Fault, now: Millis) -> Change {
     let mut n = c.clone();
-    if matches!(effect, Effect::Sync) {
-        // Advisory: the snapshot after it is crash-consistent without it
-        // (SQLite in WAL mode recovers from one), and a guest that cannot
-        // sync must not stop its backups. The executor logs the fault.
+    if effect.is_advisory() {
+        // The executor logs the fault.
         return Change { row: Some(n), shipped: None };
     }
     if effect.is_duty() {
@@ -251,11 +249,19 @@ fn duty_done(n: &mut Computer) {
     n.ship.retry_at = None;
 }
 
+/// Whether the batch goes on after `effect` answered `outcome`: a failure
+/// ends it (the row backs off, or the duties do), unless the effect is
+/// advisory.
+pub fn goes_on(effect: &Effect, outcome: &Outcome) -> bool {
+    !matches!(outcome, Outcome::Failed(_)) || effect.is_advisory()
+}
+
 /// What the batch knows after `effect` answered `outcome`: a changed
 /// world is observed again rather than guessed.
 pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
-    if matches!(effect, Effect::Sync) {
-        // Tried, whatever it answered (see `failed`).
+    if effect.is_advisory() {
+        // Tried, whatever it answered (`Effect::is_advisory`).
+        assert!(matches!(effect, Effect::Sync));
         k.synced = true;
         k.disk = None;
         return;
@@ -268,7 +274,7 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
     match effect {
         Effect::Quiesce => k.quiesced = true,
         Effect::Sync => unreachable!("learned above"),
-        Effect::Stop => {
+        Effect::Stop { .. } => {
             k.machine = Machine::Stopped;
             k.probe = None;
         }

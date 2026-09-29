@@ -56,6 +56,9 @@ pub struct SimMachine {
     /// The guest's agent stopped answering: every exec (launch, quiesce,
     /// sync) times out until the machine stops.
     pub wedged: bool,
+    /// The machine will not power off: a graceful stop times out until
+    /// one kills it.
+    pub hung: bool,
     pub credentials: Vec<Credential>,
 }
 
@@ -254,6 +257,7 @@ impl gates::Engine for World {
                     service_alive: false,
                     quiesced: false,
                     wedged: false,
+                    hung: false,
                     credentials: credentials.to_vec(),
                 },
             );
@@ -277,11 +281,15 @@ impl gates::Engine for World {
         })
     }
 
-    async fn stop(&self, id: ComputerId) -> GateResult<()> {
+    async fn stop(&self, id: ComputerId, force: bool) -> GateResult<()> {
         let mut s = self.lock();
-        let roll = s.engine_roll(&format!("stop {}", id.hex()));
+        let roll = s.engine_roll(&format!("stop {}{}", id.hex(), if force { " -f" } else { "" }));
         gated(roll, || {
             if let Some(m) = s.machines.get_mut(&id) {
+                if m.hung && !force {
+                    return Err(fault(GateError::Timeout, "msb stop: no answer within 60 s"));
+                }
+                m.hung = false;
                 m.state = Machine::Stopped;
                 m.service_alive = false;
                 m.wedged = false;

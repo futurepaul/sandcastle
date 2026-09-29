@@ -41,7 +41,9 @@ pub trait Engine: Send + Sync + 'static {
     /// idle, with the credentials in the engine's swap.
     fn create(&self, id: ComputerId, spec: &MachineSpec, disk: Option<PathBuf>, credentials: &[Credential]) -> impl Future<Output = GateResult<()>> + Send;
     fn start(&self, id: ComputerId, credentials: &[Credential]) -> impl Future<Output = GateResult<()>> + Send;
-    fn stop(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
+    /// Stops the machine gracefully, or with `force` kills it; stopped or
+    /// crashed already is success.
+    fn stop(&self, id: ComputerId, force: bool) -> impl Future<Output = GateResult<()>> + Send;
     fn remove(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
     /// New values for credentials the machine holds, live.
     fn rotate(&self, id: ComputerId, credentials: &[Credential]) -> impl Future<Output = GateResult<()>> + Send;

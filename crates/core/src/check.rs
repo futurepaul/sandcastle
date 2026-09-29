@@ -107,7 +107,11 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             assert_ne!(k.machine, Machine::Running, "a running machine is stopped first");
             assert!(c.desired == Desired::Deleted || c.restore.is_some());
         }
-        Effect::Stop => assert!(k.quiesced || crate::plan::wedged(c), "a machine stops after its service, or after its service would not quiesce"),
+        Effect::Stop { force } => {
+            let unquiesced = crate::plan::wedged(c) || crate::plan::stop_failed(c);
+            assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service or its stop failed");
+            assert_eq!(*force, crate::plan::stop_failed(c), "a machine is killed only after a graceful stop failed");
+        }
         Effect::Create { seq, .. } => {
             assert_eq!(c.desired, Desired::Running);
             assert_eq!(*seq, c.target().0.seq, "a machine is made from the target generation");
