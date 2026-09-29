@@ -40,12 +40,13 @@ pub enum VmState {
     Other(String),
 }
 
-/// A durable disk, for `Data` computers.
+/// A durable disk the node made (`disks.rs`), mounted in the guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Volume {
-    pub name: String,
-    pub gib: u32,
-    pub path: String,
+pub struct Disk {
+    /// The host block device (or image) the engine attaches.
+    pub device: PathBuf,
+    /// Where the guest mounts it.
+    pub mount: String,
 }
 
 /// Everything the engine needs to make a machine.
@@ -58,7 +59,7 @@ pub struct Machine {
     /// The guest's service port is published on 127.0.0.1:host_port only.
     pub host_port: u16,
     pub guest_port: u16,
-    pub volume: Option<Volume>,
+    pub disk: Option<Disk>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,22 +73,17 @@ pub fn machine_name(id: &str) -> String {
     format!("sc-{id}")
 }
 
-pub fn volume_name(id: &str) -> String {
-    format!("sc-{id}-data")
-}
-
 pub trait Engine: Send + Sync + 'static {
     /// Every machine this node made (named `sc-…`), in one call.
     fn list(&self) -> impl Future<Output = Result<HashMap<String, VmState>, EngineError>> + Send;
-    /// Makes the machine, replacing one of the same name (its volume is
-    /// kept), and boots it idle: the service is launched separately.
+    /// Makes the machine, replacing one of the same name, and boots it
+    /// idle: the service is launched separately. The disk is the node's,
+    /// so replacing a machine never touches it.
     fn create(&self, machine: &Machine) -> impl Future<Output = Result<(), EngineError>> + Send;
     fn start(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
     fn stop(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
     /// Removes the machine; absent is success.
     fn remove(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
-    /// Removes a volume; absent is success.
-    fn remove_volume(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
     /// Runs `argv` in the machine as root, with `stdin` as its input (then
     /// end of file).
     fn exec(&self, name: &str, argv: &[String], stdin: &[u8], timeout: Duration) -> impl Future<Output = Result<ExecOutput, EngineError>> + Send;
@@ -265,9 +261,9 @@ impl Engine for Msb {
             "--net-rule".into(),
             self.net_rule(),
         ];
-        if let Some(v) = &m.volume {
-            args.push("--mount-named".into());
-            args.push(format!("{}:{}:kind=disk,size={}G", v.name, v.path, v.gib));
+        if let Some(d) = &m.disk {
+            args.push("--mount-disk".into());
+            args.push(format!("{}:{}:format=raw,fstype=ext4", d.device.display(), d.mount));
         }
         args.push(m.image.clone());
         self.run_ok("msb create", &args, CREATE_TIMEOUT).await.map(|_| ())
@@ -283,13 +279,6 @@ impl Engine for Msb {
 
     async fn remove(&self, name: &str) -> Result<(), EngineError> {
         match self.run_ok("msb rm", &["rm".into(), "-f".into(), name.into()], LIFECYCLE_TIMEOUT).await {
-            Err(e) if is_not_found(&e) => Ok(()),
-            other => other.map(|_| ()),
-        }
-    }
-
-    async fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
-        match self.run_ok("msb volume rm", &["volume".into(), "rm".into(), name.into()], LIFECYCLE_TIMEOUT).await {
             Err(e) if is_not_found(&e) => Ok(()),
             other => other.map(|_| ()),
         }
@@ -314,7 +303,6 @@ pub mod fake {
     #[derive(Default)]
     pub struct State {
         pub machines: HashMap<String, (Machine, VmState)>,
-        pub volumes: HashMap<String, u32>,
         pub services: HashMap<String, tokio::task::JoinHandle<()>>,
         pub calls: Vec<String>,
         /// `create` fails for an image containing this.
@@ -420,9 +408,6 @@ pub mod fake {
             if s.fail_create_for.as_ref().is_some_and(|f| m.image.contains(f.as_str())) {
                 return Err(EngineError::Failed { what: "fake create".into(), code: Some(1), stderr: "no such image".into() });
             }
-            if let Some(v) = &m.volume {
-                s.volumes.entry(v.name.clone()).or_insert(v.gib);
-            }
             s.machines.insert(m.name.clone(), (m.clone(), VmState::Running));
             Ok(())
         }
@@ -460,17 +445,6 @@ pub mod fake {
             Ok(())
         }
 
-        /// Like msb 0.7.4: a volume a machine holds is not removed.
-        async fn remove_volume(&self, name: &str) -> Result<(), EngineError> {
-            let mut s = self.0.lock().unwrap();
-            s.calls.push(format!("remove_volume {name}"));
-            let held = s.machines.values().any(|(m, _)| m.volume.as_ref().is_some_and(|v| v.name == name));
-            if held {
-                return Err(EngineError::Failed { what: "fake volume rm".into(), code: Some(1), stderr: "currently attached".into() });
-            }
-            s.volumes.remove(name);
-            Ok(())
-        }
 
         async fn exec(&self, name: &str, argv: &[String], stdin: &[u8], _timeout: Duration) -> Result<ExecOutput, EngineError> {
             let script = argv.get(2).cloned().unwrap_or_default();

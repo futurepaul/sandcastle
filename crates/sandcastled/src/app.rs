@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use sandcastle_proto::Observed;
 
+use crate::disks::Disks;
 use crate::engine::Engine;
 use crate::store::Store;
 
@@ -62,6 +63,17 @@ pub struct Config {
     /// large home, or a slow disk, takes longer.
     #[arg(long, default_value_t = 120)]
     pub startup_grace_s: u64,
+    /// The ZFS dataset under which each computer's disk is a volume; the
+    /// daemon's user holds `zfs allow` on it (sandcastle/README.md).
+    #[arg(long)]
+    pub zfs_parent: String,
+    /// How often a serving computer's disk is snapshotted, when something
+    /// was written since the last snapshot.
+    #[arg(long, default_value_t = 300)]
+    pub snapshot_every_s: u64,
+    /// The node's snapshots kept per computer; older ones are destroyed.
+    #[arg(long, default_value_t = 24)]
+    pub snapshots_kept: usize,
 }
 
 impl Config {
@@ -105,6 +117,19 @@ impl Config {
                 return Err(format!("--guest-deny {d:?} is an IP address or CIDR"));
             }
         }
+        let parent_ok = !self.zfs_parent.is_empty()
+            && self.zfs_parent.len() <= 128
+            && !self.zfs_parent.starts_with('/')
+            && self.zfs_parent.bytes().all(|c| c.is_ascii_alphanumeric() || b"/_-.".contains(&c));
+        if !parent_ok {
+            return Err("--zfs-parent is a dataset name, e.g. tank/sandcastle".into());
+        }
+        if self.snapshot_every_s < 60 && !cfg!(test) {
+            return Err("--snapshot-every-s is at least 60".into());
+        }
+        if self.snapshots_kept == 0 || self.snapshots_kept > 1000 {
+            return Err("--snapshots-kept is 1 to 1000".into());
+        }
         if self.startup_grace_s == 0 || self.startup_grace_s > 3600 {
             return Err("--startup-grace-s is 1 to 3600".into());
         }
@@ -115,16 +140,17 @@ impl Config {
     }
 }
 
-pub struct App<E: Engine> {
+pub struct App<E: Engine, D: Disks> {
     pub config: Config,
     pub store: Store,
     pub engine: E,
+    pub disks: D,
     observed: Mutex<HashMap<String, Observed>>,
 }
 
-impl<E: Engine> App<E> {
-    pub fn new(config: Config, store: Store, engine: E) -> App<E> {
-        App { config, store, engine, observed: Mutex::new(HashMap::new()) }
+impl<E: Engine, D: Disks> App<E, D> {
+    pub fn new(config: Config, store: Store, engine: E, disks: D) -> App<E, D> {
+        App { config, store, engine, disks, observed: Mutex::new(HashMap::new()) }
     }
 
     pub fn now(&self) -> i64 {

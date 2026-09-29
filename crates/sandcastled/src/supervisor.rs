@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use sandcastle_proto::{ComputerSpec, Observed, Storage};
 
 use crate::app::App;
-use crate::engine::{machine_name, volume_name, Engine, Machine, VmState, Volume};
+use crate::disks::{snapshot_name, Disks, SnapshotKind};
+use crate::engine::{machine_name, Disk, Engine, Machine, VmState};
 use crate::store::{Computer, DesiredState};
 
 pub const TICK: Duration = Duration::from_secs(2);
@@ -91,6 +92,8 @@ pub struct Track {
     failures: u32,
     retry_at: Option<Instant>,
     last_error: Option<String>,
+    /// When the next scheduled snapshot is due, once the computer serves.
+    next_snapshot_at: Option<Instant>,
 }
 
 /// What a machine is made from, as one value: the image and the service
@@ -105,12 +108,10 @@ pub fn generation(spec: &sandcastle_proto::ComputerSpec) -> String {
 }
 
 /// The machine a computer's `spec` makes (its own, or the good one it
-/// rolled back to: storage and size are the same in both).
-pub fn machine_of(c: &Computer, spec: &ComputerSpec) -> Machine {
-    let volume = match spec.storage {
-        Storage::Data => Some(Volume { name: volume_name(&c.id), gib: spec.data_gib, path: spec.data_path.clone() }),
-        Storage::Ephemeral | Storage::Pet => None,
-    };
+/// rolled back to: storage and size are the same in both), with the disk
+/// the node made for it.
+pub fn machine_of(c: &Computer, spec: &ComputerSpec, device: Option<std::path::PathBuf>) -> Machine {
+    let disk = device.map(|device| Disk { device, mount: spec.data_path.clone() });
     Machine {
         name: machine_name(&c.id),
         image: spec.image.clone(),
@@ -118,7 +119,7 @@ pub fn machine_of(c: &Computer, spec: &ComputerSpec) -> Machine {
         memory_mib: spec.memory_mib,
         host_port: c.host_port,
         guest_port: spec.service.port,
-        volume,
+        disk,
     }
 }
 
@@ -133,7 +134,7 @@ pub fn target(c: &Computer) -> (&ComputerSpec, bool) {
     }
 }
 
-pub async fn run<E: Engine>(app: Arc<App<E>>) {
+pub async fn run<E: Engine, D: Disks>(app: Arc<App<E, D>>) {
     let mut tracks: HashMap<String, Track> = HashMap::new();
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -146,7 +147,7 @@ pub async fn run<E: Engine>(app: Arc<App<E>>) {
 
 /// One pass over every computer. Sequential: a slow create (an image
 /// pull) delays the others by at most the engine's create timeout.
-pub async fn tick<E: Engine>(app: &App<E>, tracks: &mut HashMap<String, Track>) {
+pub async fn tick<E: Engine, D: Disks>(app: &App<E, D>, tracks: &mut HashMap<String, Track>) {
     let computers = match app.store.all_computers() {
         Ok(c) => c,
         Err(e) => {
@@ -170,7 +171,7 @@ pub async fn tick<E: Engine>(app: &App<E>, tracks: &mut HashMap<String, Track>) 
     }
 }
 
-async fn converge<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, track: &mut Track) -> Observed {
+async fn converge<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, vm: Option<VmState>, track: &mut Track) -> Observed {
     let name = machine_name(&c.id);
     match c.desired {
         DesiredState::Deleted => {
@@ -184,7 +185,14 @@ async fn converge<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, tr
             Some(VmState::Running) => {
                 quiesce(app, &name).await;
                 match app.engine.stop(&name).await {
-                    Ok(()) => Observed::Stopped,
+                    Ok(()) => {
+                        // Stopped cleanly: the disk is as consistent as it
+                        // gets, so this is the snapshot to restore from.
+                        if let Err(e) = snapshot(app, c, SnapshotKind::Stop, false).await {
+                            eprintln!("supervisor: snapshot of {} after stopping: {e}", c.name);
+                        }
+                        Observed::Stopped
+                    }
                     Err(e) => Observed::Failed { reason: format!("stopping: {e}") },
                 }
             }
@@ -241,7 +249,7 @@ async fn converge<E: Engine>(app: &App<E>, c: &Computer, vm: Option<VmState>, tr
 }
 
 /// One step toward a running, serving computer made from `spec`.
-async fn run_step<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
+async fn run_step<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
     let name = machine_name(&c.id);
     let wanted = generation(spec);
     let rebase_due = c.applied_generation.as_deref() != Some(wanted.as_str());
@@ -252,8 +260,15 @@ async fn run_step<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, vm
             // then is the durable disk handed to the new machine.
             quiesce(app, &name).await;
             app.engine.stop(&name).await.map_err(|e| format!("stopping before the rebase: {e}"))?;
+            // The disk as the old generation left it, cleanly stopped: what
+            // to restore if the new one migrates data the old cannot read.
+            snapshot(app, c, SnapshotKind::Rebase, false).await.map_err(|e| format!("snapshot before the rebase: {e}"))?;
         }
-        app.engine.create(&machine_of(c, spec)).await.map_err(|e| format!("creating: {e}"))?;
+        let device = match spec.storage {
+            Storage::Data => Some(app.disks.ensure(&c.id, spec.data_gib).await.map_err(|e| format!("the disk: {e}"))?),
+            Storage::Ephemeral | Storage::Pet => None,
+        };
+        app.engine.create(&machine_of(c, spec, device)).await.map_err(|e| format!("creating: {e}"))?;
         app.store.set_applied_generation(&c.name, &wanted, app.now()).map_err(|e| format!("recording the generation: {e}"))?;
         launch(app, c, spec, track).await?;
         return Ok(Observed::Starting);
@@ -264,6 +279,7 @@ async fn run_step<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, vm
         return Ok(Observed::Starting);
     }
     if probe(c.host_port, &spec.service.health_path).await {
+        scheduled_snapshot(app, c, track).await;
         return Ok(Observed::Serving);
     }
     let grace = Duration::from_secs(app.config.startup_grace_s);
@@ -281,7 +297,7 @@ async fn run_step<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, vm
     }
 }
 
-async fn launch<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
+async fn launch<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
     let mut argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), LAUNCH_SCRIPT.into(), "sandcastle-launch".into()];
     argv.extend(spec.service.argv.iter().cloned());
     let env = env_file(&spec.service.env);
@@ -303,14 +319,65 @@ async fn launch<E: Engine>(app: &App<E>, c: &Computer, spec: &ComputerSpec, trac
 
 /// Best effort: a service that will not stop is killed after 10 s, and a
 /// machine that will not answer an exec is stopped regardless.
-async fn quiesce<E: Engine>(app: &App<E>, name: &str) {
+async fn quiesce<E: Engine, D: Disks>(app: &App<E, D>, name: &str) {
     let argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), STOP_SCRIPT.into()];
     if let Err(e) = app.engine.exec(name, &argv, &[], EXEC_TIMEOUT).await {
         eprintln!("supervisor: stopping the service on {name}: {e}");
     }
 }
 
-async fn delete<E: Engine>(app: &App<E>, c: &Computer, exists: bool) -> Result<(), String> {
+/// Takes the node's snapshot of `c`'s disk, if it has one and anything
+/// was written since the last. With `guest_running`, the guest syncs first
+/// so what its services wrote is on the disk (a crash-consistent snapshot:
+/// SQLite in WAL mode recovers from one). Then prunes to the kept count.
+async fn snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, kind: SnapshotKind, guest_running: bool) -> Result<Option<String>, String> {
+    if c.spec.storage != Storage::Data {
+        return Ok(None);
+    }
+    let written = app.disks.written(&c.id).await.map_err(|e| e.to_string())?;
+    if written == 0 {
+        return Ok(None);
+    }
+    if guest_running {
+        let argv: Vec<String> = vec!["/bin/sync".into()];
+        if let Err(e) = app.engine.exec(&machine_name(&c.id), &argv, &[], EXEC_TIMEOUT).await {
+            eprintln!("supervisor: sync before the snapshot of {}: {e}", c.name);
+        }
+    }
+    let name = snapshot_name(app.now(), kind);
+    match app.disks.snapshot(&c.id, &name).await {
+        Ok(()) => {}
+        // One of this kind this second already: that one stands.
+        Err(e) if e.to_string().contains("already exists") => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    }
+    let snaps = app.disks.snapshots(&c.id).await.map_err(|e| e.to_string())?;
+    let excess = snaps.len().saturating_sub(app.config.snapshots_kept);
+    for old in &snaps[..excess] {
+        app.disks.destroy_snapshot(&c.id, &old.name).await.map_err(|e| e.to_string())?;
+    }
+    Ok(Some(name))
+}
+
+/// The snapshot schedule of a serving computer: one every
+/// `snapshot_every_s`, skipped when nothing was written. A failure is
+/// logged and waits for the next slot; it never takes the computer down.
+async fn scheduled_snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, track: &mut Track) {
+    let every = Duration::from_secs(app.config.snapshot_every_s);
+    let now = Instant::now();
+    match track.next_snapshot_at {
+        None => track.next_snapshot_at = Some(now + every),
+        Some(due) if now >= due => {
+            track.next_snapshot_at = Some(now + every);
+            if let Err(e) = snapshot(app, c, SnapshotKind::Auto, true).await {
+                eprintln!("supervisor: scheduled snapshot of {}: {e}", c.name);
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+async fn delete<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, exists: bool) -> Result<(), String> {
     let name = machine_name(&c.id);
     if exists {
         // The engine removes neither a running machine nor a volume a
@@ -320,7 +387,7 @@ async fn delete<E: Engine>(app: &App<E>, c: &Computer, exists: bool) -> Result<(
         app.engine.remove(&name).await.map_err(|e| e.to_string())?;
     }
     if c.spec.storage == Storage::Data {
-        app.engine.remove_volume(&volume_name(&c.id)).await.map_err(|e| e.to_string())?;
+        app.disks.destroy(&c.id).await.map_err(|e| e.to_string())?;
     }
     app.store.remove_computer(&c.name).map_err(|e| e.to_string())
 }

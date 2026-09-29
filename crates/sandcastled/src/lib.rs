@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod app;
+pub mod disks;
 pub mod engine;
 pub mod http;
 pub mod proxy;

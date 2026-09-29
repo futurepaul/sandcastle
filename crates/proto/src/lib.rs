@@ -124,6 +124,10 @@ pub struct ComputerView {
     pub spec: ComputerSpec,
     pub desired: Desired,
     pub observed: Observed,
+    /// True until the node has acted on the current spec and desired
+    /// state: right after a PUT, `observed` still describes what ran
+    /// before. Poll until this is false.
+    pub pending: bool,
     /// Present while the node runs the last spec that served because this
     /// spec's image or service failed. `start` retries it; a new spec
     /// replaces it.
@@ -145,6 +149,20 @@ pub struct Rollback {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ComputerList {
     pub computers: Vec<ComputerView>,
+}
+
+/// One of the node's snapshots of a computer's durable disk.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotView {
+    /// `sc-<unix seconds>-<kind>`; kind is `auto`, `stop`, or `rebase`.
+    pub name: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotList {
+    /// Oldest first.
+    pub snapshots: Vec<SnapshotView>,
 }
 
 /// The body of `PUT /v1/grants/{pubkey}`, written by a grantor: what that

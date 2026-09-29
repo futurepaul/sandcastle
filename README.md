@@ -41,7 +41,8 @@ or what runs inside a computer:
 | `GET /v1/grants/{pubkey}` | that key, or a grantor | |
 | `DELETE /v1/grants/{pubkey}` | a grantor | revoke; the key's computers stop |
 | `PUT /v1/computers/{name}` | a key with a grant | create (201), the same spec again (200), or an update (200): the image, the service, and `url_auth` can change; storage and size are fixed (409) |
-| `GET /v1/computers[/{name}]` | the owner | desired and observed state, the URL; env values read `(set)` |
+| `GET /v1/computers[/{name}]` | the owner | desired and observed state, `pending` (true until the node has acted on the latest spec and desired state: poll until false), a `rollback` if any, the URL; env values read `(set)` |
+| `GET /v1/computers/{name}/snapshots` | the owner | the node's snapshots of the durable disk, oldest first |
 | `POST /v1/computers/{name}/start` \| `/stop` | the owner | stop stays stopped |
 | `DELETE /v1/computers/{name}` | the owner | 202; the computer reads `desired: deleted` until its machine and disk are gone, then 404 |
 | `POST /v1/computers/{name}/tickets` | the owner | a single-use link, good for 60 s, that opens the computer's URL in a browser |
@@ -78,7 +79,13 @@ Each field in brief:
 The API records what callers want. The supervisor converges the engine to
 it every 2 s, from the node's own state:
 
-- **Create.** An idle microVM is made from the image, with the data disk and the service port published on `127.0.0.1` only. Then the service is launched.
+- **Create.** An idle microVM is made from the image, with the service port published on `127.0.0.1` only. For `data` storage it gets the computer's durable disk, a ZFS volume the node made and owns (not the engine's). Then the service is launched.
+- **Snapshots** of the durable disk are taken only when something was written since the last one:
+  - every `--snapshot-every-s` (300 s by default) while serving, after the guest syncs;
+  - after the clean stop before a rebase;
+  - after a stop.
+
+  They are crash-consistent: a write the guest fsynced is in a snapshot taken at once, as proven on the test node after the ext4 journal replay. The node keeps the newest `--snapshots-kept` (24 by default).
 - **Serving** means the service answered its health path through that port. It is not the engine's say-so.
 - **Update.** When the image or service changes (a new *generation*), the node:
   1. stops the service gracefully,
@@ -155,6 +162,18 @@ ranges, link-local metadata, and the host's loopback.
 
 The host's firewall admits 22 and 443 and nothing else.
 
+**Disks** are ZFS volumes under `--zfs-parent`. The node is unprivileged, so the host is set up once:
+
+1. A pool, and the parent dataset (`zfs create -o mountpoint=none tank/sandcastle`).
+2. Delegation to the daemon's user: `zfs allow -u <user> create,destroy,mount,snapshot,send,receive,rollback,clone,promote,hold,release,volsize,volmode,refreservation,compression,userprop tank/sandcastle`. ZFS asks for `mount` even for volumes, which are never mounted on the host.
+3. A udev rule giving that user the device nodes of those volumes and no others:
+
+```
+KERNEL=="zd*", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", PROGRAM="/lib/udev/zvol_id $devnode", RESULT=="tank/sandcastle/*", OWNER="<user>", GROUP="<user>", MODE="0600"
+```
+
+A disk is formatted (ext4) only when `blkid` finds nothing on it at all, and a ZFS user property (`sandcastle:formatted`) records it once done. A blkid error is never read as "empty".
+
 ## The client
 
 ```sh
@@ -166,6 +185,7 @@ sandcastle grant <pubkey> --computers 3 --vcpus 4 --memory-mib 8192 --data-gib 2
 sandcastle put hermes --spec hermes.json
 sandcastle get hermes
 sandcastle ticket hermes                       # open the link in a browser
+sandcastle snapshots hermes
 ```
 
 Two flags cover a node without public DNS or a public certificate:
@@ -176,7 +196,7 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 35 tests.
+`cargo test --workspace --all-features`: 38 tests.
 
 The node's tests run the real router, TLS, HTTP, store, and supervisor
 against a fake engine whose services are live sockets. They cover:
@@ -186,6 +206,9 @@ against a fake engine whose services are live sockets. They cover:
 - a whole life, from create to delete, including a ticket, the cookie
   strip, an upgrade, a rebase, and stop/start;
 - rollback, and backoff when there is nothing to roll back to;
+- the snapshot schedule: skipped unless written, the guest synced first,
+  pruned, owner-only;
+- `pending` across a rebase and a stop;
 - a restart that re-adopts.
 
 The real engine is proven by hand on `finite-lat-6`

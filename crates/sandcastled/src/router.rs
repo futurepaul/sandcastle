@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::app::App;
+use crate::disks::Disks;
 use crate::engine::Engine;
 use crate::http::{text, Body};
 
@@ -46,7 +47,7 @@ pub fn target(host: Option<&str>, domain: &str) -> Target {
     }
 }
 
-pub async fn dispatch<E: Engine>(app: &App<E>, peer: SocketAddr, req: Request<Incoming>) -> Response<Body> {
+pub async fn dispatch<E: Engine, D: Disks>(app: &App<E, D>, peer: SocketAddr, req: Request<Incoming>) -> Response<Body> {
     let host = req.headers().get("host").and_then(|v| v.to_str().ok()).map(str::to_string);
     match target(host.as_deref(), &app.config.domain) {
         Target::Api => crate::api::handle(app, req).await,
@@ -55,7 +56,7 @@ pub async fn dispatch<E: Engine>(app: &App<E>, peer: SocketAddr, req: Request<In
     }
 }
 
-pub async fn serve<E: Engine>(app: Arc<App<E>>, listener: TcpListener, tls: TlsAcceptor) {
+pub async fn serve<E: Engine, D: Disks>(app: Arc<App<E, D>>, listener: TcpListener, tls: TlsAcceptor) {
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS_MAX));
     // Intentionally unbounded: the accept loop, ended by the process; each
     // connection holds one of CONNECTIONS_MAX slots.

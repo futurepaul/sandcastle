@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use sandcastled::app::{App, Config};
+use sandcastled::disks::Zfs;
 use sandcastled::engine::Msb;
 use sandcastled::store::Store;
 
@@ -26,6 +27,12 @@ async fn main() {
     let engine = Msb { program: config.msb.clone(), home: config.msb_home.clone(), guest_deny: config.guest_deny.clone() };
     if let Err(e) = engine.check_version(&config.msb_version).await {
         eprintln!("sandcastled: {e}");
+        std::process::exit(1);
+    }
+    let disks = Zfs { parent: config.zfs_parent.clone(), home: config.msb_home.clone() };
+    // The parent must exist and be ours to use; a listing proves both.
+    if let Err(e) = disks.check_parent().await {
+        eprintln!("sandcastled: --zfs-parent {}: {e}", config.zfs_parent);
         std::process::exit(1);
     }
     let tls = match sandcastled::router::tls_acceptor(&config.tls_cert, &config.tls_key) {
@@ -56,7 +63,7 @@ async fn main() {
         }
     };
     eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
-    let app = Arc::new(App::new(config, store, engine));
+    let app = Arc::new(App::new(config, store, engine, disks));
     tokio::spawn(sandcastled::supervisor::run(app.clone()));
     // Computers keep running when the daemon stops: a restart re-adopts
     // them from the store (the supervisor's first tick).

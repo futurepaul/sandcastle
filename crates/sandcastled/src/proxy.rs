@@ -13,6 +13,7 @@ use hyper::{Request, Response, StatusCode};
 use sandcastle_proto::UrlAuth;
 
 use crate::app::{random_hex32, token_hash, App};
+use crate::disks::Disks;
 use crate::engine::Engine;
 use crate::http::{text, Body};
 use crate::store::DesiredState;
@@ -30,7 +31,7 @@ const HOP_BY_HOP: [&str; 8] = ["connection", "keep-alive", "proxy-authenticate",
 
 type Resp = Response<Body>;
 
-pub async fn handle<E: Engine>(app: &App<E>, name: &str, peer: SocketAddr, req: Request<Incoming>) -> Resp {
+pub async fn handle<E: Engine, D: Disks>(app: &App<E, D>, name: &str, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     let computer = match app.store.computer(name) {
         Ok(Some(c)) if c.desired != DesiredState::Deleted => c,
         Ok(_) => return text(StatusCode::NOT_FOUND, "No such computer.\n"),
@@ -59,7 +60,7 @@ pub async fn handle<E: Engine>(app: &App<E>, name: &str, peer: SocketAddr, req: 
     forward(computer.host_port, peer, req).await
 }
 
-fn redeem<E: Engine>(app: &App<E>, name: &str, req: &Request<Incoming>) -> Resp {
+fn redeem<E: Engine, D: Disks>(app: &App<E, D>, name: &str, req: &Request<Incoming>) -> Resp {
     let ticket = req.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("ticket=")));
     let Some(ticket) = ticket else {
         return text(StatusCode::BAD_REQUEST, "No ticket.\n");

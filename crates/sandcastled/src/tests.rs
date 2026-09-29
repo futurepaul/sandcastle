@@ -16,6 +16,7 @@ use sandcastle_nip98::Keys;
 use sandcastle_proto::{ComputerSpec, ComputerView, GrantSpec, Observed, Service, Storage, Ticket, UrlAuth};
 
 use crate::app::{App, Config};
+use crate::disks::fake::FakeDisks;
 use crate::engine::fake::Fake;
 use crate::store::Store;
 use crate::supervisor::{self, Track};
@@ -23,8 +24,9 @@ use crate::supervisor::{self, Track};
 const DOMAIN: &str = "sc.test";
 
 struct Node {
-    app: Arc<App<Fake>>,
+    app: Arc<App<Fake, FakeDisks>>,
     engine: Fake,
+    disks: FakeDisks,
     addr: SocketAddr,
     connector: tokio_rustls::TlsConnector,
     dir: PathBuf,
@@ -58,10 +60,10 @@ fn write_cert(dir: &std::path::Path) -> (PathBuf, PathBuf, rustls_pki_types::Cer
 impl Node {
     async fn start(grantor: &Keys) -> Node {
         let dir = temp_dir("node");
-        Node::start_in(dir, grantor, Fake::new(), port_base()).await
+        Node::start_in(dir, grantor, Fake::new(), FakeDisks::default(), port_base()).await
     }
 
-    async fn start_in(dir: PathBuf, grantor: &Keys, engine: Fake, port_base: u16) -> Node {
+    async fn start_in(dir: PathBuf, grantor: &Keys, engine: Fake, disks: FakeDisks, port_base: u16) -> Node {
         let (cert, key, der) = write_cert(&dir);
         let config = Config {
             state_dir: dir.clone(),
@@ -78,10 +80,13 @@ impl Node {
             auth_window_s: 60,
             guest_deny: vec!["203.0.113.7".into()],
             startup_grace_s: 1,
+            zfs_parent: "tank/sandcastle".into(),
+            snapshot_every_s: 1,
+            snapshots_kept: 3,
         };
         config.check().unwrap();
         let store = Store::open(&dir.join("sandcastle.db")).unwrap();
-        let app = Arc::new(App::new(config, store, engine.clone()));
+        let app = Arc::new(App::new(config, store, engine.clone(), disks.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = crate::router::tls_acceptor(&cert, &key).unwrap();
@@ -95,7 +100,7 @@ impl Node {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        Node { app, engine, addr, connector, dir, tracks: HashMap::new(), server }
+        Node { app, engine, disks, addr, connector, dir, tracks: HashMap::new(), server }
     }
 
     async fn connect(&self, host: &str) -> hyper::client::conn::http1::SendRequest<Full<Bytes>> {
@@ -354,13 +359,25 @@ async fn a_computer_from_create_to_delete() {
         assert_eq!(&buf, b"ping");
     }
 
-    // A rebase: a new machine from the new image, the same volume.
+    // A rebase: a new machine from the new image, the same disk.
+    let (_, before) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!((before["observed"]["state"].as_str(), before["pending"].as_bool()), (Some("serving"), Some(false)));
     let mut newer = spec();
     newer.image = "example/hermes:2".into();
-    assert_eq!(node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&newer)).await.0, StatusCode::OK);
+    let (status, put) = node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&newer)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (put["observed"]["state"].as_str(), put["pending"].as_bool()),
+        (Some("serving"), Some(true)),
+        "right after the PUT, `serving` describes the old generation, and pending says so"
+    );
     node.tick().await;
+    let (_, mid) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(mid["pending"].as_bool(), Some(true));
     node.tick().await;
     assert_eq!(node.app.observed("hermes"), Observed::Serving);
+    let (_, after) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(after["pending"].as_bool(), Some(false), "serving the new generation");
     let (_, _, body) = node.browse("hermes", "/", Some(&session)).await;
     assert!(String::from_utf8_lossy(&body).contains("example/hermes:2"), "the session survives a rebase");
     let calls = node.engine.calls();
@@ -371,7 +388,13 @@ async fn a_computer_from_create_to_delete() {
         &[format!("exec {machine} stop-service"), format!("stop {machine}")],
         "the service stops and the machine stops cleanly before it is replaced: {calls:?}"
     );
-    assert_eq!(node.engine.0.lock().unwrap().volumes.len(), 2, "hermes' and other's disks, kept across the rebase");
+    assert_eq!(node.disks.0.lock().unwrap().len(), 2, "hermes' and other's disks, kept across the rebase");
+    let hermes_id = node.app.store.computer("hermes").unwrap().unwrap().id;
+    assert_eq!(node.disks.0.lock().unwrap()[&hermes_id].formats, 1, "a rebase never formats the disk again");
+    let snaps = node.disks.0.lock().unwrap()[&hermes_id].snapshots.clone();
+    assert!(snaps.iter().any(|s| s.name.ends_with("-rebase")), "a snapshot of the cleanly stopped disk before the rebase: {snaps:?}");
+    let machine = node.engine.0.lock().unwrap().machines[&crate::engine::machine_name(&hermes_id)].0.clone();
+    assert_eq!(machine.disk.unwrap().device, std::path::PathBuf::from(format!("/fake/zvol/{hermes_id}")), "the same disk, remounted");
 
     // A service-only change is a rebase too, and the new env is launched.
     let mut with_secret = newer.clone();
@@ -385,9 +408,15 @@ async fn a_computer_from_create_to_delete() {
     assert!(env.contains("HERMES_DASHBOARD_BASIC_AUTH_SECRET='stable'"), "{env}");
 
     // Stop quiesces and stops; the URL then says so.
-    assert_eq!(node.call(&alice, "POST", "/v1/computers/hermes/stop", None).await.0, StatusCode::OK);
+    node.disks.write(&hermes_id, 100);
+    let (status, stop) = node.call(&alice, "POST", "/v1/computers/hermes/stop", None).await;
+    assert_eq!((status, stop["pending"].as_bool()), (StatusCode::OK, Some(true)));
     node.tick().await;
+    let (_, stopped) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!((stopped["observed"]["state"].as_str(), stopped["pending"].as_bool()), (Some("stopped"), Some(false)));
     assert_eq!(node.app.observed("hermes"), Observed::Stopped);
+    let snaps = node.disks.0.lock().unwrap()[&hermes_id].snapshots.clone();
+    assert!(snaps.last().unwrap().name.ends_with("-stop"), "a snapshot after the clean stop: {snaps:?}");
     assert_eq!(node.browse("hermes", "/", Some(&session)).await.0, StatusCode::SERVICE_UNAVAILABLE);
 
     // Start again: start, launch, serve.
@@ -406,7 +435,7 @@ async fn a_computer_from_create_to_delete() {
     assert_eq!(node.call(&alice, "POST", "/v1/computers/hermes/tickets", None).await.0, StatusCode::CONFLICT);
     node.tick().await;
     assert!(node.app.store.computer("hermes").unwrap().is_none());
-    assert_eq!(node.engine.0.lock().unwrap().volumes.len(), 1, "only other's disk is left");
+    assert_eq!(node.disks.0.lock().unwrap().len(), 1, "only other's disk is left");
     assert_eq!(node.call(&alice, "GET", "/v1/computers/hermes", None).await.0, StatusCode::NOT_FOUND);
     std::fs::remove_dir_all(&node.dir).unwrap();
 }
@@ -442,10 +471,11 @@ async fn a_restart_readopts_without_relaunching() {
     let (grantor, alice) = (Keys::generate(), Keys::generate());
     let dir = temp_dir("restart");
     let engine = Fake::new();
+    let disks = FakeDisks::default();
     let base = port_base();
     let session;
     {
-        let mut node = Node::start_in(dir.clone(), &grantor, engine.clone(), base).await;
+        let mut node = Node::start_in(dir.clone(), &grantor, engine.clone(), disks.clone(), base).await;
         node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
         node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
         node.tick().await;
@@ -458,7 +488,7 @@ async fn a_restart_readopts_without_relaunching() {
         session = headers.get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
     }
     let calls_before = engine.calls().len();
-    let mut node = Node::start_in(dir.clone(), &grantor, engine.clone(), base).await;
+    let mut node = Node::start_in(dir.clone(), &grantor, engine.clone(), disks.clone(), base).await;
     node.tick().await;
     assert_eq!(node.app.observed("hermes"), Observed::Serving);
     let after: Vec<String> = engine.calls()[calls_before..].to_vec();
@@ -523,7 +553,7 @@ async fn a_failed_rebase_rolls_back() {
         m.image.clone()
     };
     assert_eq!(running_image(&node), "example/hermes:1", "{:?}", node.engine.calls());
-    assert_eq!(node.engine.0.lock().unwrap().volumes.len(), 1, "one disk throughout");
+    assert_eq!(node.disks.0.lock().unwrap().len(), 1, "one disk throughout");
 
     // Staying rolled back: no further attempts at the broken image.
     let creates = node.engine.calls().iter().filter(|c| c.starts_with("create")).count();
@@ -583,5 +613,54 @@ async fn a_first_generation_that_fails_backs_off() {
     assert!(matches!(node.app.observed("hermes"), Observed::Failed { reason } if !reason.starts_with("rolling back")));
     let (_, body) = node.call(&alice, "GET", "/v1/computers/hermes", None).await;
     assert!(body.get("rollback").is_none());
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a serving computer's disk is snapshotted on its schedule only
+/// when something was written, the guest syncs first, the node keeps a
+/// bounded number, and the API lists them to the owner alone. Method: the
+/// fake disks' write counter and a 1 s schedule.
+#[tokio::test]
+async fn snapshots_follow_writes_and_are_pruned() {
+    let (grantor, alice, bob) = (Keys::generate(), Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("hermes"), Observed::Serving, "the first serving tick arms the schedule");
+    let id = node.app.store.computer("hermes").unwrap().unwrap().id;
+    let count = |node: &Node| node.disks.0.lock().unwrap()[&id].snapshots.len();
+    assert_eq!(count(&node), 0);
+
+    // Due, and the disk was written (a new disk counts its formatting).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    node.tick().await;
+    assert_eq!(count(&node), 1);
+    let calls = node.engine.calls();
+    let last_exec = calls.iter().rev().find(|c| c.starts_with("exec")).unwrap();
+    assert!(last_exec.ends_with("other"), "the guest synced before the snapshot: {calls:?}");
+
+    // Due, but nothing written: no snapshot.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    node.tick().await;
+    assert_eq!(count(&node), 1);
+
+    // Writes on every slot: kept at three (snapshots_kept), oldest gone.
+    for _ in 0..4 {
+        node.disks.write(&id, 4096);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        node.tick().await;
+    }
+    let snaps = node.disks.0.lock().unwrap()[&id].snapshots.clone();
+    assert_eq!(snaps.len(), 3, "{snaps:?}");
+    assert!(snaps.windows(2).all(|w| w[0].created_at <= w[1].created_at));
+
+    let (status, body) = node.call(&alice, "GET", "/v1/computers/hermes/snapshots", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<String> = body["snapshots"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(listed, snaps.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
+    assert!(listed.iter().all(|n| n.ends_with("-auto")));
+    assert_eq!(node.call(&bob, "GET", "/v1/computers/hermes/snapshots", None).await.0, StatusCode::NOT_FOUND);
     std::fs::remove_dir_all(&node.dir).unwrap();
 }

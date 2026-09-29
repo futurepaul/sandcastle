@@ -61,6 +61,8 @@ enum Command {
     Delete { name: String },
     /// A single-use link that opens the computer's URL in a browser.
     Ticket { name: String },
+    /// The node's snapshots of a computer's durable disk, oldest first.
+    Snapshots { name: String },
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -194,5 +196,6 @@ async fn main() {
         Command::Stop { name } => call(&cli, "POST", &format!("/v1/computers/{name}/stop"), None).await,
         Command::Delete { name } => call(&cli, "DELETE", &format!("/v1/computers/{name}"), None).await,
         Command::Ticket { name } => call(&cli, "POST", &format!("/v1/computers/{name}/tickets"), None).await,
+        Command::Snapshots { name } => call(&cli, "GET", &format!("/v1/computers/{name}/snapshots"), None).await,
     }
 }
