@@ -43,6 +43,8 @@ or what runs inside a computer:
 | `PUT /v1/computers/{name}` | a key with a grant | create (201), the same spec again (200), or an update (200): the image, the service, and `url_auth` can change; storage and size are fixed (409) |
 | `GET /v1/computers[/{name}]` | the owner | desired and observed state, `pending` (true until the node has acted on the latest spec and desired state: poll until false), a `rollback` if any, the URL; env values read `(set)` |
 | `GET /v1/computers/{name}/snapshots` | the owner | the node's snapshots of the durable disk, oldest first |
+| `GET /v1/backups` | a key | its backups in the node's bucket, its deleted computers' included |
+| `PUT /v1/computers/{name}?restore=<computer id>@<snapshot>` | a key with a grant | create a computer whose disk starts from that backup: the key's own, whole back to a full stream, same size and mount |
 | `POST /v1/computers/{name}/start` \| `/stop` | the owner | stop stays stopped |
 | `DELETE /v1/computers/{name}` | the owner | 202; the computer reads `desired: deleted` until its machine and disk are gone, then 404 |
 | `POST /v1/computers/{name}/tickets` | the owner | a single-use link, good for 60 s, that opens the computer's URL in a browser |
@@ -85,7 +87,7 @@ it every 2 s, from the node's own state:
   - after the clean stop before a rebase;
   - after a stop.
 
-  They are crash-consistent: a write the guest fsynced is in a snapshot taken at once, as proven on the test node after the ext4 journal replay. The node keeps the newest `--snapshots-kept` (24 by default).
+  They are crash-consistent: a write the guest fsynced is in a snapshot taken at once, as proven on the test node after the ext4 journal replay. The node keeps the newest `--snapshots-kept` (24 by default), plus the last one shipped.
 - **Serving** means the service answered its health path through that port. It is not the engine's say-so.
 - **Update.** When the image or service changes (a new *generation*), the node:
   1. stops the service gracefully,
@@ -105,6 +107,26 @@ The router is the node's one listener: TLS on 443, then by Host.
   - The cookie is stripped before the service sees the request.
   - The service's own login (Hermes') is the second gate.
 - WebSockets pass through.
+
+## Backups
+
+With `--backup-bucket`, a shipper sends each computer's snapshots off the host, oldest first, one per computer every 10 s:
+
+- **Streams.** The first is a whole `zfs send -c`, then incrementals from the last one shipped. After 48 incrementals, or when the last shipped snapshot was pruned, the next goes whole again.
+- **Sealing.** Every object is sealed before it leaves (`seal.rs`): AES-256-GCM in 1 MiB chunks with the STREAM construction, and a per-object key from HKDF of the node's backup key, bound to the object's path. The bucket can neither read an object, nor alter it, reorder it, truncate it, or swap it for another without the restore failing.
+- **Layout.** Objects are uploaded in parts (`--backup-part-mib`, 16) under `nodes/<node>/computers/<computer id>/`.
+- **Manifest.** Each computer has a sealed manifest there, naming its owner and its chain. So a node that lost its state still authorizes and replays a restore from the bucket alone.
+- **The key.** It is a file (`--backup-key-file`, 64 hex). **The operator keeps a copy apart from the node**: without it, no backup opens.
+- **Credentials.** The bucket's key (`--backup-credentials`, an env file) should reach that bucket alone.
+
+A restore (`?restore=` on create):
+
+1. The node reads the manifest.
+2. It checks the owner is the signer and the chain is whole.
+3. It replays the chain into the new computer's empty disk, each object opened as it streams and fed to `zfs receive`.
+4. Only then does it boot the machine.
+
+A restore cut short leaves no partial disk behind.
 
 ## Running a node
 
@@ -142,7 +164,9 @@ Environment=HOME=/home/ubuntu
 ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled --state-dir /var/lib/sandcastle \
   --domain sandcastle.fragment.club --tls-cert /etc/sandcastle/le-cert.pem --tls-key /etc/sandcastle/le-key.pem \
   --grantor <hex> --msb /home/ubuntu/.local/bin/msb --msb-home /home/ubuntu \
-  --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64>
+  --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64> --zfs-parent tank/sandcastle \
+  --node-name lat-6 --backup-bucket sandcastle-backups --backup-credentials /etc/sandcastle/backups.env \
+  --backup-key-file /etc/sandcastle/backup.key
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
@@ -186,6 +210,8 @@ sandcastle put hermes --spec hermes.json
 sandcastle get hermes
 sandcastle ticket hermes                       # open the link in a browser
 sandcastle snapshots hermes
+sandcastle backups
+sandcastle put copy --spec hermes.json --restore <computer id>@<snapshot>
 ```
 
 Two flags cover a node without public DNS or a public certificate:
@@ -196,7 +222,7 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 38 tests.
+`cargo test --workspace --all-features`: 52 tests.
 
 The node's tests run the real router, TLS, HTTP, store, and supervisor
 against a fake engine whose services are live sockets. They cover:
@@ -209,6 +235,11 @@ against a fake engine whose services are live sockets. They cover:
 - the snapshot schedule: skipped unless written, the guest synced first,
   pruned, owner-only;
 - `pending` across a rebase and a stop;
+- backups shipped sealed, whole then incremental, in parts, and restored
+  into a new computer after the original is deleted; a tampered object
+  refused with no partial disk left; the shipped base kept from pruning;
+- the seal (every size, tampering, truncation, reordering, a wrong key or
+  path) and SigV4 against AWS's own worked example;
 - a restart that re-adopts.
 
 The real engine is proven by hand on `finite-lat-6`

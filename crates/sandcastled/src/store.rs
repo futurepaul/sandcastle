@@ -18,6 +18,9 @@ pub const SEEN_EVENTS_MAX: u32 = 100_000;
 /// browsers, small enough that a caller cannot fill the table.
 pub const TICKETS_PER_COMPUTER_MAX: u32 = 32;
 pub const SESSIONS_PER_COMPUTER_MAX: u32 = 64;
+/// Backups one listing returns: 24 a day for months of one computer. The
+/// node ships fresh whole streams well before a chain gets this long.
+pub const BACKUPS_LISTED_MAX: u32 = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -53,6 +56,26 @@ pub struct Computer {
     /// stays on `good_spec` while the spec's generation is this one.
     pub failed_generation: Option<String>,
     pub failed_reason: Option<String>,
+    /// `<computer id>@<snapshot>` of a backup to restore the disk from, set
+    /// at create and cleared once the disk holds it.
+    pub restore_from: Option<String>,
+}
+
+/// One snapshot shipped off the host.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Backup {
+    /// The object's key in the bucket.
+    pub key: String,
+    pub computer_id: String,
+    pub computer_name: String,
+    pub owner: String,
+    pub snapshot: String,
+    /// The snapshot this stream is incremental from; `None` for a whole one.
+    pub base: Option<String>,
+    pub created_at: i64,
+    /// Sealed bytes in the bucket.
+    pub bytes: u64,
+    pub shipped_at: i64,
 }
 
 /// `Desired` plus the deletion the supervisor has yet to carry out.
@@ -118,10 +141,26 @@ CREATE TABLE IF NOT EXISTS computers (
   good_spec TEXT,
   failed_generation TEXT CHECK (failed_generation IS NULL OR length(failed_generation) = 64),
   failed_reason TEXT,
+  restore_from TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS computers_owner ON computers (owner);
+-- Backups outlive their computer: a deleted computer's owner can still
+-- restore from them, so rows name the computer but do not reference it.
+CREATE TABLE IF NOT EXISTS backups (
+  object_key TEXT PRIMARY KEY,
+  computer_id TEXT NOT NULL CHECK (length(computer_id) = 16),
+  computer_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK (length(owner) = 64),
+  snapshot TEXT NOT NULL,
+  base_snapshot TEXT,
+  created_at INTEGER NOT NULL,
+  bytes INTEGER NOT NULL CHECK (bytes >= 0),
+  shipped_at INTEGER NOT NULL,
+  UNIQUE (computer_id, snapshot)
+);
+CREATE INDEX IF NOT EXISTS backups_owner ON backups (owner);
 CREATE TABLE IF NOT EXISTS seen_events (
   event_id TEXT PRIMARY KEY CHECK (length(event_id) = 64),
   expires_at INTEGER NOT NULL
@@ -147,8 +186,8 @@ fn spec_from_json(name: &str, raw: &str) -> Result<ComputerSpec, StoreError> {
 }
 
 /// name, id, owner, spec, desired, host_port, applied_generation,
-/// good_spec, failed_generation, failed_reason
-type ComputerRow = (String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>);
+/// good_spec, failed_generation, failed_reason, restore_from
+type ComputerRow = (String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
 
 fn row_to_computer(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerRow> {
     Ok((
@@ -162,19 +201,20 @@ fn row_to_computer(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComputerRow> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
 fn computer_from_row(r: ComputerRow) -> Result<Computer, StoreError> {
-    let (name, id, owner, spec, desired, port, applied_generation, good_spec, failed_generation, failed_reason) = r;
+    let (name, id, owner, spec, desired, port, applied_generation, good_spec, failed_generation, failed_reason, restore_from) = r;
     let host_port = u16::try_from(port).map_err(|_| StoreError::Corrupt(format!("computer {name} port {port}")))?;
     let spec = spec_from_json(&name, &spec)?;
     let good_spec = good_spec.map(|g| spec_from_json(&name, &g)).transpose()?;
-    Ok(Computer { desired: DesiredState::parse(&desired)?, spec, id, owner, host_port, applied_generation, good_spec, failed_generation, failed_reason, name })
+    Ok(Computer { desired: DesiredState::parse(&desired)?, spec, id, owner, host_port, applied_generation, good_spec, failed_generation, failed_reason, restore_from, name })
 }
 
 const COMPUTER_COLUMNS: &str =
-    "name, id, owner, spec, desired, host_port, applied_generation, good_spec, failed_generation, failed_reason";
+    "name, id, owner, spec, desired, host_port, applied_generation, good_spec, failed_generation, failed_reason, restore_from";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, StoreError> {
@@ -246,7 +286,17 @@ impl Store {
 
     /// Stores a new computer, allocating its host port from `ports`. The
     /// caller has checked the name, the spec, and the owner's grant.
-    pub fn insert_computer(&self, name: &str, id: &str, owner: &str, spec: &ComputerSpec, ports: std::ops::Range<u16>, now: i64) -> Result<Computer, StoreError> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_computer(
+        &self,
+        name: &str,
+        id: &str,
+        owner: &str,
+        spec: &ComputerSpec,
+        restore_from: Option<&str>,
+        ports: std::ops::Range<u16>,
+        now: i64,
+    ) -> Result<Computer, StoreError> {
         assert!(spec.validate().is_ok(), "callers validate the spec before storing it");
         assert_eq!(id.len(), 16);
         let spec_json = serde_json::to_string(spec).expect("a spec serializes");
@@ -272,9 +322,9 @@ impl Store {
         }
         let host_port = port.ok_or(StoreError::NoPort)?;
         tx.execute(
-            "INSERT INTO computers (name, id, owner, spec, desired, host_port, applied_generation, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, ?6)",
-            params![name, id, owner, spec_json, host_port, now],
+            "INSERT INTO computers (name, id, owner, spec, desired, host_port, applied_generation, restore_from, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, ?7, ?7)",
+            params![name, id, owner, spec_json, host_port, restore_from, now],
         )?;
         tx.commit()?;
         drop(conn);
@@ -382,6 +432,57 @@ impl Store {
         } else {
             Err(StoreError::Corrupt(format!("set_failed on missing computer {name}")))
         }
+    }
+
+    /// The disk now holds its restored backup.
+    pub fn clear_restore(&self, name: &str, now: i64) -> Result<(), StoreError> {
+        self.conn().execute("UPDATE computers SET restore_from = NULL, updated_at = ?2 WHERE name = ?1", params![name, now])?;
+        Ok(())
+    }
+
+    // Backups ---------------------------------------------------------------
+
+    pub fn record_backup(&self, b: &Backup) -> Result<(), StoreError> {
+        assert_eq!(b.computer_id.len(), 16);
+        let bytes = i64::try_from(b.bytes).map_err(|_| StoreError::Corrupt(format!("backup of {} bytes", b.bytes)))?;
+        self.conn().execute(
+            "INSERT INTO backups (object_key, computer_id, computer_name, owner, snapshot, base_snapshot, created_at, bytes, shipped_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![b.key, b.computer_id, b.computer_name, b.owner, b.snapshot, b.base, b.created_at, bytes, b.shipped_at],
+        )?;
+        Ok(())
+    }
+
+    fn select_backups(&self, tail: &str, arg: &str) -> Result<Vec<Backup>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT object_key, computer_id, computer_name, owner, snapshot, base_snapshot, created_at, bytes, shipped_at
+             FROM backups {tail} ORDER BY created_at, snapshot LIMIT {BACKUPS_LISTED_MAX}"
+        ))?;
+        let rows = stmt.query_map(params![arg], |r| {
+            Ok(Backup {
+                key: r.get(0)?,
+                computer_id: r.get(1)?,
+                computer_name: r.get(2)?,
+                owner: r.get(3)?,
+                snapshot: r.get(4)?,
+                base: r.get(5)?,
+                created_at: r.get(6)?,
+                bytes: u64::try_from(r.get::<_, i64>(7)?).unwrap_or(0),
+                shipped_at: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A computer's shipped backups, oldest first.
+    pub fn backups_of_computer(&self, computer_id: &str) -> Result<Vec<Backup>, StoreError> {
+        self.select_backups("WHERE computer_id = ?1", computer_id)
+    }
+
+    /// Every backup a key owns, its deleted computers' included.
+    pub fn backups_of_owner(&self, owner: &str) -> Result<Vec<Backup>, StoreError> {
+        self.select_backups("WHERE owner = ?1", owner)
     }
 
     /// The last step of a deletion, after the engine removed everything.
@@ -505,10 +606,10 @@ pub mod tests {
         let path = dir.join("state.db");
         {
             let s = Store::open(&path).unwrap();
-            let a = s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20002, 1).unwrap();
-            let b = s.insert_computer("b", "0000000000000002", ALICE, &spec(), 20000..20002, 1).unwrap();
+            let a = s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20002, 1).unwrap();
+            let b = s.insert_computer("b", "0000000000000002", ALICE, &spec(), None, 20000..20002, 1).unwrap();
             assert_eq!((a.host_port, b.host_port), (20000, 20001));
-            assert!(matches!(s.insert_computer("c", "0000000000000003", ALICE, &spec(), 20000..20002, 1), Err(StoreError::NoPort)));
+            assert!(matches!(s.insert_computer("c", "0000000000000003", ALICE, &spec(), None, 20000..20002, 1), Err(StoreError::NoPort)));
             s.set_applied_generation("a", &"1".repeat(64), 2).unwrap();
         }
         let s = Store::open(&path).unwrap();
@@ -522,14 +623,14 @@ pub mod tests {
     #[test]
     fn a_name_is_taken_once() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
-        assert!(matches!(s.insert_computer("a", "0000000000000002", ALICE, &spec(), 20000..20010, 1), Err(StoreError::Sqlite(_))));
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
+        assert!(matches!(s.insert_computer("a", "0000000000000002", ALICE, &spec(), None, 20000..20010, 1), Err(StoreError::Sqlite(_))));
     }
 
     #[test]
     fn a_corrupt_spec_is_corruption_not_a_default() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         s.conn().execute("UPDATE computers SET spec = '{\"image\":\"\"}'", []).unwrap();
         assert!(matches!(s.computer("a"), Err(StoreError::Corrupt(_))));
     }
@@ -545,8 +646,8 @@ pub mod tests {
     #[test]
     fn a_ticket_works_once_for_its_computer_before_it_expires() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
-        s.insert_computer("b", "0000000000000002", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
+        s.insert_computer("b", "0000000000000002", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         s.put_ticket(&hash('1'), "a", 100, 10).unwrap();
         assert!(!s.redeem_ticket(&hash('1'), "b", 20).unwrap(), "not for another computer");
         assert!(s.redeem_ticket(&hash('1'), "a", 20).unwrap());
@@ -559,7 +660,7 @@ pub mod tests {
     #[test]
     fn open_tickets_are_capped() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         for i in 0..TICKETS_PER_COMPUTER_MAX {
             s.put_ticket(&format!("{i:064x}"), "a", 100, 10).unwrap();
         }
@@ -569,7 +670,7 @@ pub mod tests {
     #[test]
     fn sessions_expire_and_the_oldest_give_way() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         s.put_session(&hash('1'), "a", 100, 10).unwrap();
         assert!(s.session_valid(&hash('1'), "a", 50).unwrap());
         assert!(!s.session_valid(&hash('1'), "a", 101).unwrap());
@@ -588,7 +689,7 @@ pub mod tests {
         let g = GrantSpec { computers_max: 1, vcpus_max: 1, memory_mib_max: 512, data_gib_max: 1 };
         s.put_grant(ALICE, &g, GRANTOR, 1).unwrap();
         assert_eq!(s.grant(ALICE).unwrap().map(|(g, _)| g.computers_max), Some(1));
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         assert!(s.delete_grant(ALICE, 2).unwrap());
         assert!(s.grant(ALICE).unwrap().is_none());
         assert_eq!(s.computer("a").unwrap().unwrap().desired, DesiredState::Stopped);
@@ -598,7 +699,7 @@ pub mod tests {
     #[test]
     fn removing_a_computer_takes_its_tickets_and_sessions() {
         let s = Store::in_memory().unwrap();
-        s.insert_computer("a", "0000000000000001", ALICE, &spec(), 20000..20010, 1).unwrap();
+        s.insert_computer("a", "0000000000000001", ALICE, &spec(), None, 20000..20010, 1).unwrap();
         s.put_session(&hash('1'), "a", 100, 10).unwrap();
         s.remove_computer("a").unwrap();
         assert!(s.computer("a").unwrap().is_some(), "only a computer marked deleted is removed");

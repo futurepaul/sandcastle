@@ -13,9 +13,12 @@ license = "MIT"
 [workspace.dependencies]
 sandcastle-proto = { path = "crates/proto" }
 sandcastle-nip98 = { path = "crates/nip98" }
+aes-gcm = "=0.10.3"
 base64 = "=0.22.1"
 clap = { version = "=4.6.6", features = ["derive", "env"] }
 hex = "=0.4.3"
+hkdf = "=0.12.4"
+hmac = "=0.12.1"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
@@ -31,6 +34,7 @@ thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "time", "io-util", "sync", "signal", "fs"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 url = "=2.5.8"
+webpki-roots = "=1.0.9"
 
 [profile.release]
 strip = true

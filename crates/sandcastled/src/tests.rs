@@ -16,6 +16,7 @@ use sandcastle_nip98::Keys;
 use sandcastle_proto::{ComputerSpec, ComputerView, GrantSpec, Observed, Service, Storage, Ticket, UrlAuth};
 
 use crate::app::{App, Config};
+use crate::backups::fake::FakeObjects;
 use crate::disks::fake::FakeDisks;
 use crate::engine::fake::Fake;
 use crate::store::Store;
@@ -24,9 +25,10 @@ use crate::supervisor::{self, Track};
 const DOMAIN: &str = "sc.test";
 
 struct Node {
-    app: Arc<App<Fake, FakeDisks>>,
+    app: Arc<App<Fake, FakeDisks, FakeObjects>>,
     engine: Fake,
     disks: FakeDisks,
+    objects: FakeObjects,
     addr: SocketAddr,
     connector: tokio_rustls::TlsConnector,
     dir: PathBuf,
@@ -83,10 +85,19 @@ impl Node {
             zfs_parent: "tank/sandcastle".into(),
             snapshot_every_s: 1,
             snapshots_kept: 3,
+            node_name: "test-node".into(),
+            backup_bucket: Some("backups".into()),
+            backup_endpoint: "https://s3.test".into(),
+            backup_region: "auto".into(),
+            backup_credentials: Some(dir.join("unused.env")),
+            backup_key_file: Some(dir.join("unused.key")),
+            backup_part_mib: 1,
         };
         config.check().unwrap();
         let store = Store::open(&dir.join("sandcastle.db")).unwrap();
-        let app = Arc::new(App::new(config, store, engine.clone(), disks.clone()));
+        let objects = FakeObjects::default();
+        let backup_key = crate::seal::BackupKey::from_hex(&"42".repeat(32)).unwrap();
+        let app = Arc::new(App::new(config, store, engine.clone(), disks.clone(), Some((objects.clone(), backup_key))));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = crate::router::tls_acceptor(&cert, &key).unwrap();
@@ -100,7 +111,7 @@ impl Node {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        Node { app, engine, disks, addr, connector, dir, tracks: HashMap::new(), server }
+        Node { app, engine, disks, objects, addr, connector, dir, tracks: HashMap::new(), server }
     }
 
     async fn connect(&self, host: &str) -> hyper::client::conn::http1::SendRequest<Full<Bytes>> {
@@ -662,5 +673,140 @@ async fn snapshots_follow_writes_and_are_pruned() {
     assert_eq!(listed, snaps.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
     assert!(listed.iter().all(|n| n.ends_with("-auto")));
     assert_eq!(node.call(&bob, "GET", "/v1/computers/hermes/snapshots", None).await.0, StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+impl Node {
+    /// Serving, with one snapshot taken after a write.
+    async fn serve_and_snapshot(&mut self, name: &str) -> String {
+        let id = self.app.store.computer(name).unwrap().unwrap().id;
+        self.disks.write(&id, 4096);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        self.tick().await;
+        id
+    }
+
+    async fn ship(&self) {
+        crate::backups::ship_pass(self.app.as_ref()).await;
+    }
+}
+
+/// Goal: snapshots leave the host sealed, as a whole stream then
+/// incrementals, and a new computer restores from them through the API,
+/// even after the original is deleted; the refusals hold. Method: fake
+/// disks whose streams span chunks and parts, a fake bucket, 1 MiB parts.
+#[tokio::test]
+async fn backups_ship_sealed_and_restore_into_a_new_computer() {
+    let (grantor, alice, bob) = (Keys::generate(), Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    for k in [&alice, &bob] {
+        node.call(&grantor, "PUT", &format!("/v1/grants/{}", k.pubkey_hex()), Some(grant())).await;
+    }
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    let id = node.serve_and_snapshot("hermes").await;
+    node.ship().await;
+    let first = node.app.store.backups_of_computer(&id).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].base, None, "the first is whole");
+    assert!(node.objects.0.lock().unwrap().completed_multiparts >= 1, "a 3 MiB stream in 1 MiB parts");
+    node.ship().await;
+    assert_eq!(node.app.store.backups_of_computer(&id).unwrap().len(), 1, "nothing new to ship");
+
+    node.serve_and_snapshot("hermes").await;
+    node.ship().await;
+    let shipped = node.app.store.backups_of_computer(&id).unwrap();
+    assert_eq!(shipped.len(), 2);
+    assert_eq!(shipped[1].base.as_deref(), Some(shipped[0].snapshot.as_str()), "then incremental");
+    {
+        let st = node.objects.0.lock().unwrap();
+        let manifest_key = crate::backups::manifest_key("test-node", &id);
+        assert!(st.objects.contains_key(&manifest_key));
+        for (k, v) in &st.objects {
+            assert!(v.starts_with(crate::seal::MAGIC), "{k} is sealed");
+            assert!(!v.windows(9).any(|w| w == b"fake-send"), "{k} holds no plaintext");
+        }
+    }
+    let (_, listed) = node.call(&alice, "GET", "/v1/backups", None).await;
+    assert_eq!(listed["backups"].as_array().unwrap().len(), 2);
+    let (_, none) = node.call(&bob, "GET", "/v1/backups", None).await;
+    assert!(none["backups"].as_array().unwrap().is_empty());
+
+    // Refusals before anything is stored.
+    let target = format!("{id}@{}", shipped[1].snapshot);
+    assert_eq!(node.call(&bob, "PUT", &format!("/v1/computers/stolen?restore={target}"), json_spec(&spec())).await.0, StatusCode::NOT_FOUND, "not bob's");
+    let mut bigger = spec();
+    bigger.data_gib = 6;
+    assert_eq!(node.call(&alice, "PUT", &format!("/v1/computers/copy?restore={target}"), json_spec(&bigger)).await.0, StatusCode::BAD_REQUEST, "another size");
+    assert_eq!(node.call(&alice, "PUT", &format!("/v1/computers/hermes?restore={target}"), json_spec(&spec())).await.0, StatusCode::CONFLICT, "onto an existing computer");
+    assert_eq!(node.call(&alice, "PUT", &format!("/v1/computers/copy?restore={id}@sc-1-auto"), json_spec(&spec())).await.0, StatusCode::NOT_FOUND, "no such snapshot");
+    assert_eq!(node.call(&alice, "PUT", "/v1/computers/copy?restore=nope", json_spec(&spec())).await.0, StatusCode::BAD_REQUEST);
+    assert!(node.app.store.computer("copy").unwrap().is_none());
+
+    // The original goes; its backups stay theirs to restore.
+    assert_eq!(node.call(&alice, "DELETE", "/v1/computers/hermes", None).await.0, StatusCode::ACCEPTED);
+    node.tick().await;
+    assert!(node.app.store.computer("hermes").unwrap().is_none());
+    assert!(!node.disks.0.lock().unwrap().contains_key(&id));
+    let (status, body) = node.call(&alice, "PUT", &format!("/v1/computers/copy?restore={target}"), json_spec(&spec())).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    node.tick().await;
+    node.tick().await;
+    assert_eq!(node.app.observed("copy"), Observed::Serving);
+    let copy = node.app.store.computer("copy").unwrap().unwrap();
+    assert_eq!(copy.restore_from, None, "the mark is cleared once restored");
+    let restored: Vec<String> = node.disks.0.lock().unwrap()[&copy.id].snapshots.iter().map(|s| s.name.clone()).collect();
+    assert_eq!(restored, shipped.iter().map(|b| b.snapshot.clone()).collect::<Vec<_>>(), "the whole chain, replayed in order");
+    assert_eq!(node.disks.0.lock().unwrap()[&copy.id].formats, 0, "a restored disk is never formatted");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: a tampered backup fails the restore, leaves no partial disk, and
+/// the computer reports why. Method: flip a byte in the bucket.
+#[tokio::test]
+async fn a_tampered_backup_does_not_restore() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    let id = node.serve_and_snapshot("hermes").await;
+    node.ship().await;
+    let b = node.app.store.backups_of_computer(&id).unwrap().remove(0);
+    node.objects.0.lock().unwrap().objects.get_mut(&b.key).unwrap()[100] ^= 1;
+    let target = format!("{id}@{}", b.snapshot);
+    assert_eq!(node.call(&alice, "PUT", &format!("/v1/computers/copy?restore={target}"), json_spec(&spec())).await.0, StatusCode::CREATED);
+    node.tick().await;
+    assert!(matches!(node.app.observed("copy"), Observed::Failed { reason } if reason.contains("does not authenticate")), "{:?}", node.app.observed("copy"));
+    let copy = node.app.store.computer("copy").unwrap().unwrap();
+    assert!(!node.disks.0.lock().unwrap().contains_key(&copy.id), "no partial disk left behind");
+    std::fs::remove_dir_all(&node.dir).unwrap();
+}
+
+/// Goal: pruning never destroys the last shipped snapshot, the base of the
+/// next incremental. Method: ship once, then take more snapshots than are
+/// kept without shipping.
+#[tokio::test]
+async fn pruning_keeps_the_shipped_base() {
+    let (grantor, alice) = (Keys::generate(), Keys::generate());
+    let mut node = Node::start(&grantor).await;
+    node.call(&grantor, "PUT", &format!("/v1/grants/{}", alice.pubkey_hex()), Some(grant())).await;
+    node.call(&alice, "PUT", "/v1/computers/hermes", json_spec(&spec())).await;
+    node.tick().await;
+    node.tick().await;
+    let id = node.serve_and_snapshot("hermes").await;
+    node.ship().await;
+    let base = node.app.store.backups_of_computer(&id).unwrap()[0].snapshot.clone();
+    for _ in 0..4 {
+        node.serve_and_snapshot("hermes").await;
+    }
+    let names: Vec<String> = node.disks.0.lock().unwrap()[&id].snapshots.iter().map(|s| s.name.clone()).collect();
+    assert!(names.contains(&base), "{names:?}");
+    assert_eq!(names.len(), 4, "three kept, plus the shipped base");
+    node.ship().await;
+    let shipped = node.app.store.backups_of_computer(&id).unwrap();
+    assert_eq!(shipped[1].base.as_deref(), Some(base.as_str()), "the next one is incremental from it");
     std::fs::remove_dir_all(&node.dir).unwrap();
 }

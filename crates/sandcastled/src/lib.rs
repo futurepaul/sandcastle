@@ -5,11 +5,14 @@
 
 pub mod api;
 pub mod app;
+pub mod backups;
 pub mod disks;
 pub mod engine;
 pub mod http;
 pub mod proxy;
 pub mod router;
+pub mod s3;
+pub mod seal;
 pub mod store;
 pub mod supervisor;
 

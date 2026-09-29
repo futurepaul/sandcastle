@@ -151,6 +151,27 @@ pub struct ComputerList {
     pub computers: Vec<ComputerView>,
 }
 
+/// A snapshot shipped off the host, restorable into a new computer with
+/// `PUT /v1/computers/{name}?restore=<computer_id>@<snapshot>`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BackupView {
+    pub computer_id: String,
+    /// The computer's name when it was shipped (it may be deleted since).
+    pub computer_name: String,
+    pub snapshot: String,
+    /// The snapshot it is incremental from, or `None` for a whole stream.
+    pub base: Option<String>,
+    pub created_at: i64,
+    /// Sealed bytes in the bucket.
+    pub bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BackupList {
+    /// Oldest first.
+    pub backups: Vec<BackupView>,
+}
+
 /// One of the node's snapshots of a computer's durable disk.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotView {

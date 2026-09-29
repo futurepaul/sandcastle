@@ -8,7 +8,9 @@ use std::sync::Mutex;
 
 use sandcastle_proto::Observed;
 
+use crate::backups::Objects;
 use crate::disks::Disks;
+use crate::seal::BackupKey;
 use crate::engine::Engine;
 use crate::store::Store;
 
@@ -74,6 +76,28 @@ pub struct Config {
     /// The node's snapshots kept per computer; older ones are destroyed.
     #[arg(long, default_value_t = 24)]
     pub snapshots_kept: usize,
+    /// This node's name in the backup bucket (`nodes/<name>/…`).
+    #[arg(long)]
+    pub node_name: String,
+    /// The S3 bucket for backups; without it, snapshots stay on the host.
+    #[arg(long)]
+    pub backup_bucket: Option<String>,
+    #[arg(long, default_value = "https://fly.storage.tigris.dev")]
+    pub backup_endpoint: String,
+    #[arg(long, default_value = "auto")]
+    pub backup_region: String,
+    /// An env file with AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= for
+    /// the bucket (a key scoped to it alone).
+    #[arg(long)]
+    pub backup_credentials: Option<PathBuf>,
+    /// A file holding the node's backup key (64 hex): every backup is sealed
+    /// with it, and restoring needs it. The operator keeps a copy apart
+    /// from the node.
+    #[arg(long)]
+    pub backup_key_file: Option<PathBuf>,
+    /// Upload part size, MiB (S3's floor is 5).
+    #[arg(long, default_value_t = 16)]
+    pub backup_part_mib: u32,
 }
 
 impl Config {
@@ -130,6 +154,16 @@ impl Config {
         if self.snapshots_kept == 0 || self.snapshots_kept > 1000 {
             return Err("--snapshots-kept is 1 to 1000".into());
         }
+        let node_ok = !self.node_name.is_empty() && self.node_name.len() <= 40 && self.node_name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-');
+        if !node_ok {
+            return Err("--node-name is 1 to 40 of [a-z0-9-]".into());
+        }
+        if self.backup_bucket.is_some() && (self.backup_credentials.is_none() || self.backup_key_file.is_none()) {
+            return Err("--backup-bucket needs --backup-credentials and --backup-key-file".into());
+        }
+        if (self.backup_part_mib < 5 && !cfg!(test)) || self.backup_part_mib > 512 {
+            return Err("--backup-part-mib is 5 to 512".into());
+        }
         if self.startup_grace_s == 0 || self.startup_grace_s > 3600 {
             return Err("--startup-grace-s is 1 to 3600".into());
         }
@@ -140,17 +174,24 @@ impl Config {
     }
 }
 
-pub struct App<E: Engine, D: Disks> {
+pub struct App<E: Engine, D: Disks, O: Objects> {
     pub config: Config,
     pub store: Store,
     pub engine: E,
     pub disks: D,
+    /// The backup bucket, when the node has one.
+    pub objects: Option<O>,
+    pub backup_key: Option<BackupKey>,
     observed: Mutex<HashMap<String, Observed>>,
 }
 
-impl<E: Engine, D: Disks> App<E, D> {
-    pub fn new(config: Config, store: Store, engine: E, disks: D) -> App<E, D> {
-        App { config, store, engine, disks, observed: Mutex::new(HashMap::new()) }
+impl<E: Engine, D: Disks, O: Objects> App<E, D, O> {
+    pub fn new(config: Config, store: Store, engine: E, disks: D, backups: Option<(O, BackupKey)>) -> App<E, D, O> {
+        let (objects, backup_key) = match backups {
+            Some((o, k)) => (Some(o), Some(k)),
+            None => (None, None),
+        };
+        App { config, store, engine, disks, objects, backup_key, observed: Mutex::new(HashMap::new()) }
     }
 
     pub fn now(&self) -> i64 {

@@ -3,6 +3,8 @@ use std::sync::Arc;
 use clap::Parser;
 use sandcastled::app::{App, Config};
 use sandcastled::disks::Zfs;
+use sandcastled::s3::{Bucket, Credentials};
+use sandcastled::seal::BackupKey;
 use sandcastled::engine::Msb;
 use sandcastled::store::Store;
 
@@ -63,8 +65,33 @@ async fn main() {
         }
     };
     eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
-    let app = Arc::new(App::new(config, store, engine, disks));
+    let backups = match &config.backup_bucket {
+        None => None,
+        Some(name) => {
+            let creds_path = config.backup_credentials.as_ref().expect("checked by Config::check");
+            let key_path = config.backup_key_file.as_ref().expect("checked by Config::check");
+            let creds = Credentials::from_env_file(creds_path).unwrap_or_else(|e| {
+                eprintln!("sandcastled: {e}");
+                std::process::exit(1);
+            });
+            let key_hex = std::fs::read_to_string(key_path).unwrap_or_else(|e| {
+                eprintln!("sandcastled: {}: {e}", key_path.display());
+                std::process::exit(1);
+            });
+            let key = BackupKey::from_hex(&key_hex).unwrap_or_else(|| {
+                eprintln!("sandcastled: {}: not 64 hex characters", key_path.display());
+                std::process::exit(1);
+            });
+            let bucket = Bucket::new(&config.backup_endpoint, &config.backup_region, name, creds).unwrap_or_else(|e| {
+                eprintln!("sandcastled: {e}");
+                std::process::exit(2);
+            });
+            Some((bucket, key))
+        }
+    };
+    let app = Arc::new(App::new(config, store, engine, disks, backups));
     tokio::spawn(sandcastled::supervisor::run(app.clone()));
+    tokio::spawn(sandcastled::backups::run(app.clone()));
     // Computers keep running when the daemon stops: a restart re-adopts
     // them from the store (the supervisor's first tick).
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler installs");

@@ -18,4 +18,4 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 url.workspace = true
-webpki-roots = "=1.0.9"
+webpki-roots.workspace = true

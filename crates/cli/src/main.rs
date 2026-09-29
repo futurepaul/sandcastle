@@ -51,8 +51,16 @@ enum Command {
     GrantOf { pubkey: String },
     /// Revoke a key's grant; its computers stop (grantors only).
     Revoke { pubkey: String },
-    /// Create a computer, or converge it to a spec (JSON file).
-    Put { name: String, #[arg(long)] spec: PathBuf },
+    /// Create a computer, or converge it to a spec (JSON file). With
+    /// --restore <computer id>@<snapshot>, a new computer's disk starts from
+    /// that backup.
+    Put {
+        name: String,
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        restore: Option<String>,
+    },
     Get { name: String },
     List,
     Start { name: String },
@@ -63,6 +71,8 @@ enum Command {
     Ticket { name: String },
     /// The node's snapshots of a computer's durable disk, oldest first.
     Snapshots { name: String },
+    /// Your backups on this node's bucket, deleted computers' included.
+    Backups,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -182,13 +192,17 @@ async fn main() {
         }
         Command::GrantOf { pubkey } => call(&cli, "GET", &format!("/v1/grants/{pubkey}"), None).await,
         Command::Revoke { pubkey } => call(&cli, "DELETE", &format!("/v1/grants/{pubkey}"), None).await,
-        Command::Put { name, spec } => {
+        Command::Put { name, spec, restore } => {
             let raw = std::fs::read(spec).unwrap_or_else(|e| fail(format!("{}: {e}", spec.display())));
             let parsed: ComputerSpec = serde_json::from_slice(&raw).unwrap_or_else(|e| fail(format!("{}: {e}", spec.display())));
             if let Err(e) = parsed.validate() {
                 fail(format!("{}: {e}", spec.display()));
             }
-            call(&cli, "PUT", &format!("/v1/computers/{name}"), Some(serde_json::to_value(parsed).expect("serializes"))).await
+            let path = match restore {
+                Some(r) => format!("/v1/computers/{name}?restore={r}"),
+                None => format!("/v1/computers/{name}"),
+            };
+            call(&cli, "PUT", &path, Some(serde_json::to_value(parsed).expect("serializes"))).await
         }
         Command::Get { name } => call(&cli, "GET", &format!("/v1/computers/{name}"), None).await,
         Command::List => call(&cli, "GET", "/v1/computers", None).await,
@@ -197,5 +211,6 @@ async fn main() {
         Command::Delete { name } => call(&cli, "DELETE", &format!("/v1/computers/{name}"), None).await,
         Command::Ticket { name } => call(&cli, "POST", &format!("/v1/computers/{name}/tickets"), None).await,
         Command::Snapshots { name } => call(&cli, "GET", &format!("/v1/computers/{name}/snapshots"), None).await,
+        Command::Backups => call(&cli, "GET", "/v1/backups", None).await,
     }
 }

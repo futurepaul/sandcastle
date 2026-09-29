@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use sandcastle_proto::{ComputerSpec, Observed, Storage};
 
 use crate::app::App;
+use crate::backups::Objects;
 use crate::disks::{snapshot_name, Disks, SnapshotKind};
 use crate::engine::{machine_name, Disk, Engine, Machine, VmState};
 use crate::store::{Computer, DesiredState};
@@ -134,7 +135,7 @@ pub fn target(c: &Computer) -> (&ComputerSpec, bool) {
     }
 }
 
-pub async fn run<E: Engine, D: Disks>(app: Arc<App<E, D>>) {
+pub async fn run<E: Engine, D: Disks, O: Objects>(app: Arc<App<E, D, O>>) {
     let mut tracks: HashMap<String, Track> = HashMap::new();
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -147,7 +148,7 @@ pub async fn run<E: Engine, D: Disks>(app: Arc<App<E, D>>) {
 
 /// One pass over every computer. Sequential: a slow create (an image
 /// pull) delays the others by at most the engine's create timeout.
-pub async fn tick<E: Engine, D: Disks>(app: &App<E, D>, tracks: &mut HashMap<String, Track>) {
+pub async fn tick<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, tracks: &mut HashMap<String, Track>) {
     let computers = match app.store.all_computers() {
         Ok(c) => c,
         Err(e) => {
@@ -171,7 +172,7 @@ pub async fn tick<E: Engine, D: Disks>(app: &App<E, D>, tracks: &mut HashMap<Str
     }
 }
 
-async fn converge<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, vm: Option<VmState>, track: &mut Track) -> Observed {
+async fn converge<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, vm: Option<VmState>, track: &mut Track) -> Observed {
     let name = machine_name(&c.id);
     match c.desired {
         DesiredState::Deleted => {
@@ -249,7 +250,7 @@ async fn converge<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, vm: Option
 }
 
 /// One step toward a running, serving computer made from `spec`.
-async fn run_step<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
+async fn run_step<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, vm: Option<VmState>, track: &mut Track) -> Result<Observed, String> {
     let name = machine_name(&c.id);
     let wanted = generation(spec);
     let rebase_due = c.applied_generation.as_deref() != Some(wanted.as_str());
@@ -263,6 +264,9 @@ async fn run_step<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &Com
             // The disk as the old generation left it, cleanly stopped: what
             // to restore if the new one migrates data the old cannot read.
             snapshot(app, c, SnapshotKind::Rebase, false).await.map_err(|e| format!("snapshot before the rebase: {e}"))?;
+        }
+        if let Some(from) = &c.restore_from {
+            restore(app, c, from).await?;
         }
         let device = match spec.storage {
             Storage::Data => Some(app.disks.ensure(&c.id, spec.data_gib).await.map_err(|e| format!("the disk: {e}"))?),
@@ -297,7 +301,7 @@ async fn run_step<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &Com
     }
 }
 
-async fn launch<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
+async fn launch<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, spec: &ComputerSpec, track: &mut Track) -> Result<(), String> {
     let mut argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), LAUNCH_SCRIPT.into(), "sandcastle-launch".into()];
     argv.extend(spec.service.argv.iter().cloned());
     let env = env_file(&spec.service.env);
@@ -319,7 +323,7 @@ async fn launch<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, spec: &Compu
 
 /// Best effort: a service that will not stop is killed after 10 s, and a
 /// machine that will not answer an exec is stopped regardless.
-async fn quiesce<E: Engine, D: Disks>(app: &App<E, D>, name: &str) {
+async fn quiesce<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, name: &str) {
     let argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), STOP_SCRIPT.into()];
     if let Err(e) = app.engine.exec(name, &argv, &[], EXEC_TIMEOUT).await {
         eprintln!("supervisor: stopping the service on {name}: {e}");
@@ -330,7 +334,7 @@ async fn quiesce<E: Engine, D: Disks>(app: &App<E, D>, name: &str) {
 /// was written since the last. With `guest_running`, the guest syncs first
 /// so what its services wrote is on the disk (a crash-consistent snapshot:
 /// SQLite in WAL mode recovers from one). Then prunes to the kept count.
-async fn snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, kind: SnapshotKind, guest_running: bool) -> Result<Option<String>, String> {
+async fn snapshot<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, kind: SnapshotKind, guest_running: bool) -> Result<Option<String>, String> {
     if c.spec.storage != Storage::Data {
         return Ok(None);
     }
@@ -353,16 +357,39 @@ async fn snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, kind: Snap
     }
     let snaps = app.disks.snapshots(&c.id).await.map_err(|e| e.to_string())?;
     let excess = snaps.len().saturating_sub(app.config.snapshots_kept);
+    // The newest shipped snapshot stays: the next incremental builds on it.
+    let base = app.store.backups_of_computer(&c.id).map_err(|e| e.to_string())?.last().map(|b| b.snapshot.clone());
     for old in &snaps[..excess] {
+        if base.as_deref() == Some(old.name.as_str()) {
+            continue;
+        }
         app.disks.destroy_snapshot(&c.id, &old.name).await.map_err(|e| e.to_string())?;
     }
     Ok(Some(name))
 }
 
+/// Restores `c`'s disk from `from` (`<computer id>@<snapshot>`) before its
+/// first machine, if the disk is not already there. A restore cut short
+/// leaves a partial disk, which is destroyed so the next attempt starts
+/// from nothing.
+async fn restore<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, from: &str) -> Result<(), String> {
+    // An existing disk was restored earlier, and the mark not yet cleared.
+    if !app.disks.exists(&c.id).await.map_err(|e| e.to_string())? {
+        let (source, snapshot) = from.split_once('@').ok_or("restore_from is <computer id>@<snapshot>")?;
+        let manifest = crate::backups::read_manifest(app, source).await?.ok_or("the backup's manifest is gone from the bucket")?;
+        let chain = crate::backups::chain(&manifest.backups, snapshot).ok_or("the backup's chain is broken")?;
+        if let Err(e) = crate::backups::restore_chain(app, &c.id, &chain).await {
+            let _ = app.disks.destroy(&c.id).await;
+            return Err(format!("restoring {from}: {e}"));
+        }
+    }
+    app.store.clear_restore(&c.name, app.now()).map_err(|e| e.to_string())
+}
+
 /// The snapshot schedule of a serving computer: one every
 /// `snapshot_every_s`, skipped when nothing was written. A failure is
 /// logged and waits for the next slot; it never takes the computer down.
-async fn scheduled_snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, track: &mut Track) {
+async fn scheduled_snapshot<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, track: &mut Track) {
     let every = Duration::from_secs(app.config.snapshot_every_s);
     let now = Instant::now();
     match track.next_snapshot_at {
@@ -377,7 +404,7 @@ async fn scheduled_snapshot<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, 
     }
 }
 
-async fn delete<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer, exists: bool) -> Result<(), String> {
+async fn delete<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer, exists: bool) -> Result<(), String> {
     let name = machine_name(&c.id);
     if exists {
         // The engine removes neither a running machine nor a volume a

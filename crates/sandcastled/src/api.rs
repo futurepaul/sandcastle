@@ -8,10 +8,11 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use sandcastle_proto::{
-    validate_name, validate_pubkey, ComputerList, ComputerSpec, ComputerView, GrantSpec, GrantView, Observed, Rollback, SnapshotList, SnapshotView, Ticket, UrlAuth, TICKET_TTL_S,
+    validate_name, validate_pubkey, BackupList, BackupView, ComputerList, ComputerSpec, ComputerView, GrantSpec, GrantView, Observed, Rollback, SnapshotList, SnapshotView, Ticket, UrlAuth, TICKET_TTL_S,
 };
 
 use crate::app::{random_hex32, token_hash, App};
+use crate::backups::Objects;
 use crate::disks::Disks;
 use crate::engine::Engine;
 use crate::http::{error, json, Body};
@@ -40,7 +41,7 @@ fn not_found() -> Resp {
 /// What a view shows in place of a service env value.
 pub const REDACTED: &str = "(set)";
 
-fn view<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer) -> ComputerView {
+fn view<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, c: &Computer) -> ComputerView {
     // Env values are the service's own secrets (a dashboard password): the
     // owner set them and never needs them read back, so views name them only.
     let mut spec = c.spec.clone();
@@ -75,7 +76,7 @@ fn view<E: Engine, D: Disks>(app: &App<E, D>, c: &Computer) -> ComputerView {
     }
 }
 
-pub async fn handle<E: Engine, D: Disks>(app: &App<E, D>, req: Request<Incoming>) -> Resp {
+pub async fn handle<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, req: Request<Incoming>) -> Resp {
     let method = req.method().clone();
     let path_and_query = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let path = req.uri().path().to_string();
@@ -104,13 +105,15 @@ pub async fn handle<E: Engine, D: Disks>(app: &App<E, D>, req: Request<Incoming>
         Err(e) => return store_error(e),
     }
     let signer = verified.pubkey;
+    let query = path_and_query.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (&method, segments.as_slice()) {
         (&Method::PUT, ["v1", "grants", key]) => put_grant(app, &signer, key, &body),
         (&Method::GET, ["v1", "grants", key]) => get_grant(app, &signer, key),
         (&Method::DELETE, ["v1", "grants", key]) => delete_grant(app, &signer, key),
         (&Method::GET, ["v1", "computers"]) => list(app, &signer),
-        (&Method::PUT, ["v1", "computers", name]) => put_computer(app, &signer, name, &body),
+        (&Method::PUT, ["v1", "computers", name]) => put_computer(app, &signer, name, &query, &body).await,
+        (&Method::GET, ["v1", "backups"]) => backups(app, &signer),
         // A computer being deleted can still be read (desired: deleted), so
         // a caller polls until 404 rather than trusting the 202.
         (&Method::GET, ["v1", "computers", name]) => match app.store.computer(name) {
@@ -131,7 +134,7 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Box<Resp>> {
     serde_json::from_slice(body).map_err(|e| Box::new(error(StatusCode::BAD_REQUEST, "invalid", format!("the body: {e}"))))
 }
 
-fn put_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str, body: &[u8]) -> Resp {
+fn put_grant<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, key: &str, body: &[u8]) -> Resp {
     if !app.is_grantor(signer) {
         return error(StatusCode::FORBIDDEN, "not_grantor", "only the node's grantors write grants");
     }
@@ -151,7 +154,7 @@ fn put_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str, body
     json(StatusCode::OK, &GrantView { pubkey: key.to_string(), spec, granted_by: signer.to_string() })
 }
 
-fn get_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str) -> Resp {
+fn get_grant<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, key: &str) -> Resp {
     // A key may read its own grant; grantors read any.
     if signer != key && !app.is_grantor(signer) {
         return error(StatusCode::FORBIDDEN, "forbidden", "a grant is read by its key or a grantor");
@@ -163,7 +166,7 @@ fn get_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str) -> R
     }
 }
 
-fn delete_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str) -> Resp {
+fn delete_grant<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, key: &str) -> Resp {
     if !app.is_grantor(signer) {
         return error(StatusCode::FORBIDDEN, "not_grantor", "only the node's grantors write grants");
     }
@@ -174,7 +177,7 @@ fn delete_grant<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, key: &str) -
     }
 }
 
-fn list<E: Engine, D: Disks>(app: &App<E, D>, signer: &str) -> Resp {
+fn list<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str) -> Resp {
     match app.store.computers_of(signer) {
         Ok(cs) => json(StatusCode::OK, &ComputerList { computers: cs.iter().map(|c| view(app, c)).collect() }),
         Err(e) => store_error(e),
@@ -183,7 +186,7 @@ fn list<E: Engine, D: Disks>(app: &App<E, D>, signer: &str) -> Resp {
 
 /// Runs `f` on the signer's own computer, or answers 404 (another's or
 /// missing) or 409 (being deleted: nothing but reading it is left).
-fn with_owned<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, f: impl FnOnce(Computer) -> Resp) -> Resp {
+fn with_owned<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, name: &str, f: impl FnOnce(Computer) -> Resp) -> Resp {
     match app.store.computer(name) {
         Ok(Some(c)) if c.owner == signer && c.desired == DesiredState::Deleted => {
             error(StatusCode::CONFLICT, "deleting", "this computer is being deleted")
@@ -198,10 +201,14 @@ fn with_owned<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, f:
 /// new image, service, or URL auth is an update (200; the supervisor
 /// rebases the machine onto its disk); a change to its storage or size is a
 /// conflict (409).
-fn put_computer<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, body: &[u8]) -> Resp {
+async fn put_computer<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, name: &str, query: &str, body: &[u8]) -> Resp {
     if let Err(e) = validate_name(name) {
         return error(StatusCode::BAD_REQUEST, "invalid", e.to_string());
     }
+    let restore = match restore_param(query) {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
     let spec: ComputerSpec = match parse(body) {
         Ok(s) => s,
         Err(r) => return *r,
@@ -224,6 +231,11 @@ fn put_computer<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, 
     let now = app.now();
     match existing {
         None => {
+            if let Some((source, snapshot)) = &restore {
+                if let Err(r) = check_restore(app, signer, source, snapshot, &spec).await {
+                    return *r;
+                }
+            }
             match app.store.count_computers_of(signer) {
                 Ok(n) if n >= grant.computers_max => {
                     return error(StatusCode::FORBIDDEN, "over_grant", format!("this key's grant allows {} computers", grant.computers_max))
@@ -232,7 +244,8 @@ fn put_computer<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, 
                 Err(e) => return store_error(e),
             }
             let id = random_hex32()[..16].to_string();
-            match app.store.insert_computer(name, &id, signer, &spec, app.config.ports(), now) {
+            let restore_from = restore.as_ref().map(|(s, snap)| format!("{s}@{snap}"));
+            match app.store.insert_computer(name, &id, signer, &spec, restore_from.as_deref(), app.config.ports(), now) {
                 Ok(c) => json(StatusCode::CREATED, &view(app, &c)),
                 // Two creates racing for one name: the loser sees a taken name.
                 Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _))) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
@@ -244,6 +257,7 @@ fn put_computer<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, 
         // Someone else's name, or one being deleted, is taken, not missing:
         // a create cannot tell the two apart, and neither can the caller.
         Some(c) if c.owner != signer || c.desired == DesiredState::Deleted => error(StatusCode::CONFLICT, "name_taken", "that name is taken"),
+        Some(_) if restore.is_some() => error(StatusCode::CONFLICT, "exists", "a restore makes a new computer; this one exists"),
         Some(c) if c.spec == spec => json(StatusCode::OK, &view(app, &c)),
         Some(c) if c.spec.can_become(&spec) => {
             if let Err(e) = app.store.set_spec(name, &spec, now) {
@@ -263,7 +277,78 @@ fn put_computer<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, 
     }
 }
 
-fn set_desired<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, desired: DesiredState) -> Resp {
+/// `restore=<computer id>@<snapshot>`, or nothing; anything else in the
+/// query is refused.
+fn restore_param(query: &str) -> Result<Option<(String, String)>, Box<Resp>> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let bad = |m: &str| Box::new(error(StatusCode::BAD_REQUEST, "invalid", m.to_string()));
+    let Some(value) = query.strip_prefix("restore=") else { return Err(bad("the only query is restore=<computer id>@<snapshot>")) };
+    let Some((source, snapshot)) = value.split_once('@') else { return Err(bad("restore is <computer id>@<snapshot>")) };
+    let source_ok = source.len() == 16 && source.bytes().all(|c| c.is_ascii_hexdigit());
+    let snapshot_ok = snapshot.starts_with(crate::disks::SNAPSHOT_PREFIX) && snapshot.len() <= 64 && snapshot.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    if source_ok && snapshot_ok {
+        Ok(Some((source.to_string(), snapshot.to_string())))
+    } else {
+        Err(bad("restore is <16 hex>@sc-<time>-<kind>"))
+    }
+}
+
+/// A restore is the signer's own backup, whole back to a full stream, into
+/// a disk of the same size. The sealed manifest in the bucket decides, so a
+/// node that lost its state still answers the same.
+async fn check_restore<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, source: &str, snapshot: &str, spec: &ComputerSpec) -> Result<(), Box<Resp>> {
+    if app.objects.is_none() {
+        return Err(Box::new(error(StatusCode::CONFLICT, "no_backups", "this node has no backup bucket")));
+    }
+    let not_found = || Box::new(error(StatusCode::NOT_FOUND, "no_backup", "no such backup"));
+    let manifest = match crate::backups::read_manifest(app, source).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Err(not_found()),
+        Err(e) => {
+            eprintln!("api: manifest of {source}: {e}");
+            return Err(Box::new(error(StatusCode::BAD_GATEWAY, "bucket", "the backup bucket did not answer")));
+        }
+    };
+    // Someone else's backup reads as missing, as someone else's computer does.
+    if manifest.owner != signer || crate::backups::chain(&manifest.backups, snapshot).is_none() {
+        return Err(not_found());
+    }
+    let fits = spec.storage == sandcastle_proto::Storage::Data && spec.data_gib == manifest.data_gib && spec.data_path == manifest.data_path;
+    if !fits {
+        return Err(Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("a restore needs data storage of {} GiB at {}, as the backup's", manifest.data_gib, manifest.data_path),
+        )));
+    }
+    Ok(())
+}
+
+fn backups<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str) -> Resp {
+    match app.store.backups_of_owner(signer) {
+        Ok(rows) => json(
+            StatusCode::OK,
+            &BackupList {
+                backups: rows
+                    .into_iter()
+                    .map(|b| BackupView {
+                        computer_id: b.computer_id,
+                        computer_name: b.computer_name,
+                        snapshot: b.snapshot,
+                        base: b.base,
+                        created_at: b.created_at,
+                        bytes: b.bytes,
+                    })
+                    .collect(),
+            },
+        ),
+        Err(e) => store_error(e),
+    }
+}
+
+fn set_desired<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, name: &str, desired: DesiredState) -> Resp {
     with_owned(app, signer, name, |c| {
         if desired == DesiredState::Running {
             // Starting needs the grant still; stopping and deleting never do.
@@ -293,7 +378,7 @@ fn set_desired<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str, d
     })
 }
 
-async fn snapshots<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str) -> Resp {
+async fn snapshots<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, name: &str) -> Resp {
     let c = match app.store.computer(name) {
         Ok(Some(c)) if c.owner == signer => c,
         Ok(_) => return not_found(),
@@ -302,13 +387,20 @@ async fn snapshots<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &st
     if c.spec.storage != sandcastle_proto::Storage::Data {
         return json(StatusCode::OK, &SnapshotList { snapshots: vec![] });
     }
+    match app.disks.exists(&c.id).await {
+        Ok(true) => {}
+        // A disk not made yet has no snapshots.
+        Ok(false) => return json(StatusCode::OK, &SnapshotList { snapshots: vec![] }),
+        Err(e) => {
+            eprintln!("api: snapshots of {name}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the node could not list the snapshots");
+        }
+    }
     match app.disks.snapshots(&c.id).await {
         Ok(snaps) => json(
             StatusCode::OK,
             &SnapshotList { snapshots: snaps.into_iter().map(|s| SnapshotView { name: s.name, created_at: s.created_at }).collect() },
         ),
-        // A disk not made yet has no snapshots.
-        Err(e) if e.to_string().contains("does not exist") => json(StatusCode::OK, &SnapshotList { snapshots: vec![] }),
         Err(e) => {
             eprintln!("api: snapshots of {name}: {e}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the node could not list the snapshots")
@@ -316,7 +408,7 @@ async fn snapshots<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &st
     }
 }
 
-fn ticket<E: Engine, D: Disks>(app: &App<E, D>, signer: &str, name: &str) -> Resp {
+fn ticket<E: Engine, D: Disks, O: Objects>(app: &App<E, D, O>, signer: &str, name: &str) -> Resp {
     with_owned(app, signer, name, |c| {
         if c.spec.url_auth == UrlAuth::Public {
             // Harmless, but a public computer needs none: say so.

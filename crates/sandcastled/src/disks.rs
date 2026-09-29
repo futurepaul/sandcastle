@@ -73,10 +73,94 @@ pub fn snapshot_name(created_at: i64, kind: SnapshotKind) -> String {
     format!("{SNAPSHOT_PREFIX}{created_at}-{}", kind.as_str())
 }
 
+/// A `zfs send` stream being read. `finish` says whether the sender
+/// exited cleanly: a stream that ended early is not a backup.
+pub enum SendStream {
+    Zfs { child: tokio::process::Child, stdout: tokio::process::ChildStdout },
+    #[cfg(test)]
+    Bytes(std::io::Cursor<Vec<u8>>),
+}
+
+impl SendStream {
+    /// The next bytes, or 0 at the end.
+    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SendStream::Zfs { stdout, .. } => stdout.read(buf).await,
+            #[cfg(test)]
+            SendStream::Bytes(c) => std::io::Read::read(c, buf),
+        }
+    }
+
+    pub async fn finish(self) -> Result<(), DiskError> {
+        match self {
+            SendStream::Zfs { mut child, .. } => {
+                let status = tokio::time::timeout(ZFS_TIMEOUT, child.wait())
+                    .await
+                    .map_err(|_| DiskError::Timeout { what: "zfs send".into(), after_s: ZFS_TIMEOUT.as_secs() })?
+                    .map_err(|e| DiskError::Spawn("zfs", e))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(DiskError::Failed { what: "zfs send".into(), code: status.code(), stderr: String::new() })
+                }
+            }
+            #[cfg(test)]
+            SendStream::Bytes(_) => Ok(()),
+        }
+    }
+}
+
+/// A `zfs receive` being fed; `finish` closes its input and waits for it
+/// to accept the whole stream.
+pub enum ReceiveSink {
+    Zfs { child: tokio::process::Child, stdin: tokio::process::ChildStdin },
+    #[cfg(test)]
+    Bytes { id: String, buf: Vec<u8>, disks: fake::FakeDisks },
+}
+
+impl ReceiveSink {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), DiskError> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            ReceiveSink::Zfs { stdin, .. } => stdin.write_all(data).await.map_err(|e| DiskError::Spawn("zfs", e)),
+            #[cfg(test)]
+            ReceiveSink::Bytes { buf, .. } => {
+                buf.extend_from_slice(data);
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn finish(self) -> Result<(), DiskError> {
+        match self {
+            ReceiveSink::Zfs { mut child, stdin } => {
+                drop(stdin);
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = e.read_to_string(&mut err).await;
+                }
+                let status = tokio::time::timeout(ZFS_TIMEOUT, child.wait())
+                    .await
+                    .map_err(|_| DiskError::Timeout { what: "zfs receive".into(), after_s: ZFS_TIMEOUT.as_secs() })?
+                    .map_err(|e| DiskError::Spawn("zfs", e))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(DiskError::Failed { what: "zfs receive".into(), code: status.code(), stderr: err.trim().to_string() })
+                }
+            }
+            #[cfg(test)]
+            ReceiveSink::Bytes { id, buf, disks } => disks.received(&id, buf),
+        }
+    }
+}
+
 pub trait Disks: Send + Sync + 'static {
     /// The computer's disk, made and formatted (ext4) if it does not exist
     /// yet; returns the path the engine mounts. Idempotent.
     fn ensure(&self, id: &str, gib: u32) -> impl Future<Output = Result<PathBuf, DiskError>> + Send;
+    /// Whether the computer's disk exists.
+    fn exists(&self, id: &str) -> impl Future<Output = Result<bool, DiskError>> + Send;
     /// Bytes written since the latest snapshot (all of it, before the first).
     fn written(&self, id: &str) -> impl Future<Output = Result<u64, DiskError>> + Send;
     fn snapshot(&self, id: &str, name: &str) -> impl Future<Output = Result<(), DiskError>> + Send;
@@ -85,6 +169,13 @@ pub trait Disks: Send + Sync + 'static {
     fn destroy_snapshot(&self, id: &str, name: &str) -> impl Future<Output = Result<(), DiskError>> + Send;
     /// Removes the disk and its snapshots; absent is success.
     fn destroy(&self, id: &str) -> impl Future<Output = Result<(), DiskError>> + Send;
+    /// A stream of snapshot `snap`, whole or from `base` (an older snapshot
+    /// of the same disk), with its blocks as compressed on disk.
+    fn send(&self, id: &str, snap: &str, base: Option<&str>) -> impl Future<Output = Result<SendStream, DiskError>> + Send;
+    /// Receives a stream into disk `id`: a whole one makes the disk, an
+    /// incremental one extends it (its base must be the disk's latest
+    /// snapshot). The disk is never mounted on the host.
+    fn receive(&self, id: &str) -> impl Future<Output = Result<ReceiveSink, DiskError>> + Send;
 }
 
 /// ZFS volumes under one parent dataset.
@@ -241,6 +332,10 @@ impl Disks for Zfs {
         Ok(device)
     }
 
+    async fn exists(&self, id: &str) -> Result<bool, DiskError> {
+        Zfs::exists(self, &self.dataset(id)).await
+    }
+
     async fn written(&self, id: &str) -> Result<u64, DiskError> {
         let out = self.run_ok("zfs", &["get", "-H", "-p", "-o", "value", "written", &self.dataset(id)], ZFS_TIMEOUT).await?;
         out.trim().parse().map_err(|_| DiskError::BadOutput { what: "zfs get written".into(), detail: out.trim().to_string() })
@@ -288,6 +383,49 @@ impl Disks for Zfs {
         }
         self.run_ok("zfs", &["destroy", "-r", &dataset], ZFS_TIMEOUT).await.map(|_| ())
     }
+
+    async fn send(&self, id: &str, snap: &str, base: Option<&str>) -> Result<SendStream, DiskError> {
+        let dataset = self.dataset(id);
+        let target = format!("{dataset}@{snap}");
+        let mut args: Vec<String> = vec!["send".into(), "-c".into()];
+        if let Some(b) = base {
+            args.push("-i".into());
+            args.push(format!("@{b}"));
+        }
+        args.push(target);
+        let mut child = tokio::process::Command::new("zfs")
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| DiskError::Spawn("zfs", e))?;
+        let stdout = child.stdout.take().expect("stdout is piped");
+        Ok(SendStream::Zfs { child, stdout })
+    }
+
+    async fn receive(&self, id: &str) -> Result<ReceiveSink, DiskError> {
+        let dataset = self.dataset(id);
+        // -u: never mount; volmode=dev: a raw device for the engine, as
+        // `ensure` makes them.
+        let mut child = tokio::process::Command::new("zfs")
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .args(["receive", "-u", "-o", "volmode=dev", &dataset])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| DiskError::Spawn("zfs", e))?;
+        let stdin = child.stdin.take().expect("stdin is piped");
+        Ok(ReceiveSink::Zfs { child, stdin })
+    }
 }
 
 /// Disks for tests: a map of volumes, each with a write counter a test
@@ -310,9 +448,56 @@ pub mod fake {
     #[derive(Clone, Default)]
     pub struct FakeDisks(pub Arc<Mutex<HashMap<String, Volume>>>);
 
+    /// A fake send stream: says which disk, snapshot, and base it is, and
+    /// is long enough to span chunks and parts.
+    pub fn stream_bytes(id: &str, snap: &str, base: Option<&str>) -> Vec<u8> {
+        let head = format!("fake-send {id}@{snap} from {}\n", base.unwrap_or("-"));
+        let mut out = head.into_bytes();
+        out.resize(out.len() + 3 * 1024 * 1024 + 17, b'z');
+        out
+    }
+
+    fn created_at_of(snap: &str) -> i64 {
+        snap.trim_start_matches(SNAPSHOT_PREFIX).split('-').next().unwrap().parse().unwrap()
+    }
+
     impl FakeDisks {
         pub fn write(&self, id: &str, bytes: u64) {
             self.0.lock().unwrap().get_mut(id).expect("a disk this test made").written += bytes;
+        }
+
+        /// A stream received into `id`: checked to be one the fake sent,
+        /// then applied (a whole stream makes the disk; an incremental one
+        /// must build on its latest snapshot, as ZFS demands).
+        pub fn received(&self, id: &str, buf: Vec<u8>) -> Result<(), DiskError> {
+            let bad = |d: &str| Err(DiskError::Failed { what: "fake receive".into(), code: Some(1), stderr: d.to_string() });
+            let head_end = buf.iter().position(|&b| b == b'\n').unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let Some(rest) = head.strip_prefix("fake-send ") else { return bad("not a fake stream") };
+            let (src, base) = rest.split_once(" from ").expect("the fake's own format");
+            let (src_id, snap) = src.split_once('@').expect("the fake's own format");
+            let base = (base != "-").then_some(base);
+            if buf != stream_bytes(src_id, snap, base) {
+                return bad("stream corrupted");
+            }
+            let mut m = self.0.lock().unwrap();
+            match base {
+                None => {
+                    if m.contains_key(id) {
+                        return bad("destination exists");
+                    }
+                    let snaps = vec![Snapshot { name: snap.into(), created_at: created_at_of(snap) }];
+                    m.insert(id.to_string(), Volume { gib: 0, written: 0, snapshots: snaps, formats: 0 });
+                }
+                Some(b) => {
+                    let Some(v) = m.get_mut(id) else { return bad("destination does not exist") };
+                    if v.snapshots.last().map(|s| s.name.as_str()) != Some(b) {
+                        return bad("most recent snapshot does not match incremental source");
+                    }
+                    v.snapshots.push(Snapshot { name: snap.into(), created_at: created_at_of(snap) });
+                }
+            }
+            Ok(())
         }
     }
 
@@ -320,8 +505,16 @@ pub mod fake {
         async fn ensure(&self, id: &str, gib: u32) -> Result<PathBuf, DiskError> {
             let mut m = self.0.lock().unwrap();
             let v = m.entry(id.to_string()).or_insert_with(|| Volume { gib, written: 4096, formats: 1, ..Volume::default() });
+            if v.gib == 0 {
+                // Received from a backup: its size came with the stream.
+                v.gib = gib;
+            }
             assert_eq!(v.gib, gib, "a disk's size is fixed");
             Ok(PathBuf::from(format!("/fake/zvol/{id}")))
+        }
+
+        async fn exists(&self, id: &str) -> Result<bool, DiskError> {
+            Ok(self.0.lock().unwrap().contains_key(id))
         }
 
         async fn written(&self, id: &str) -> Result<u64, DiskError> {
@@ -340,8 +533,12 @@ pub mod fake {
             Ok(())
         }
 
+        /// Like `zfs list` of a missing dataset: an error, not an empty list.
         async fn snapshots(&self, id: &str) -> Result<Vec<Snapshot>, DiskError> {
-            Ok(self.0.lock().unwrap().get(id).map(|v| v.snapshots.clone()).unwrap_or_default())
+            match self.0.lock().unwrap().get(id) {
+                Some(v) => Ok(v.snapshots.clone()),
+                None => Err(DiskError::Failed { what: "fake zfs list".into(), code: Some(1), stderr: "dataset does not exist".into() }),
+            }
         }
 
         async fn destroy_snapshot(&self, id: &str, name: &str) -> Result<(), DiskError> {
@@ -354,6 +551,20 @@ pub mod fake {
         async fn destroy(&self, id: &str) -> Result<(), DiskError> {
             self.0.lock().unwrap().remove(id);
             Ok(())
+        }
+
+        async fn send(&self, id: &str, snap: &str, base: Option<&str>) -> Result<SendStream, DiskError> {
+            let m = self.0.lock().unwrap();
+            let v = m.get(id).ok_or_else(|| DiskError::Failed { what: "fake send".into(), code: Some(1), stderr: "no disk".into() })?;
+            let has = |n: &str| v.snapshots.iter().any(|s| s.name == n);
+            if !has(snap) || base.is_some_and(|b| !has(b)) {
+                return Err(DiskError::Failed { what: "fake send".into(), code: Some(1), stderr: "no such snapshot".into() });
+            }
+            Ok(SendStream::Bytes(std::io::Cursor::new(stream_bytes(id, snap, base))))
+        }
+
+        async fn receive(&self, id: &str) -> Result<ReceiveSink, DiskError> {
+            Ok(ReceiveSink::Bytes { id: id.to_string(), buf: Vec::new(), disks: self.clone() })
         }
     }
 }
