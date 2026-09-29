@@ -49,8 +49,8 @@ pub enum Effect {
     /// Stop the service gracefully (SIGTERM, then SIGKILL after 10 s) and
     /// sync the guest.
     Quiesce,
-    /// Stop the machine; then owe `snapshot`, if any.
-    Stop { snapshot: Option<SnapshotKind> },
+    /// Stop the machine.
+    Stop,
     /// Flush the running guest's writes to its disk.
     Sync,
     Snapshot { name: SnapshotName },
@@ -79,7 +79,7 @@ impl Effect {
     pub fn step(&self) -> Step {
         match self {
             Effect::Quiesce => Step::Quiesce,
-            Effect::Stop { .. } => Step::Stop,
+            Effect::Stop => Step::Stop,
             Effect::Sync | Effect::Snapshot { .. } => Step::Snapshot,
             Effect::Prune { .. } => Step::Prune,
             Effect::EnsureDisk { .. } => Step::Disk,
@@ -110,6 +110,9 @@ pub enum Note {
     Served { seq: u32 },
     /// The service of generation `seq` stayed silent past the grace.
     GraceExpired { seq: u32 },
+    /// A snapshot of `kind` is owed, recorded before the stop it follows,
+    /// so a crash after the stop still takes it (a write-ahead intent).
+    Owe { kind: SnapshotKind },
     /// A snapshot owed or scheduled was already on the disk (taken before
     /// a crash), or is not needed (nothing written, or no disk).
     SnapshotTaken { name: SnapshotName },

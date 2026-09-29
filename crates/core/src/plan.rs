@@ -36,9 +36,9 @@ fn decide(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
 }
 
 /// A clean stop: the service first, then the machine.
-fn halt(k: &Knowledge, snapshot: Option<SnapshotKind>) -> Next {
+fn halt(k: &Knowledge) -> Next {
     if k.quiesced {
-        Next::Do(Effect::Stop { snapshot })
+        Next::Do(Effect::Stop)
     } else {
         Next::Do(Effect::Quiesce)
     }
@@ -49,7 +49,7 @@ fn delete(c: &Computer, k: &Knowledge) -> Next {
         return Next::Do(Effect::AbortUpload { key: u.key.clone(), id: u.id.clone() });
     }
     match k.machine {
-        Machine::Running => halt(k, None),
+        Machine::Running => halt(k),
         Machine::Stopped | Machine::Other => Next::Do(Effect::Remove),
         Machine::Absent if !c.has_disk() => Next::Do(Effect::DeleteRow),
         Machine::Absent => match &k.disk {
@@ -62,7 +62,12 @@ fn delete(c: &Computer, k: &Knowledge) -> Next {
 
 fn stopped(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     if k.machine == Machine::Running {
-        return halt(k, Some(SnapshotKind::Stop));
+        // The snapshot after a stop is owed before the stop, so a crash
+        // between the two still takes it.
+        if c.has_disk() && c.snapshot_due.is_none() {
+            return Next::Note(Note::Owe { kind: SnapshotKind::Stop });
+        }
+        return halt(k);
     }
     if let Some(n) = owed_snapshot(c, k) {
         return n;
@@ -83,12 +88,13 @@ fn running(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     match (k.machine, current) {
         (Machine::Running, true) => serving(c, target, k, p, now),
         // A rebase: the new generation's credentials first, so a source
-        // that is down leaves the old machine serving; then a clean stop.
+        // that is down leaves the old machine serving; then a clean stop
+        // (the snapshot is `make`'s, from what the disk shows).
         (Machine::Running, false) => match credentials_for(target, k) {
             Err(n) => n,
-            Ok(_) => halt(k, Some(SnapshotKind::Rebase)),
+            Ok(_) => halt(k),
         },
-        (Machine::Stopped, true) => start(target, k),
+        (Machine::Stopped, true) => start(c, target, k),
         // Absent, a stale generation, or a machine the engine lost track
         // of: a new one on the same disk.
         _ => make(c, target, k),
@@ -111,6 +117,9 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
     if let Some(n) = owed_snapshot(c, k) {
         return n;
     }
+    if let Some(n) = replacement_snapshot(c, k) {
+        return n;
+    }
     let credentials = match credentials_for(target, k) {
         Ok(v) => v,
         Err(n) => return n,
@@ -129,7 +138,10 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
     Next::Do(Effect::Create { seq: target.seq, machine, credentials })
 }
 
-fn start(target: &Generation, k: &Knowledge) -> Next {
+fn start(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
+    if let Some(n) = owed_snapshot(c, k) {
+        return n;
+    }
     match credentials_for(target, k) {
         Ok(credentials) => Next::Do(Effect::Start { credentials }),
         Err(n) => n,
@@ -182,18 +194,42 @@ fn serving_duties(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, 
     duties(c, k, p, now)
 }
 
-/// A snapshot the row owes (after a stop, or before a rebase replaces the
-/// machine): taken, found already taken, or skipped when nothing changed.
+/// The newest snapshot on the disk the row has not numbered yet: one
+/// taken just before a crash, which the row catches up to before anything
+/// else is numbered.
+fn unrecorded(c: &Computer, d: &DiskFacts) -> Option<SnapshotName> {
+    d.snapshots.iter().map(|s| s.name).filter(|n| n.seq >= c.snapshot_seq).max_by_key(|n| n.seq)
+}
+
+/// A snapshot the row owes (after a stop): taken, found already taken, or
+/// skipped when nothing changed.
 fn owed_snapshot(c: &Computer, k: &Knowledge) -> Option<Next> {
     let kind = c.snapshot_due?;
     let name = SnapshotName::new(c.snapshot_seq, kind);
     Some(match &k.disk {
         None => Next::Observe(Observe::Disk),
         Some(d) if !d.exists => Next::Note(Note::SnapshotSkipped { owed: true }),
-        Some(d) if d.has(name) => Next::Note(Note::SnapshotTaken { name }),
+        Some(d) if unrecorded(c, d).is_some() => Next::Note(Note::SnapshotTaken { name: unrecorded(c, d).expect("just seen") }),
         Some(d) if d.written == 0 => Next::Note(Note::SnapshotSkipped { owed: true }),
         Some(_) => Next::Do(Effect::Snapshot { name }),
     })
+}
+
+/// Before a stopped (or lost) machine is replaced, what it wrote since the
+/// last snapshot is snapshotted, observed rather than remembered, so no
+/// crash between the stop and the replacement can skip it.
+fn replacement_snapshot(c: &Computer, k: &Knowledge) -> Option<Next> {
+    if k.machine == Machine::Absent || !c.has_disk() {
+        return None;
+    }
+    let name = SnapshotName::new(c.snapshot_seq, SnapshotKind::Rebase);
+    match &k.disk {
+        None => Some(Next::Observe(Observe::Disk)),
+        Some(d) if !d.exists => None,
+        Some(d) if unrecorded(c, d).is_some() => Some(Next::Note(Note::SnapshotTaken { name: unrecorded(c, d).expect("just seen") })),
+        Some(d) if d.written > 0 => Some(Next::Do(Effect::Snapshot { name })),
+        Some(_) => None,
+    }
 }
 
 /// The schedule's snapshot, while serving: the guest synced first, then
@@ -211,7 +247,7 @@ fn scheduled_snapshot(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> O
         // What the guest wrote reaches the disk before it is measured.
         None if !k.synced => Next::Do(Effect::Sync),
         None => Next::Observe(Observe::Disk),
-        Some(d) if d.has(name) => Next::Note(Note::SnapshotTaken { name }),
+        Some(d) if unrecorded(c, d).is_some() => Next::Note(Note::SnapshotTaken { name: unrecorded(c, d).expect("just seen") }),
         Some(d) if d.written == 0 => Next::Note(Note::SnapshotSkipped { owed: false }),
         Some(_) => Next::Do(Effect::Snapshot { name }),
     })
@@ -239,7 +275,7 @@ fn refresh_credentials(c: &Computer, target: &Generation, k: &Knowledge, now: Mi
             match held {
                 Some(h) if h.digest == fresh.digest && !h.withdrawn => Next::Note(Note::CredentialsCurrent),
                 Some(h) if h.shape == fresh.shape => Next::Do(Effect::Rotate { credentials: values.clone(), withdraw: false }),
-                _ => halt(k, None),
+                _ => halt(k),
             }
         }
     })
@@ -271,7 +307,7 @@ fn restore(r: &Restore, k: &Knowledge) -> Next {
 
 fn halt_or_remove(k: &Knowledge) -> Next {
     match k.machine {
-        Machine::Running => halt(k, None),
+        Machine::Running => halt(k),
         _ => Next::Do(Effect::Remove),
     }
 }
@@ -299,6 +335,11 @@ fn duties(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Option<Next> 
     let Some(d) = &k.disk else { return Some(Next::Observe(Observe::Disk)) };
     if !d.exists {
         return Some(Next::Note(Note::DutiesDone));
+    }
+    // A snapshot taken just before a crash is numbered before anything is
+    // shipped or pruned.
+    if let Some(name) = unrecorded(c, d) {
+        return Some(Next::Note(Note::SnapshotTaken { name }));
     }
     if p.ships {
         if let Some((snapshot, base)) = next_to_ship(c, d) {

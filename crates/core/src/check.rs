@@ -107,12 +107,16 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             assert_ne!(k.machine, Machine::Running, "a running machine is stopped first");
             assert!(c.desired == Desired::Deleted || c.restore.is_some());
         }
-        Effect::Stop { .. } => assert!(k.quiesced, "a machine stops after its service, never under it"),
+        Effect::Stop => assert!(k.quiesced, "a machine stops after its service, never under it"),
         Effect::Create { seq, .. } => {
             assert_eq!(c.desired, Desired::Running);
             assert_eq!(*seq, c.target().0.seq, "a machine is made from the target generation");
             assert_ne!(k.machine, Machine::Running, "a running machine is stopped before it is replaced");
-            assert!(c.snapshot_due.is_none(), "the rebase snapshot is taken before the machine is replaced");
+            assert!(c.snapshot_due.is_none(), "an owed snapshot is taken before the machine is replaced");
+            if k.machine != Machine::Absent && c.has_disk() {
+                let disk = k.disk.as_ref().expect("a replacement looks at the disk first");
+                assert!(!disk.exists || disk.written == 0, "what the old machine wrote is snapshotted before it is replaced");
+            }
             assert!(c.restore.is_none(), "the disk is restored before the first machine");
         }
         Effect::Snapshot { name } => assert_eq!(name.seq, c.snapshot_seq, "snapshots are numbered in order"),

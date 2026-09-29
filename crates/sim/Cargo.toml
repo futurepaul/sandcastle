@@ -1,0 +1,15 @@
+[package]
+name = "sandcastle-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A deterministic simulation of a sandcastle node: the real core, store, and executor against a simulated world, with faults, crashes, and invariants."
+publish = false
+
+[dependencies]
+sandcastle-core.workspace = true
+sandcastle-node.workspace = true
+sandcastle-proto.workspace = true
+hyper.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

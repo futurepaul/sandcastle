@@ -155,18 +155,52 @@ fn a_rebase_stops_cleanly_and_snapshots_before_replacing() {
     r.restart(Machine::Running);
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop { snapshot: Some(SnapshotKind::Rebase) }));
+    r.expect_do(|e| matches!(e, Effect::Stop));
     r.ok();
-    assert_eq!(r.c.snapshot_due, Some(SnapshotKind::Rebase));
-    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    assert_eq!(r.next(), Next::Observe(Observe::Disk), "before replacing, it looks at what the old machine wrote");
     r.k.disk = Some(disk(4096, &[]));
     r.expect_do(|e| matches!(e, Effect::Snapshot { name } if *name == SnapshotName::new(1, SnapshotKind::Rebase)));
     r.ok();
-    assert_eq!(r.c.snapshot_due, None);
     assert_eq!(r.c.snapshot_seq, 2);
+    assert_eq!(r.next(), Next::Observe(Observe::Disk), "a changed disk is observed again, not guessed");
+    r.k.disk = Some(disk(0, &[SnapshotName::new(1, SnapshotKind::Rebase)]));
     r.expect_do(|e| matches!(e, Effect::EnsureDisk { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Create { seq: 2, machine, .. } if machine.image == "img:2"));
+}
+
+/// Goal: a crash after a rebase's stop, before its record, never replaces
+/// the machine over unsnapshotted writes (found by simulation seed 80).
+/// Method: the row still thinks the old machine runs; the engine says it
+/// is stopped; the disk holds writes past the last snapshot.
+#[test]
+fn a_crash_after_the_rebase_stop_still_snapshots_before_replacing() {
+    let mut r = serving();
+    r.c.spec = generation(2, "img:2");
+    r.restart(Machine::Stopped);
+    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    r.k.disk = Some(disk(4096, &[]));
+    r.expect_do(|e| matches!(e, Effect::Snapshot { name } if name.kind == SnapshotKind::Rebase));
+}
+
+/// Goal: stopping owes its snapshot before it stops (a write-ahead
+/// intent), so a crash between the stop and its record still takes it.
+#[test]
+fn a_stop_owes_its_snapshot_first() {
+    let mut r = serving();
+    r.c.desired = Desired::Stopped;
+    r.restart(Machine::Running);
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Stop));
+    // a crash: the stop happened, its record did not
+    r.restart(Machine::Stopped);
+    assert_eq!(r.c.snapshot_due, Some(SnapshotKind::Stop), "owed in the row already");
+    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    r.k.disk = Some(disk(512, &[]));
+    r.expect_do(|e| matches!(e, Effect::Snapshot { name } if *name == SnapshotName::new(1, SnapshotKind::Stop)));
 }
 
 /// Goal: a crash after the rebase snapshot was taken, before the row knew,
@@ -176,7 +210,6 @@ fn a_rebase_stops_cleanly_and_snapshots_before_replacing() {
 fn a_snapshot_taken_before_a_crash_counts_as_taken() {
     let mut r = serving();
     r.c.spec = generation(2, "img:2");
-    r.c.snapshot_due = Some(SnapshotKind::Rebase);
     r.restart(Machine::Stopped);
     assert_eq!(r.next(), Next::Observe(Observe::Disk));
     let name = snap(1, SnapshotKind::Rebase);
@@ -197,6 +230,7 @@ fn a_new_generation_that_fails_rolls_back() {
     r.k.machine = Machine::Stopped;
     r.c.applied_seq = Some(1);
     r.k.disk_ready = true;
+    r.k.disk = Some(disk(0, &[]));
     r.expect_do(|e| matches!(e, Effect::Create { seq: 2, .. }));
     r.answer(Outcome::Failed(Fault { error: GateError::Failed, detail: "no such image".into() }));
     assert_eq!(r.c.failed_seq, Some(2));
@@ -252,7 +286,7 @@ fn a_node_fault_during_a_rebase_does_not_roll_back() {
     r.c.spec = generation(2, "img:2");
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop { .. }));
+    r.expect_do(|e| matches!(e, Effect::Stop));
     r.ok();
     r.k.disk = Some(disk(10, &[]));
     r.expect_do(|e| matches!(e, Effect::Snapshot { .. }));
@@ -270,7 +304,7 @@ fn a_deletion_goes_in_order() {
     r.c.desired = Desired::Deleted;
     r.expect_do(|e| matches!(e, Effect::Quiesce));
     r.ok();
-    r.expect_do(|e| matches!(e, Effect::Stop { snapshot: None }));
+    r.expect_do(|e| matches!(e, Effect::Stop));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Remove));
     r.ok();

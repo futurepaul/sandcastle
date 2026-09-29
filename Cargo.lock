@@ -1188,6 +1188,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-sim"
+version = "0.1.0"
+dependencies = [
+ "hyper",
+ "sandcastle-core",
+ "sandcastle-node",
+ "sandcastle-proto",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "sandcastled"
 version = "0.1.0"
 dependencies = [

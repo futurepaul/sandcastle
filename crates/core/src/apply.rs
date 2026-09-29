@@ -47,6 +47,7 @@ pub fn note(c: &Computer, note: &Note, p: &Policy, now: Millis) -> Change {
             n.launched_at = None;
             record(&mut n, c, FaultKind::Spec, Step::Grace, &reason, now);
         }
+        Note::Owe { kind } => n.snapshot_due = Some(*kind),
         Note::SnapshotTaken { name } => taken(&mut n, *name, p, now),
         Note::SnapshotSkipped { owed: true } => n.snapshot_due = None,
         Note::SnapshotSkipped { owed: false } => n.snapshot_at = Some(now + p.snapshot_every_ms),
@@ -82,11 +83,8 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
     match effect {
         // Facts about the world, which the batch's knowledge holds.
         Effect::Quiesce | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
-        Effect::Stop { snapshot } => {
+        Effect::Stop => {
             n.launched_at = None;
-            if c.has_disk() {
-                n.snapshot_due = *snapshot;
-            }
             n.status = if c.desired == Desired::Stopped { Status::Stopped } else { Status::Starting };
             n.status_reason = None;
         }
@@ -212,7 +210,7 @@ fn served(n: &mut Computer, p: &Policy, now: Millis) {
 }
 
 fn taken(n: &mut Computer, name: SnapshotName, p: &Policy, now: Millis) {
-    assert_eq!(name.seq, n.snapshot_seq, "snapshots are taken in order");
+    assert!(name.seq >= n.snapshot_seq, "a snapshot is numbered at or past the row's next number");
     n.snapshot_seq = name.seq + 1;
     if n.snapshot_due == Some(name.kind) {
         n.snapshot_due = None;
@@ -254,14 +252,17 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
             k.synced = true;
             k.disk = None;
         }
-        Effect::Stop { .. } => {
+        Effect::Stop => {
             k.machine = Machine::Stopped;
             k.probe = None;
         }
         Effect::Snapshot { .. } | Effect::Prune { .. } | Effect::Receive { .. } => k.disk = None,
+        // Ensuring an existing disk changes nothing observed; making one does.
         Effect::EnsureDisk { .. } => {
             k.disk_ready = true;
-            k.disk = None;
+            if k.disk.as_ref().is_some_and(|d| !d.exists) {
+                k.disk = None;
+            }
         }
         Effect::DestroyDisk => {
             k.disk_ready = false;

@@ -186,7 +186,7 @@ impl<W: World> Node<W> {
         match effect {
             Effect::Quiesce => done(engine.quiesce(c.id).await),
             Effect::Sync => done(engine.sync(c.id).await),
-            Effect::Stop { .. } => done(engine.stop(c.id).await),
+            Effect::Stop => done(engine.stop(c.id).await),
             Effect::Snapshot { name } => done(disks.snapshot(c.id, *name).await),
             Effect::Prune { names } => done(disks.destroy_snapshots(c.id, names).await),
             Effect::EnsureDisk { gib } => done(disks.ensure(c.id, *gib).await.map(|_| ())),
