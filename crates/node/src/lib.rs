@@ -5,4 +5,8 @@
 //! top of it.
 
 pub mod commands;
+pub mod executor;
+pub mod gates;
+pub mod manifest;
+pub mod seal;
 pub mod store;
