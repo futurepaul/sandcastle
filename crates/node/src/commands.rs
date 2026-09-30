@@ -7,7 +7,8 @@
 //! of a running computer.
 
 use rusqlite::{params, OptionalExtension};
-use sandcastle_core::model::{ChainLink, Computer, ComputerId, Desired, Fixed, Generation, Millis, Restore, Ship, Status};
+use sandcastle_core::budget;
+use sandcastle_core::model::{ChainLink, Computer, ComputerId, Desired, Fixed, Generation, Millis, Policy, Restore, Ship, Status};
 use sandcastle_proto::{ComputerSpec, ComputerView, GrantSpec, GrantView, Observed, Rollback, Storage};
 
 use crate::store::{self, Store, StoreError, COMPUTERS_PER_NODE_MAX};
@@ -38,6 +39,8 @@ pub enum CommandError {
     RestoreExists,
     #[error("the node is full: {0}")]
     NodeFull(&'static str),
+    #[error("the node's reserve has no room: {0}")]
+    NoRoom(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -182,6 +185,7 @@ pub fn put_computer(
     restore: Option<RestorePlan>,
     id: ComputerId,
     ports: std::ops::Range<u16>,
+    policy: &Policy,
     now: Millis,
 ) -> Result<(Computer, Put), CommandError> {
     sandcastle_proto::validate_name(name).map_err(|e| CommandError::Invalid(e.to_string()))?;
@@ -197,7 +201,7 @@ pub fn put_computer(
     }
     let existing: Option<String> = tx.query_row("SELECT id FROM computers WHERE name = ?1", params![name], |r| r.get(0)).optional()?;
     let result = match existing {
-        None => create(&tx, signer, name, spec, restore, id, ports, grant, now)?,
+        None => create(&tx, signer, name, spec, restore, id, ports, grant, policy, now)?,
         Some(hex) => {
             let existing_id = ComputerId::parse(&hex).ok_or_else(|| StoreError::Corrupt(format!("computer id {hex:?}")))?;
             let current = store::read_in(&tx, existing_id)?.ok_or_else(|| StoreError::Corrupt("a named computer vanished".into()))?;
@@ -231,12 +235,14 @@ fn create(
     id: ComputerId,
     ports: std::ops::Range<u16>,
     grant: GrantSpec,
+    policy: &Policy,
     now: Millis,
 ) -> Result<(Computer, Put), CommandError> {
     let on_node: u32 = tx.query_row("SELECT count(*) FROM computers", [], |r| r.get(0))?;
     if on_node >= COMPUTERS_PER_NODE_MAX {
         return Err(CommandError::NodeFull("computers per node"));
     }
+    fits(tx, &fixed_of(spec), on_node, policy)?;
     let mine: u32 = tx.query_row("SELECT count(*) FROM computers WHERE owner = ?1", params![signer], |r| r.get(0))?;
     if mine >= grant.computers_max {
         return Err(CommandError::OverGrant(format!("this key's grant allows {} computers", grant.computers_max)));
@@ -274,6 +280,36 @@ fn create(
     let stored = store::read_in(tx, id)?.ok_or_else(|| StoreError::Corrupt("an inserted computer is missing".into()))?;
     assert_eq!(stored, computer, "a new computer reads back as inserted");
     Ok((stored, Put::Created))
+}
+
+/// Whether a new computer fits the node's reserve (docs/sandcastle-sleep.md,
+/// Budgets): its disk and every other's, with their snapshots' headroom,
+/// in the disk reserve; its machine's writable layer and every other's in
+/// the engine's; and its machine alone in the memory reserve (whether it
+/// may run at a given moment is the executor's ledger's to say).
+fn fits(tx: &rusqlite::Transaction<'_>, fixed: &Fixed, on_node: u32, policy: &Policy) -> Result<(), CommandError> {
+    let (reserve, costs) = (&policy.reserve, &policy.costs);
+    let need = budget::machine_memory(fixed, costs);
+    if need > reserve.memory {
+        return Err(CommandError::NoRoom(format!("its machine needs {} MiB, more than the whole memory reserve ({} MiB)", need >> 20, reserve.memory >> 20)));
+    }
+    let mut stmt = tx.prepare(&format!("SELECT data_gib FROM computers LIMIT {COMPUTERS_PER_NODE_MAX}"))?;
+    let disks: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let committed: u64 = disks.iter().map(|g| budget::disk(&Fixed { data_gib: *g, ..fixed.clone() }, costs)).sum();
+    let wanted = budget::disk(fixed, costs);
+    if committed + wanted > reserve.disk {
+        return Err(CommandError::NoRoom(format!(
+            "its disk and its snapshots' headroom need {} GiB; the disk reserve has {} GiB of {} left",
+            wanted >> 30,
+            reserve.disk.saturating_sub(committed) >> 30,
+            reserve.disk >> 30
+        )));
+    }
+    let layers = u64::from(on_node + 1) * costs.layer;
+    if layers > reserve.engine_disk {
+        return Err(CommandError::NoRoom(format!("the engine's disk reserve holds {} machines' writable layers", reserve.engine_disk / costs.layer)));
+    }
+    Ok(())
 }
 
 /// The lowest free port in `ports`. Bounded by the range and by

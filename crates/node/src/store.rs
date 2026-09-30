@@ -1039,7 +1039,17 @@ mod tests {
             credentials_url: None,
         };
         let id = ComputerId::from_bytes([7; 8]);
-        crate::commands::put_computer(&store, &owner, "busy", &spec, None, id, 20_000..20_001, 1).unwrap();
+        let policy = sandcastle_core::model::Policy {
+            startup_grace_ms: 1,
+            snapshot_every_ms: 1,
+            snapshots_kept: 1,
+            credentials_every_ms: 1,
+            ships: true,
+            reserve: sandcastle_core::budget::Reserve { memory: 1 << 30, disk: 1 << 30, engine_disk: 1 << 40 },
+            costs: sandcastle_core::budget::Costs { machine_overhead: 0, snapshot_headroom_pct: 0, layer: 1 },
+            node: "n".into(),
+        };
+        crate::commands::put_computer(&store, &owner, "busy", &spec, None, id, 20_000..20_001, &policy, 1).unwrap();
         let n = u64::from(BACKUPS_PER_COMPUTER_MAX);
         {
             let mut conn = store.conn();

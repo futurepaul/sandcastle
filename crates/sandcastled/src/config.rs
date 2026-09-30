@@ -68,6 +68,8 @@ pub struct Serve {
     #[arg(long, default_value_t = 24)]
     pub snapshots_kept: u32,
     #[command(flatten)]
+    pub budget: BudgetArgs,
+    #[command(flatten)]
     pub bucket: BucketArgs,
     /// Upload part size, MiB (S3's floor is 5).
     #[arg(long, default_value_t = 16)]
@@ -104,6 +106,78 @@ pub struct Engine {
     /// This node's name in the backup bucket (`nodes/<name>/…`).
     #[arg(long)]
     pub node_name: String,
+}
+
+/// The node's reserve and what things cost (docs/sandcastle-sleep.md,
+/// Budgets). The reserves are the operator's to choose; the costs default
+/// to what lat-6 measured and are tuned from the capacity report.
+#[derive(clap::Args, Debug, Clone)]
+pub struct BudgetArgs {
+    /// Memory for every machine together, GiB. The unit's `MemoryMax=`
+    /// must hold it (the node checks at startup).
+    #[arg(long)]
+    pub reserve_memory_gib: u32,
+    /// Space in the ZFS parent for every disk and its snapshots, GiB.
+    #[arg(long)]
+    pub reserve_disk_gib: u32,
+    /// Space on the engine's disk for images and machines' writable
+    /// layers, GiB.
+    #[arg(long)]
+    pub reserve_engine_disk_gib: u32,
+    /// Memory the engine's process uses beyond its guest's, MiB (about
+    /// 20–40 measured on lat-6).
+    #[arg(long, default_value_t = 64)]
+    pub machine_overhead_mib: u32,
+    /// Space kept for a disk's snapshots, percent of the disk.
+    #[arg(long, default_value_t = 25)]
+    pub snapshot_headroom_pct: u32,
+    /// The engine disk one machine's writable layer may take, GiB (msb's
+    /// default layer is about 4).
+    #[arg(long, default_value_t = 4)]
+    pub layer_gib: u32,
+    /// Run without a kernel memory cap on the unit: for development only.
+    #[arg(long)]
+    pub allow_uncapped_memory: bool,
+}
+
+impl BudgetArgs {
+    pub fn check(&self) -> Result<(), String> {
+        let positive = self.reserve_memory_gib > 0 && self.reserve_disk_gib > 0 && self.reserve_engine_disk_gib > 0;
+        if !positive {
+            return Err("--reserve-memory-gib, --reserve-disk-gib, and --reserve-engine-disk-gib are at least 1".into());
+        }
+        if self.reserve_memory_gib > 64 * 1024 || self.reserve_disk_gib > 1024 * 1024 || self.reserve_engine_disk_gib > 1024 * 1024 {
+            return Err("a reserve is at most 64 TiB of memory or 1 PiB of disk".into());
+        }
+        if self.machine_overhead_mib > 4096 {
+            return Err("--machine-overhead-mib is at most 4096".into());
+        }
+        if self.snapshot_headroom_pct > sandcastle_core::budget::SNAPSHOT_HEADROOM_PCT_MAX {
+            return Err(format!("--snapshot-headroom-pct is at most {}", sandcastle_core::budget::SNAPSHOT_HEADROOM_PCT_MAX));
+        }
+        if self.layer_gib == 0 || self.layer_gib > 1024 {
+            return Err("--layer-gib is 1 to 1024".into());
+        }
+        Ok(())
+    }
+
+    pub fn reserve(&self) -> sandcastle_core::budget::Reserve {
+        use sandcastle_core::budget::GIB;
+        sandcastle_core::budget::Reserve {
+            memory: u64::from(self.reserve_memory_gib) * GIB,
+            disk: u64::from(self.reserve_disk_gib) * GIB,
+            engine_disk: u64::from(self.reserve_engine_disk_gib) * GIB,
+        }
+    }
+
+    pub fn costs(&self) -> sandcastle_core::budget::Costs {
+        use sandcastle_core::budget::{GIB, MIB};
+        sandcastle_core::budget::Costs {
+            machine_overhead: u64::from(self.machine_overhead_mib) * MIB,
+            snapshot_headroom_pct: self.snapshot_headroom_pct,
+            layer: u64::from(self.layer_gib) * GIB,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -198,6 +272,8 @@ impl Serve {
             snapshots_kept: self.snapshots_kept,
             credentials_every_ms: self.credentials_every_s * 1000,
             ships: self.bucket.backup_bucket.is_some(),
+            reserve: self.budget.reserve(),
+            costs: self.budget.costs(),
             node: self.engine.node_name.clone(),
         }
     }
@@ -206,6 +282,7 @@ impl Serve {
     pub fn check(&self) -> Result<(), String> {
         self.engine.check()?;
         self.bucket.check()?;
+        self.budget.check()?;
         if self.grantors.is_empty() {
             return Err("at least one --grantor".into());
         }
@@ -267,7 +344,7 @@ mod tests {
         let mut args = vec![
             "sandcastled", "serve", "--state-dir", "/var/lib/sc", "--domain", "sc.example", "--tls-cert", "/c", "--tls-key", "/k",
             "--grantor", "a38bc6abf2e9933e3d73741806c9b92cbd9453070845266e69f36d444c8a6bd4", "--msb-home", "/home/sc", "--zfs-parent", "tank/sc",
-            "--node-name", "lat-6",
+            "--node-name", "lat-6", "--reserve-memory-gib", "112", "--reserve-disk-gib", "1500", "--reserve-engine-disk-gib", "300",
         ];
         args.extend_from_slice(extra);
         let Command::Serve(s) = Command::try_parse_from(args).map_err(|e| e.to_string())? else { panic!("serve") };
@@ -296,6 +373,9 @@ mod tests {
             &["--node-key-file", "/n", "--credentials-origin", "http://fragment.club"],
             &["--node-key-file", "/n", "--credentials-origin", "https://fragment.club/api"],
             &["--credentials-every-s", "5"],
+            &["--reserve-memory-gib", "0"],
+            &["--snapshot-headroom-pct", "401"],
+            &["--layer-gib", "0"],
         ] {
             assert!(serve(bad).is_err(), "{bad:?}");
         }

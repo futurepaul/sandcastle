@@ -6,6 +6,7 @@
 //! executor supplies the world, and the simulator a simulated one.
 
 pub mod apply;
+pub mod budget;
 pub mod check;
 pub mod credentials;
 pub mod limits;

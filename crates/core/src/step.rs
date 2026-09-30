@@ -30,6 +30,9 @@ pub enum Observe {
     Probe { port: u16, path: String },
     /// The credential source's answer.
     Credentials { url: String },
+    /// Whether the node's memory reserve has room for this computer's
+    /// machine (`need` bytes): a yes commits it (`budget::Ledger`).
+    Room { need: u64 },
 }
 
 /// What a new machine is made of.

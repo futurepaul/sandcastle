@@ -111,10 +111,10 @@ fn running(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
             Err(n) => n,
             Ok(_) => halt(c, k),
         },
-        (Machine::Stopped, true) => start(c, target, k),
+        (Machine::Stopped, true) => start(c, target, k, p),
         // Absent, a stale generation, or a machine the engine lost track
         // of: a new one on the same disk.
-        _ => make(c, target, k),
+        _ => make(c, target, k, p),
     }
 }
 
@@ -130,7 +130,7 @@ fn credentials_for(target: &Generation, k: &Knowledge) -> Result<Vec<Credential>
     }
 }
 
-fn make(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
+fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
     if let Some(n) = owed_snapshot(c, k) {
         return n;
     }
@@ -144,6 +144,9 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
     if c.has_disk() && !k.disk_ready {
         return Next::Do(Effect::EnsureDisk { gib: c.fixed.data_gib });
     }
+    if let Some(n) = room(c, k, p) {
+        return n;
+    }
     let machine = MachineSpec {
         image: target.image.clone(),
         vcpus: c.fixed.vcpus,
@@ -155,13 +158,33 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
     Next::Do(Effect::Create { seq: target.seq, machine, credentials })
 }
 
-fn start(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
+fn start(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
     if let Some(n) = owed_snapshot(c, k) {
         return n;
     }
-    match credentials_for(target, k) {
-        Ok(credentials) => Next::Do(Effect::Start { credentials }),
-        Err(n) => n,
+    let credentials = match credentials_for(target, k) {
+        Ok(credentials) => credentials,
+        Err(n) => return n,
+    };
+    if let Some(n) = room(c, k, p) {
+        return n;
+    }
+    Next::Do(Effect::Start { credentials })
+}
+
+/// What a computer's status says while the node's memory reserve has no
+/// room for its machine.
+pub const WAITING_FOR_ROOM: &str = "waiting for room in the node's memory reserve";
+
+/// Room in the node's memory reserve for this computer's machine, asked
+/// before it is made or started. Without room it waits, saying so, and
+/// asks again next batch; not a fault, so no backoff.
+fn room(c: &Computer, k: &Knowledge, p: &Policy) -> Option<Next> {
+    match k.room {
+        Some(true) => None,
+        None => Some(Next::Observe(Observe::Room { need: crate::budget::machine_memory(&c.fixed, &p.costs) })),
+        Some(false) if c.status == Status::Starting && c.status_reason.as_deref() == Some(WAITING_FOR_ROOM) => Some(Next::Rest(None)),
+        Some(false) => Some(Next::Note(Note::Status { status: Status::Starting, reason: Some(WAITING_FOR_ROOM.to_string()) })),
     }
 }
 

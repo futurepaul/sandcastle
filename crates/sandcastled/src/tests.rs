@@ -66,7 +66,8 @@ fn config(dir: &Path, grantor: &Keys, port_base: u16) -> Serve {
         "sandcastled", "serve", "--state-dir", &s(dir), "--domain", DOMAIN, "--tls-cert", &s(&dir.join("cert.pem")), "--tls-key", &s(&dir.join("key.pem")),
         "--grantor", grantor.pubkey_hex(), "--msb-home", &s(dir), "--zfs-parent", "tank/sc", "--node-name", "test-node", "--port-base", &port,
         "--port-count", "10", "--snapshot-every-s", "60", "--startup-grace-s", "30", "--backup-bucket", "backups", "--backup-credentials", "/unused",
-        "--backup-key-file", "/unused", "--node-key-file", "/unused", "--credentials-origin", PLATFORM,
+        "--backup-key-file", "/unused", "--node-key-file", "/unused", "--credentials-origin", PLATFORM, "--reserve-memory-gib", "16",
+        "--reserve-disk-gib", "100", "--reserve-engine-disk-gib", "50", "--allow-uncapped-memory",
     ];
     let Command::Serve(serve) = Command::try_parse_from(args).unwrap() else { panic!("serve") };
     serve.check().unwrap();

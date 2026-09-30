@@ -44,6 +44,7 @@ fn command_error(e: CommandError) -> Resp {
         CommandError::Public => (StatusCode::CONFLICT, "public"),
         CommandError::RestoreExists => (StatusCode::CONFLICT, "exists"),
         CommandError::NodeFull(_) => (StatusCode::INSUFFICIENT_STORAGE, "node_full"),
+        CommandError::NoRoom(_) => (StatusCode::INSUFFICIENT_STORAGE, "no_room"),
         CommandError::Store(s) => return store_error(s),
     };
     error(status, code, e.to_string())
@@ -219,7 +220,7 @@ async fn put_computer<W: World>(d: &Daemon<W>, signer: &str, name: &str, query: 
         },
     };
     let id = d.node.new_id();
-    match commands::put_computer(&d.node.store, signer, name, &spec, plan, id, d.config.ports(), d.now()) {
+    match commands::put_computer(&d.node.store, signer, name, &spec, plan, id, d.config.ports(), &d.node.policy, d.now()) {
         Ok((c, put)) => {
             let status = if put == Put::Created { StatusCode::CREATED } else { StatusCode::OK };
             json(status, &commands::view(&c, d.config.computer_url(&c.name)))

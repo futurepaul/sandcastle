@@ -53,6 +53,7 @@ pub struct Stats {
     pub withdrawals: u64,
     pub wedges: u64,
     pub kills: u64,
+    pub waits: u64,
 }
 
 pub struct Sim {
@@ -70,8 +71,28 @@ pub struct Sim {
     pub actions: u64,
 }
 
-fn policy() -> Policy {
-    Policy { startup_grace_ms: 120_000, snapshot_every_ms: 300_000, snapshots_kept: 3, credentials_every_ms: 900_000, ships: true, node: "sim".into() }
+/// Every fourth seed's memory reserve holds three machines (of the up to
+/// nine its owners may make), so computers wait for room; the rest hold
+/// them all.
+fn memory_reserve(seed: u64) -> u64 {
+    if seed.is_multiple_of(4) {
+        3 * ((1024 << 20) + (64 << 20))
+    } else {
+        64 << 30
+    }
+}
+
+fn policy(seed: u64) -> Policy {
+    Policy {
+        startup_grace_ms: 120_000,
+        snapshot_every_ms: 300_000,
+        snapshots_kept: 3,
+        credentials_every_ms: 900_000,
+        ships: true,
+        reserve: sandcastle_core::budget::Reserve { memory: memory_reserve(seed), disk: 1 << 40, engine_disk: 1 << 40 },
+        costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        node: "sim".into(),
+    }
 }
 
 fn grant() -> GrantSpec {
@@ -95,7 +116,7 @@ impl Sim {
         for owner in OWNERS {
             commands::put_grant(&store, &[GRANTOR.to_string()], GRANTOR, owner, grant(), 0).expect("a grant");
         }
-        let node = Node::new(store, world.clone(), policy(), Some(key.clone()), sandcastle_node::seal::CHUNK_BYTES);
+        let node = Node::new(store, world.clone(), policy(seed), Some(key.clone()), sandcastle_node::seal::CHUNK_BYTES);
         let mut sim = Sim {
             stats: Stats::default(),
             seed,
@@ -163,6 +184,9 @@ impl Sim {
     fn crash(&mut self) {
         self.stats.crashes += 1;
         self.knowledge.clear();
+        // The ledger lives in the process: a restarted node adopts what it
+        // finds running at its next reconcile.
+        *self.node.ledger.lock().expect("never poisoned") = sandcastle_core::budget::Ledger::new(self.node.policy.reserve.memory);
         if self.rng.chance(300) {
             // The process comes back from its file.
             self.node.store = Store::open(&self.path).expect("the store reopens");
@@ -199,6 +223,9 @@ impl Sim {
     /// the engine's list and lives for this batch only.
     async fn batch(&mut self, id: ComputerId, crashes: bool) {
         self.knowledge.remove(&id);
+        // As the scheduler's tick does before it starts a batch.
+        let listing: HashMap<ComputerId, Machine> = self.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
+        self.node.reconcile(&listing, &std::collections::HashSet::new()).expect("reconcile");
         for _ in 0..sandcastle_core::limits::STEPS_PER_TICK_MAX {
             if !self.node_step(id, crashes).await {
                 break;
@@ -222,6 +249,7 @@ impl Sim {
             Next::Note(n) => {
                 match &n {
                     sandcastle_core::step::Note::Served { .. } => self.stats.served += 1,
+                    sandcastle_core::step::Note::Status { reason: Some(r), .. } if r == sandcastle_core::plan::WAITING_FOR_ROOM => self.stats.waits += 1,
                     sandcastle_core::step::Note::RestoreDone { .. } => self.stats.restores_done += 1,
                     _ => {}
                 }
@@ -288,13 +316,13 @@ impl Sim {
             0..=2 => {
                 let spec = self.spec();
                 let id = self.node.new_id();
-                let first = commands::put_computer(&self.node.store, owner, name, &spec, None, id, PORTS, now);
+                let first = commands::put_computer(&self.node.store, owner, name, &spec, None, id, PORTS, &self.node.policy, now);
                 if let Ok((_, Put::Created)) = &first {
                     self.stats.created += 1;
                 }
                 if let Ok((c, _)) = &first {
                     // A replay answers the same.
-                    let again = commands::put_computer(&self.node.store, owner, name, &spec, None, self.node.new_id(), PORTS, now);
+                    let again = commands::put_computer(&self.node.store, owner, name, &spec, None, self.node.new_id(), PORTS, &self.node.policy, now);
                     let (c2, put) = again.expect("a replay of a PUT that succeeded succeeds");
                     assert_eq!((put, c2.id), (Put::Unchanged, c.id), "seed {}: a replayed PUT", self.seed);
                 }
@@ -310,7 +338,7 @@ impl Sim {
                     }
                     _ => spec.credentials_url = if spec.credentials_url.is_some() { None } else { Some(CREDENTIALS_URL.into()) },
                 }
-                let _ = commands::put_computer(&self.node.store, &c.owner, name, &spec, None, self.node.new_id(), PORTS, now);
+                let _ = commands::put_computer(&self.node.store, &c.owner, name, &spec, None, self.node.new_id(), PORTS, &self.node.policy, now);
             }
             5..=7 => {
                 let Some(c) = self.node.store.by_name(name).expect("by name") else { return };
@@ -360,7 +388,7 @@ impl Sim {
         spec.data_gib = manifest.data_gib;
         spec.data_path = manifest.data_path;
         let id = self.node.new_id();
-        if let Ok((c, Put::Created)) = commands::put_computer(&self.node.store, owner, name, &spec, Some(plan), id, PORTS, now) {
+        if let Ok((c, Put::Created)) = commands::put_computer(&self.node.store, owner, name, &spec, Some(plan), id, PORTS, &self.node.policy, now) {
             self.restores.insert(c.id, content);
         }
     }
@@ -418,6 +446,10 @@ impl Sim {
         let seed = self.seed;
         let violations = std::mem::take(&mut self.world.lock().violations);
         assert!(violations.is_empty(), "seed {seed}: the world saw {violations:?}");
+        {
+            let ledger = self.node.ledger.lock().expect("never poisoned");
+            assert!(!ledger.over(), "seed {seed}: {} bytes committed past the memory reserve of {}", ledger.committed(), ledger.reserve());
+        }
         let ids = self.node.store.ids().expect("ids");
         let rows: Vec<_> = ids.iter().map(|id| self.node.store.load(*id).expect("load").expect("listed")).collect();
         let w = self.world.lock();
@@ -440,6 +472,17 @@ impl Sim {
             self.check_ship_head(c);
             if settled {
                 self.check_settled(c);
+            }
+        }
+        if settled {
+            // No room is held by a computer that neither runs nor means to.
+            let holders: Vec<ComputerId> = self.node.ledger.lock().expect("never poisoned").holders().map(|(id, _)| id).collect();
+            let w = self.world.lock();
+            for id in holders {
+                let row = rows.iter().find(|c| c.id == id);
+                let running = w.machines.get(&id).is_some_and(|m| m.state == Machine::Running);
+                let wanted = row.is_some_and(|c| c.desired == Desired::Running);
+                assert!(running || wanted, "seed {seed}: {} holds room it does not use", id.hex());
             }
         }
         if settled || self.actions.is_multiple_of(50) {
@@ -482,7 +525,13 @@ impl Sim {
         let machine = w.machines.get(&c.id);
         let (target, _) = c.target();
         let broken = target.image == "img:bad" || target.image == "img:silent";
+        let waiting = c.status_reason.as_deref() == Some(sandcastle_core::plan::WAITING_FOR_ROOM);
+        let need = sandcastle_core::budget::machine_memory(&c.fixed, &self.node.policy.costs);
+        let free = self.node.ledger.lock().expect("never poisoned").free();
         match c.desired {
+            Desired::Running if !broken && waiting => {
+                assert!(free < need, "seed {seed}: {} waits for room, but {} MiB of the reserve are free and it needs {}", c.name, free >> 20, need >> 20);
+            }
             Desired::Running if !broken => {
                 assert_eq!(c.status, Status::Serving, "seed {seed}: {} is {:?}: {:?}; the last calls:\n  {story}", c.name, c.status, c.status_reason);
                 assert_eq!(c.applied_seq, Some(target.seq), "seed {seed}: {} runs a stale generation", c.name);

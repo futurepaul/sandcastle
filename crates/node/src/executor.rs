@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use hyper::body::Bytes;
 use sandcastle_core::limits::STEPS_PER_TICK_MAX;
-use sandcastle_core::model::{Computer, ComputerId, Fetched, FaultKind, Knowledge, Machine, Policy, Step, Upload};
+use std::collections::{HashMap, HashSet};
+
+use sandcastle_core::budget::{self, Ledger};
+use sandcastle_core::model::{Computer, ComputerId, Desired, Fetched, FaultKind, Knowledge, Machine, Policy, Step, Upload};
 use sandcastle_core::step::{Effect, GateError, Next, Note, Observe, Outcome};
 use sandcastle_core::{apply, goes_on, learn, note, plan};
 use sandcastle_proto::{Credentials, CredentialsAsk};
@@ -36,6 +39,8 @@ pub struct Node<W: World> {
     pub store: Store,
     pub world: W,
     pub policy: Policy,
+    /// The memory committed to machines, inside `policy.reserve.memory`.
+    pub ledger: std::sync::Mutex<Ledger>,
     /// The key backups are sealed with: present exactly when the node ships.
     pub backup_key: Option<BackupKey>,
     /// Upload part size (S3's floor is 5 MiB, but for the last part).
@@ -55,7 +60,9 @@ impl<W: World> Node<W> {
     pub fn new(store: Store, world: W, policy: Policy, backup_key: Option<BackupKey>, part_bytes: usize) -> Node<W> {
         assert_eq!(policy.ships, backup_key.is_some() && world.objects().is_some(), "a node ships exactly when it has a bucket and a key");
         assert!(part_bytes >= CHUNK_BYTES, "a part holds at least one sealed chunk");
-        Node { store, world, policy, backup_key, part_bytes }
+        policy.costs.check();
+        let ledger = std::sync::Mutex::new(Ledger::new(policy.reserve.memory));
+        Node { store, world, policy, ledger, backup_key, part_bytes }
     }
 
     /// One pass over every computer. The engine's list is taken once; a
@@ -68,6 +75,7 @@ impl<W: World> Node<W> {
                 return Ok(());
             }
         };
+        self.reconcile(&machines, &HashSet::new())?;
         for id in self.store.ids()? {
             let machine = machines.get(&id).copied().unwrap_or(Machine::Absent);
             self.batch(id, machine).await?;
@@ -104,6 +112,36 @@ impl<W: World> Node<W> {
         }
     }
 
+    /// Squares the ledger with the engine's listing: a running machine that
+    /// holds nothing (a restarted node's) is adopted, over the reserve if
+    /// it must be; a computer whose machine is not running and that is not
+    /// meant to run, or that is gone, holds nothing. Computers whose batch
+    /// is in flight (`busy`) are left alone: one may have just been
+    /// admitted and not made its machine yet.
+    pub fn reconcile(&self, machines: &HashMap<ComputerId, Machine>, busy: &HashSet<ComputerId>) -> Result<(), StoreError> {
+        let rows: Vec<Computer> = self.store.ids()?.into_iter().filter_map(|id| self.store.load(id).transpose()).collect::<Result<_, _>>()?;
+        let mut ledger = self.ledger.lock().expect("never poisoned: panics abort");
+        for c in &rows {
+            if busy.contains(&c.id) {
+                continue;
+            }
+            let running = machines.get(&c.id) == Some(&Machine::Running);
+            match (running, ledger.holds(c.id).is_some()) {
+                (true, false) => ledger.adopt(c.id, budget::machine_memory(&c.fixed, &self.policy.costs)),
+                (false, true) if c.desired != Desired::Running => ledger.release(c.id),
+                _ => {}
+            }
+        }
+        let gone: Vec<ComputerId> = ledger.holders().map(|(id, _)| id).filter(|id| !busy.contains(id) && !rows.iter().any(|c| c.id == *id)).collect();
+        for id in gone {
+            ledger.release(id);
+        }
+        if ledger.over() {
+            eprintln!("executor: machines found running hold {} MiB, past the memory reserve of {} MiB", ledger.committed() >> 20, ledger.reserve() >> 20);
+        }
+        Ok(())
+    }
+
     /// The row, and what the core says to do next; `None` when it is gone.
     pub fn plan(&self, id: ComputerId, k: &Knowledge) -> Result<Option<(Computer, Next)>, StoreError> {
         let Some(c) = self.store.load(id)? else { return Ok(None) };
@@ -117,7 +155,17 @@ impl<W: World> Node<W> {
         if let Outcome::Failed(f) = outcome {
             eprintln!("executor: {}: {}: {:?}: {}", id.hex(), effect.step().as_str(), f.error, f.detail);
         }
-        self.store.record(id, now, |current| apply(current, effect, outcome, &self.policy, now))?;
+        let written = self.store.record(id, now, |current| apply(current, effect, outcome, &self.policy, now))?;
+        // A machine stopped for good, or removed, holds no memory; one
+        // stopped to be made again (a rebase, a restart) keeps its room.
+        let released = match (effect, outcome, &written) {
+            (Effect::Stop { .. }, Outcome::Done, Some(c)) => c.desired != Desired::Running,
+            (Effect::Remove | Effect::DeleteRow, Outcome::Done, _) => true,
+            _ => false,
+        };
+        if released {
+            self.ledger.lock().expect("never poisoned: panics abort").release(id);
+        }
         Ok(())
     }
 
@@ -140,6 +188,7 @@ impl<W: World> Node<W> {
             },
             Observe::Probe { port, path } => k.probe = Some(self.world.prober().probe(*port, path).await),
             Observe::Credentials { url } => k.credentials = Some(self.credentials(c, url).await),
+            Observe::Room { need } => k.room = Some(self.ledger.lock().expect("never poisoned: panics abort").admit(c.id, *need).is_ok()),
         }
         Ok(Stepped::Acted)
     }

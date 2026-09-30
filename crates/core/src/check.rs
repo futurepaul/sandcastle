@@ -112,7 +112,9 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service or its stop failed");
             assert_eq!(*force, crate::plan::stop_failed(c), "a machine is killed only after a graceful stop failed");
         }
+        Effect::Start { .. } => assert_eq!(k.room, Some(true), "a machine starts only with room in the reserve"),
         Effect::Create { seq, .. } => {
+            assert_eq!(k.room, Some(true), "a machine is made only with room in the reserve");
             assert_eq!(c.desired, Desired::Running);
             assert_eq!(*seq, c.target().0.seq, "a machine is made from the target generation");
             assert_ne!(k.machine, Machine::Running, "a running machine is stopped before it is replaced");

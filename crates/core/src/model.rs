@@ -493,11 +493,13 @@ pub struct Knowledge {
     pub synced: bool,
     /// The disk was ensured (made and formatted) this batch.
     pub disk_ready: bool,
+    /// Whether the node's memory reserve admitted this computer's machine.
+    pub room: Option<bool>,
 }
 
 impl Knowledge {
     pub fn new(machine: Machine) -> Knowledge {
-        Knowledge { machine, disk: None, probe: None, credentials: None, quiesced: false, synced: false, disk_ready: false }
+        Knowledge { machine, disk: None, probe: None, credentials: None, quiesced: false, synced: false, disk_ready: false, room: None }
     }
 }
 
@@ -510,5 +512,9 @@ pub struct Policy {
     pub credentials_every_ms: u64,
     /// The node ships backups (it has a bucket and a key).
     pub ships: bool,
+    /// What the operator gave the node, and what a machine costs beyond
+    /// its guest's memory and a disk beyond its volume.
+    pub reserve: crate::budget::Reserve,
+    pub costs: crate::budget::Costs,
     pub node: String,
 }

@@ -14,7 +14,16 @@ use sandcastle_proto::{Credential, Storage, UrlAuth};
 const MIN: u64 = 60_000;
 
 fn policy() -> Policy {
-    Policy { startup_grace_ms: 2 * MIN, snapshot_every_ms: 5 * MIN, snapshots_kept: 3, credentials_every_ms: 15 * MIN, ships: true, node: "n".into() }
+    Policy {
+        startup_grace_ms: 2 * MIN,
+        snapshot_every_ms: 5 * MIN,
+        snapshots_kept: 3,
+        credentials_every_ms: 15 * MIN,
+        ships: true,
+        reserve: sandcastle_core::budget::Reserve { memory: 64 << 30, disk: 1 << 40, engine_disk: 1 << 40 },
+        costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        node: "n".into(),
+    }
 }
 
 fn generation(seq: u32, image: &str) -> Generation {
@@ -76,16 +85,24 @@ struct Run {
     p: Policy,
     now: Millis,
     asked: Vec<Next>,
+    /// The node's memory reserve has no room: a room question is answered
+    /// no (yes otherwise, as the executor's ledger would).
+    full: bool,
 }
 
 impl Run {
     fn new(c: Computer, machine: Machine) -> Run {
-        Run { c, k: Knowledge::new(machine), p: policy(), now: 1_000_000, asked: vec![] }
+        Run { c, k: Knowledge::new(machine), p: policy(), now: 1_000_000, asked: vec![], full: false }
     }
 
     fn next(&mut self) -> Next {
         let n = plan(&self.c, &self.k, &self.p, self.now);
         self.asked.push(n.clone());
+        if let Next::Observe(Observe::Room { need }) = n {
+            assert_eq!(need, (u64::from(self.c.fixed.memory_mib) << 20) + self.p.costs.machine_overhead, "its allocation and the engine's overhead");
+            self.k.room = Some(!self.full);
+            return self.next();
+        }
         n
     }
 
@@ -417,6 +434,23 @@ fn a_restart_goes_on_through_its_own_failures() {
     r.expect_do(|e| matches!(e, Effect::Stop { force: true }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Start { .. }));
+}
+
+/// Goal: a computer whose machine does not fit the node's memory reserve
+/// waits, saying so, without a fault or a backoff, and is made once
+/// there is room.
+#[test]
+fn a_computer_waits_for_room_in_the_reserve() {
+    let mut r = Run::new(computer(), Machine::Absent);
+    r.k.disk_ready = true;
+    r.full = true;
+    assert_eq!(r.next(), Next::Note(Note::Status { status: Status::Starting, reason: Some(sandcastle_core::plan::WAITING_FOR_ROOM.into()) }));
+    r.noted();
+    assert_eq!((r.c.failures, r.c.retry_at), (0, None), "not a fault");
+    assert_eq!(r.next(), Next::Rest(None), "said once, then it waits");
+    r.full = false;
+    r.k.room = None;
+    r.expect_do(|e| matches!(e, Effect::Create { .. }));
 }
 
 /// Goal: a deletion goes service, machine, removal, disk, row, observing

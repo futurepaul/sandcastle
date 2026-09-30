@@ -39,6 +39,19 @@ fn spec() -> ComputerSpec {
     }
 }
 
+fn policy() -> Policy {
+    Policy {
+        startup_grace_ms: 120_000,
+        snapshot_every_ms: 300_000,
+        snapshots_kept: 3,
+        credentials_every_ms: 900_000,
+        ships: true,
+        reserve: sandcastle_core::budget::Reserve { memory: 16 << 30, disk: 100 << 30, engine_disk: 50 << 30 },
+        costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        node: "n".into(),
+    }
+}
+
 fn id(n: u8) -> ComputerId {
     ComputerId::from_bytes([n; 8])
 }
@@ -50,7 +63,7 @@ fn granted() -> Store {
 }
 
 fn create(store: &Store, name: &str, n: u8) -> Computer {
-    let (c, put) = commands::put_computer(store, ALICE, name, &spec(), None, id(n), PORTS, NOW).unwrap();
+    let (c, put) = commands::put_computer(store, ALICE, name, &spec(), None, id(n), PORTS, &policy(), NOW).unwrap();
     assert_eq!(put, Put::Created);
     c
 }
@@ -90,32 +103,32 @@ fn a_put_creates_replays_updates_and_refuses() {
     let store = granted();
     let c = create(&store, "hermes", 1);
     assert_eq!((c.spec.seq, c.host_port, c.status, c.desired), (1, 20_000, Status::Absent, Desired::Running));
-    let (again, put) = commands::put_computer(&store, ALICE, "hermes", &spec(), None, id(9), PORTS, NOW).unwrap();
+    let (again, put) = commands::put_computer(&store, ALICE, "hermes", &spec(), None, id(9), PORTS, &policy(), NOW).unwrap();
     assert_eq!((put, again.id, again.version), (Put::Unchanged, c.id, c.version), "the same spec again: nothing written");
     let bigger = ComputerSpec { data_gib: 6, ..spec() };
-    assert!(matches!(commands::put_computer(&store, ALICE, "hermes", &bigger, None, id(9), PORTS, NOW), Err(CommandError::SpecConflict)));
+    assert!(matches!(commands::put_computer(&store, ALICE, "hermes", &bigger, None, id(9), PORTS, &policy(), NOW), Err(CommandError::SpecConflict)));
     let public = ComputerSpec { url_auth: UrlAuth::Public, ..spec() };
-    let (c2, put) = commands::put_computer(&store, ALICE, "hermes", &public, None, id(9), PORTS, NOW).unwrap();
+    let (c2, put) = commands::put_computer(&store, ALICE, "hermes", &public, None, id(9), PORTS, &policy(), NOW).unwrap();
     assert_eq!((put, c2.spec.seq, c2.url_auth), (Put::Updated, 1, UrlAuth::Public), "URL auth changes in place, no new generation");
     let newer = ComputerSpec { image: "img:2".into(), ..public.clone() };
-    let (c3, put) = commands::put_computer(&store, ALICE, "hermes", &newer, None, id(9), PORTS, NOW).unwrap();
+    let (c3, put) = commands::put_computer(&store, ALICE, "hermes", &newer, None, id(9), PORTS, &policy(), NOW).unwrap();
     assert_eq!((put, c3.spec.seq, c3.spec.image.as_str()), (Put::Updated, 2, "img:2"));
-    assert!(matches!(commands::put_computer(&store, BOB, "hermes", &spec(), None, id(9), PORTS, NOW), Err(CommandError::NoGrant)));
+    assert!(matches!(commands::put_computer(&store, BOB, "hermes", &spec(), None, id(9), PORTS, &policy(), NOW), Err(CommandError::NoGrant)));
     commands::put_grant(&store, &grantors(), GRANTOR, BOB, grant(), NOW).unwrap();
-    assert!(matches!(commands::put_computer(&store, BOB, "hermes", &spec(), None, id(9), PORTS, NOW), Err(CommandError::NameTaken)));
+    assert!(matches!(commands::put_computer(&store, BOB, "hermes", &spec(), None, id(9), PORTS, &policy(), NOW), Err(CommandError::NameTaken)));
     let huge = ComputerSpec { vcpus: 4, ..spec() };
-    assert!(matches!(commands::put_computer(&store, ALICE, "other", &huge, None, id(2), PORTS, NOW), Err(CommandError::OverGrant(_))));
+    assert!(matches!(commands::put_computer(&store, ALICE, "other", &huge, None, id(2), PORTS, &policy(), NOW), Err(CommandError::OverGrant(_))));
     let bad = ComputerSpec { image: "-flag".into(), ..spec() };
-    assert!(matches!(commands::put_computer(&store, ALICE, "other", &bad, None, id(2), PORTS, NOW), Err(CommandError::Invalid(_))), "an image may not start with '-'");
+    assert!(matches!(commands::put_computer(&store, ALICE, "other", &bad, None, id(2), PORTS, &policy(), NOW), Err(CommandError::Invalid(_))), "an image may not start with '-'");
     create(&store, "second", 2);
-    assert!(matches!(commands::put_computer(&store, ALICE, "third", &spec(), None, id(3), PORTS, NOW), Err(CommandError::OverGrant(_))), "two computers per grant");
+    assert!(matches!(commands::put_computer(&store, ALICE, "third", &spec(), None, id(3), PORTS, &policy(), NOW), Err(CommandError::OverGrant(_))), "two computers per grant");
 }
 
 #[test]
 fn a_full_port_range_is_refused() {
     let store = granted();
-    commands::put_computer(&store, ALICE, "one", &spec(), None, id(1), 20_000..20_001, NOW).unwrap();
-    assert!(matches!(commands::put_computer(&store, ALICE, "two", &spec(), None, id(2), 20_000..20_001, NOW), Err(CommandError::NodeFull(_))));
+    commands::put_computer(&store, ALICE, "one", &spec(), None, id(1), 20_000..20_001, &policy(), NOW).unwrap();
+    assert!(matches!(commands::put_computer(&store, ALICE, "two", &spec(), None, id(2), 20_000..20_001, &policy(), NOW), Err(CommandError::NodeFull(_))));
 }
 
 /// Goal: start, stop, delete are idempotent where they should be; nothing
@@ -134,7 +147,7 @@ fn desire_changes_replay_and_nothing_leaves_deleted() {
     let replay = commands::set_desired(&store, ALICE, "hermes", Desired::Deleted, NOW).unwrap();
     assert_eq!(replay.version, deleted.version, "a second DELETE answers the same");
     assert!(matches!(commands::set_desired(&store, ALICE, "hermes", Desired::Running, NOW), Err(CommandError::Deleting)));
-    assert!(matches!(commands::put_computer(&store, ALICE, "hermes", &spec(), None, id(9), PORTS, NOW), Err(CommandError::NameTaken)), "a name being deleted is taken");
+    assert!(matches!(commands::put_computer(&store, ALICE, "hermes", &spec(), None, id(9), PORTS, &policy(), NOW), Err(CommandError::NameTaken)), "a name being deleted is taken");
 }
 
 fn chain() -> Vec<ChainLink> {
@@ -150,16 +163,16 @@ fn plan(owner: &str) -> RestorePlan {
 #[test]
 fn a_restore_creates_replays_and_refuses() {
     let store = granted();
-    let (c, put) = commands::put_computer(&store, ALICE, "copy", &spec(), Some(plan(ALICE)), id(1), PORTS, NOW).unwrap();
+    let (c, put) = commands::put_computer(&store, ALICE, "copy", &spec(), Some(plan(ALICE)), id(1), PORTS, &policy(), NOW).unwrap();
     assert_eq!(put, Put::Created);
     assert_eq!(c.restore.as_ref().unwrap().chain, chain());
-    let (_, put) = commands::put_computer(&store, ALICE, "copy", &spec(), Some(plan(ALICE)), id(9), PORTS, NOW).unwrap();
+    let (_, put) = commands::put_computer(&store, ALICE, "copy", &spec(), Some(plan(ALICE)), id(9), PORTS, &policy(), NOW).unwrap();
     assert_eq!(put, Put::Unchanged, "a replayed restore-create answers the same");
     let other = ComputerSpec { image: "img:2".into(), ..spec() };
-    assert!(matches!(commands::put_computer(&store, ALICE, "copy", &other, Some(plan(ALICE)), id(9), PORTS, NOW), Err(CommandError::RestoreExists)));
-    assert!(matches!(commands::put_computer(&store, ALICE, "b", &spec(), Some(plan(BOB)), id(2), PORTS, NOW), Err(CommandError::NotFound)), "another's backup reads as missing");
+    assert!(matches!(commands::put_computer(&store, ALICE, "copy", &other, Some(plan(ALICE)), id(9), PORTS, &policy(), NOW), Err(CommandError::RestoreExists)));
+    assert!(matches!(commands::put_computer(&store, ALICE, "b", &spec(), Some(plan(BOB)), id(2), PORTS, &policy(), NOW), Err(CommandError::NotFound)), "another's backup reads as missing");
     let small = ComputerSpec { data_gib: 4, ..spec() };
-    assert!(matches!(commands::put_computer(&store, ALICE, "b", &small, Some(plan(ALICE)), id(2), PORTS, NOW), Err(CommandError::Invalid(_))));
+    assert!(matches!(commands::put_computer(&store, ALICE, "b", &small, Some(plan(ALICE)), id(2), PORTS, &policy(), NOW), Err(CommandError::Invalid(_))));
 }
 
 /// A row with every part populated: what a restart must bring back whole.
@@ -298,4 +311,32 @@ fn views_redact_and_say_pending() {
     let mut settled = serving.clone();
     settled.snapshot_due = None;
     assert!(!commands::view(&settled, String::new()).pending);
+}
+
+/// Goal: a computer is made only if it fits the node's reserve: its disk
+/// with its snapshots' headroom beside every other's, its writable layer
+/// beside every other's, and its machine alone in the memory reserve; a
+/// refusal stores nothing.
+#[test]
+fn a_computer_is_made_only_inside_the_reserve() {
+    let store = granted();
+    let mut tight = policy();
+    tight.reserve.disk = 12 << 30;
+    // 5 GiB and its 25% headroom is 6.25 GiB: one fits, a second does not
+    commands::put_computer(&store, ALICE, "one", &spec(), None, id(1), PORTS, &tight, NOW).unwrap();
+    let e = commands::put_computer(&store, ALICE, "two", &spec(), None, id(2), PORTS, &tight, NOW).unwrap_err();
+    assert!(matches!(&e, CommandError::NoRoom(m) if m.contains("disk reserve")), "{e}");
+    assert!(store.by_name("two").unwrap().is_none(), "a refusal stores nothing");
+
+    let mut small = policy();
+    small.reserve.memory = 1 << 30;
+    let e = commands::put_computer(&store, ALICE, "big", &spec(), None, id(3), PORTS, &small, NOW).unwrap_err();
+    assert!(matches!(&e, CommandError::NoRoom(m) if m.contains("whole memory reserve")), "{e}");
+
+    let mut layers = policy();
+    layers.reserve.engine_disk = 4 << 30;
+    let e = commands::put_computer(&store, ALICE, "second", &spec(), None, id(4), PORTS, &layers, NOW).unwrap_err();
+    assert!(matches!(&e, CommandError::NoRoom(m) if m.contains("writable layers")), "{e}");
+    // converging an existing computer is not a new commitment
+    commands::put_computer(&store, ALICE, "one", &spec(), None, id(9), PORTS, &layers, NOW).unwrap();
 }

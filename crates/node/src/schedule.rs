@@ -43,6 +43,8 @@ async fn tick<W: World>(node: &Arc<Node<W>>, busy: &Arc<Mutex<HashSet<ComputerId
             return;
         }
     };
+    let in_flight: HashSet<ComputerId> = busy.lock().expect("never poisoned: panics abort").union(&busy_before).copied().collect();
+    node.reconcile(&machines, &in_flight).unwrap_or_else(|e| panic!("the store failed reconciling the ledger: {e}"));
     let ids = node.store.ids().unwrap_or_else(|e| panic!("the store failed listing computers: {e}"));
     for id in ids {
         {
