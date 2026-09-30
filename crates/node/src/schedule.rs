@@ -65,6 +65,12 @@ pub async fn run<W: World>(node: Arc<Node<W>>) {
     let busy: Arc<Mutex<HashSet<ComputerId>>> = Arc::new(Mutex::new(HashSet::new()));
     let slots = Arc::new(tokio::sync::Semaphore::new(BATCHES_AT_ONCE_MAX));
     let mut ticks: u32 = 0;
+    // A (re)started node measures its machines before it adopts them: a
+    // paused one is adopted at what it holds, not its whole allocation.
+    match node.world.engine().list().await {
+        Ok(machines) => node.sample(&machines).await,
+        Err(f) => eprintln!("schedule: the engine did not list its machines: {:?}: {}", f.error, f.detail),
+    }
     // Intentionally unbounded: the node's control loop, ended by the
     // process.
     loop {

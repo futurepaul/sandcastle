@@ -176,22 +176,29 @@ impl<W: World> Node<W> {
 
     /// Squares the ledger with the engine's listing: a running or paused
     /// machine that holds nothing (a restarted node's) is adopted, over the
-    /// reserve if it must be (a paused one shrinks at the next sample); a
-    /// computer whose machine is down and that is not meant to run, or is
-    /// cold, or is gone, holds nothing. Computers whose batch is in flight
-    /// (`busy`) are left alone: one may have just been admitted and not
-    /// made its machine yet.
+    /// reserve if it must be: an awake computer's running machine at its
+    /// whole allocation, any other (paused, or on its way to sleep or to a
+    /// stop) at what it measured, as it held before the restart (whole
+    /// when unmeasured); a computer whose machine is down and that is not
+    /// meant to run, or is cold, or is gone, holds nothing. Computers whose
+    /// batch is in flight (`busy`) are left alone: one may have just been
+    /// admitted and not made its machine yet.
     pub fn reconcile(&self, machines: &HashMap<ComputerId, Machine>, busy: &HashSet<ComputerId>) -> Result<(), StoreError> {
         let rows: Vec<Computer> = self.store.ids()?.into_iter().filter_map(|id| self.store.load(id).transpose()).collect::<Result<_, _>>()?;
         self.activity.retain(&rows.iter().map(|c| c.id).collect());
+        let measured: HashMap<ComputerId, u64> = self.measures.lock().expect("never poisoned: panics abort").latest.iter().map(|(id, s)| (*id, s.resident)).collect();
         let mut ledger = self.ledger.lock().expect("never poisoned: panics abort");
         for c in &rows {
             if busy.contains(&c.id) {
                 continue;
             }
-            let up = matches!(machines.get(&c.id), Some(Machine::Running | Machine::Paused));
+            let machine = machines.get(&c.id).copied();
+            let up = matches!(machine, Some(Machine::Running | Machine::Paused));
+            let whole = budget::machine_memory(&c.fixed, &self.policy.costs);
+            let awake = c.desired == Desired::Running && c.tier == Tier::Awake && machine == Some(Machine::Running);
+            let need = if awake { whole } else { measured.get(&c.id).map_or(whole, |r| (*r).clamp(1, whole)) };
             match (up, ledger.holds(c.id).is_some()) {
-                (true, false) => ledger.adopt(c.id, budget::machine_memory(&c.fixed, &self.policy.costs)),
+                (true, false) => ledger.adopt(c.id, need),
                 (false, true) if c.desired != Desired::Running || c.tier == Tier::Cold => ledger.release(c.id),
                 _ => {}
             }

@@ -200,12 +200,12 @@ impl Sim {
             71..=82 => self.guest(),
             83..=89 => self.traffic(),
             90..=96 => self.weather(),
-            _ => self.crash(),
+            _ => self.crash().await,
         }
         self.check(false);
     }
 
-    fn crash(&mut self) {
+    async fn crash(&mut self) {
         self.stats.crashes += 1;
         self.knowledge.clear();
         // The process's memory is gone: its ledger (a restarted node adopts
@@ -219,6 +219,9 @@ impl Sim {
             std::mem::replace(&mut self.node.store, Store::in_memory().expect("a placeholder"))
         };
         self.node = Node::new(store, self.world.clone(), policy(self.seed), Some(self.key.clone()), sandcastle_node::seal::CHUNK_BYTES).expect("a node restarts");
+        // As its scheduler does first: measure before adopting.
+        let listing: HashMap<ComputerId, Machine> = self.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
+        self.node.sample(&listing).await;
     }
 
     async fn advance(&mut self) {
@@ -328,7 +331,7 @@ impl Sim {
                 self.count(&effect, &outcome);
                 if crashes && self.rng.chance(CRASH_AFTER_EFFECT) {
                     // The effect happened; the row never heard.
-                    self.crash();
+                    self.crash().await;
                     return false;
                 }
                 self.node.record(id, &effect, &outcome).expect("record");
@@ -342,7 +345,7 @@ impl Sim {
             }
         };
         if crashes && self.rng.chance(CRASH_BETWEEN) {
-            self.crash();
+            self.crash().await;
             return false;
         }
         more
