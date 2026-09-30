@@ -4,7 +4,7 @@
 # already vetted where they overlap; new ones passed the two-week cooldown.
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e"]
+members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e", "crates/web"]
 
 [workspace.package]
 edition = "2021"

@@ -20,6 +20,11 @@
 //! - `hermes` (with `--hermes`): Hermes with credentials from
 //!   fragment.club, no token in the guest, a real model call through the
 //!   swap (a few cents);
+//! - `iroh` (with `--hermes`, on a node with `--iroh-relay`): the same
+//!   Hermes reached by its key through the node's relay, measured beside
+//!   its URL (fragment-next docs/runtime-seam.md);
+//! - `web` (with `--hermes --web <dir>`): the same from headless Chrome, a
+//!   page on the WASM client (`crates/web`);
 //! - `cleanup`: everything deleted, and nothing left on the host;
 //! - `wiped` (with `--wipe-state`): the daemon stopped and its state set
 //!   aside, then a restore from the bucket's sealed manifest alone.
@@ -29,6 +34,8 @@
 
 mod client;
 mod host;
+mod iroh;
+mod web;
 mod ws;
 
 use std::path::PathBuf;
@@ -76,6 +83,11 @@ struct Args {
     /// call: a few cents).
     #[arg(long)]
     hermes: bool,
+    /// The test page and the WASM client (`crates/web`'s README): with
+    /// `--hermes`, the `web` section opens it in headless Chrome
+    /// (`CHROME_BIN`).
+    #[arg(long)]
+    web: Option<PathBuf>,
     /// Keep the computers at the end (no cleanup).
     #[arg(long)]
     keep: bool,
@@ -1022,6 +1034,10 @@ async fn main() -> std::process::ExitCode {
     let mut sections: Vec<&str> = vec!["auth", "life", "crash", "backup", "net", "sleep"];
     if r.args.hermes {
         sections.push("hermes");
+        sections.push("iroh");
+        if r.args.web.is_some() {
+            sections.push("web");
+        }
     }
     if !r.args.keep {
         sections.push("cleanup");
@@ -1041,6 +1057,8 @@ async fn main() -> std::process::ExitCode {
             "net" => net(&mut r).await,
             "sleep" => sleep(&mut r).await,
             "hermes" => hermes(&mut r).await,
+            "iroh" => iroh::iroh(&mut r).await,
+            "web" => web::web(&mut r).await,
             "wiped" => wiped(&mut r).await,
             "cleanup" => cleanup(&mut r).await,
             _ => unreachable!(),
