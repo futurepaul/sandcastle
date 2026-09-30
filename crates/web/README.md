@@ -22,7 +22,7 @@ lib=$(nix build --no-link --print-out-paths nixpkgs#llvmPackages_19.clang-unwrap
 llvm=$(nix build --no-link --print-out-paths nixpkgs#llvmPackages_19.llvm)
 export CC_wasm32_unknown_unknown=$clang/bin/clang AR_wasm32_unknown_unknown=$llvm/bin/llvm-ar
 export CFLAGS_wasm32_unknown_unknown="-resource-dir $lib/lib/clang/19"
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --release --target wasm32-unknown-unknown -p sandcastle-web
+cargo build --release --target wasm32-unknown-unknown -p sandcastle-web  # .cargo/config.toml: getrandom's backend
 cargo install wasm-bindgen-cli --version 0.2.127 --locked
 rm -rf target/web && mkdir -p target/web
 wasm-bindgen target/wasm32-unknown-unknown/release/sandcastle_web.wasm --target web --out-dir target/web/pkg --out-name sandcastle_web

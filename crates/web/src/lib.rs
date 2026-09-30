@@ -8,7 +8,7 @@
 //! From JavaScript:
 //!
 //! ```js
-//! const peer = await Peer.create(relay);
+//! const peer = new Peer(); // its key, for asking an admission: peer.id()
 //! const computer = await peer.connect(endpoint, relay, admission, host);
 //! const { status, headers, body } = await computer.fetch("GET", "/api/status", "{}", new Uint8Array());
 //! const socket = await computer.websocket("/api/ws", ["hermes-gateway-v1"]);
@@ -21,7 +21,7 @@ use std::rc::Rc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use iroh::endpoint::{presets, Connection};
-use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use wasm_bindgen::prelude::*;
 
@@ -36,39 +36,51 @@ fn err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
 
-/// A page's own iroh endpoint: a key made here, used for this page's life.
+/// A page's own iroh key, made here and used for this page's life. Its
+/// endpoint binds at the first `connect`, homed on that computer's relay:
+/// a page names its key to get an admission before it knows the relay.
 #[wasm_bindgen]
 pub struct Peer {
-    ep: Endpoint,
+    secret: SecretKey,
+    ep: tokio::sync::OnceCell<Endpoint>,
 }
 
 #[wasm_bindgen]
 impl Peer {
-    pub async fn create(relay: String) -> Result<Peer, JsError> {
+    #[wasm_bindgen(constructor)]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Peer {
         console_error_panic_hook::set_once();
-        let relay: RelayUrl = relay.parse().map_err(err)?;
-        let ep = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relay.into())).bind().await.map_err(err)?;
-        Ok(Peer { ep })
+        Peer { secret: SecretKey::generate(), ep: tokio::sync::OnceCell::new() }
     }
 
     /// Its public key, 64 hex: what an admission names.
     pub fn id(&self) -> String {
-        self.ep.id().to_string()
+        self.secret.public().to_string()
     }
 
     /// Connects to a computer's key through its relay and presents the
     /// admission. `host` is the Host header its requests carry.
     pub async fn connect(&self, endpoint: String, relay: String, admission: String, host: String) -> Result<Computer, JsError> {
         let relay: RelayUrl = relay.parse().map_err(err)?;
+        let ep = self
+            .ep
+            .get_or_try_init(|| {
+                Endpoint::builder(presets::Minimal).secret_key(self.secret.clone()).relay_mode(RelayMode::Custom(relay.clone().into())).bind()
+            })
+            .await
+            .map_err(err)?;
         let addr = EndpointAddr::new(endpoint.parse().map_err(err)?).with_relay_url(relay);
-        let conn = self.ep.connect(addr, ALPN).await.map_err(err)?;
+        let conn = ep.connect(addr, ALPN).await.map_err(err)?;
         let computer = Computer { conn, host };
         computer.admit(admission).await?;
         Ok(computer)
     }
 
     pub async fn close(&self) {
-        self.ep.close().await;
+        if let Some(ep) = self.ep.get() {
+            ep.close().await;
+        }
     }
 }
 

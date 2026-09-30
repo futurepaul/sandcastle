@@ -29,7 +29,7 @@
       results.init_ms = now() - t;
       const cfg = JSON.parse(await ask("/config"));
       t = now();
-      const peer = await Peer.create(cfg.relay);
+      const peer = new Peer();
       results.peer_ms = now() - t;
       const admission = await ask(`/admit?peer=${peer.id()}`);
       t = now();
