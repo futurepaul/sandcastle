@@ -151,7 +151,7 @@ impl<W: World> Node<W> {
             Next::Do(effect) => {
                 let outcome = self.perform(&c, &effect).await;
                 self.record(id, &effect, &outcome)?;
-                if matches!((&effect, &outcome), (Effect::Pause, Outcome::Done)) {
+                if matches!((&effect, &outcome), (Effect::Pause { .. }, Outcome::Done)) {
                     self.settle_paused(id).await;
                 }
                 learn(k, &effect, &outcome);
@@ -412,7 +412,7 @@ impl<W: World> Node<W> {
             Effect::Start { credentials } => done(engine.start(c.id, credentials).await),
             Effect::Rotate { credentials, .. } => done(engine.rotate(c.id, credentials).await),
             Effect::Launch { argv, env } => done(engine.launch(c.id, argv, env).await),
-            Effect::Pause => done(engine.pause(c.id).await),
+            Effect::Pause { init } => done(engine.pause(c.id, !init).await),
             Effect::Resume => done(engine.resume(c.id).await),
             Effect::Remove => done(engine.remove(c.id).await),
             Effect::StartUpload { key, .. } => match self.objects() {

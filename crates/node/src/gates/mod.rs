@@ -58,9 +58,11 @@ pub trait Engine: Send + Sync + 'static {
     fn quiesce(&self, id: ComputerId, stop: Option<&[String]>) -> impl Future<Output = GateResult<()>> + Send;
     /// Flushes the guest's writes to its disks.
     fn sync(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
-    /// Freezes the machine, its memory kept, once its guest has flushed
-    /// its writes; paused already is success.
-    fn pause(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
+    /// Freezes the machine, its memory kept; paused already is success.
+    /// `flushed`: only once the engine has frozen the guest's workload and
+    /// flushed its writes, refused if it cannot (it cannot when the
+    /// image's init is PID 1); otherwise it flushes what it can.
+    fn pause(&self, id: ComputerId, flushed: bool) -> impl Future<Output = GateResult<()>> + Send;
     /// Thaws a paused machine; running already is success.
     fn resume(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
 }

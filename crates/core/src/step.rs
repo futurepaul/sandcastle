@@ -96,8 +96,11 @@ pub enum Effect {
     Rotate { credentials: Vec<Credential>, withdraw: bool },
     Launch { argv: Vec<String>, env: BTreeMap<String, String> },
     /// Freeze the machine, its memory kept, after its guest flushed its
-    /// writes to its disks.
-    Pause,
+    /// writes to its disks. `init`: its image's init is PID 1, whose
+    /// workload the engine cannot freeze to flush (msb 0.7.4 refuses
+    /// `--guest-flush required`), so the node synced the guest just
+    /// before and the engine flushes what it can.
+    Pause { init: bool },
     /// Thaw a paused machine.
     Resume,
     Remove,
@@ -124,7 +127,7 @@ impl Effect {
             Effect::Start { .. } => Step::Start,
             Effect::Rotate { .. } => Step::Rotate,
             Effect::Launch { .. } => Step::Launch,
-            Effect::Pause => Step::Pause,
+            Effect::Pause { .. } => Step::Pause,
             Effect::Resume => Step::Resume,
             Effect::Remove => Step::Remove,
             Effect::StartUpload { .. } | Effect::Upload { .. } | Effect::AbortUpload { .. } => Step::Ship,

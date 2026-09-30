@@ -302,7 +302,10 @@ fn warm(c: &Computer, k: &Knowledge, p: &Policy, sleep: &Sleep, now: Millis) -> 
         // The snapshot of what it wrote is owed before the pause, so a
         // crash between the two still takes it.
         Machine::Running if c.has_disk() && c.snapshot_due.is_none() => Next::Note(Note::Owe { kind: SnapshotKind::Pause }),
-        Machine::Running => Next::Do(Effect::Pause),
+        // An init's workload the engine cannot freeze to flush: the node
+        // syncs the guest just before.
+        Machine::Running if c.machine_stop.is_some() && !k.synced => Next::Do(Effect::Sync),
+        Machine::Running => Next::Do(Effect::Pause { init: c.machine_stop.is_some() }),
         Machine::Paused if c.status != Status::Warm => Next::Note(Note::Status { status: Status::Warm, reason: None }),
         // What it wrote before it paused is snapshotted once (a frozen
         // guest writes nothing more); its disk's duties go on while it

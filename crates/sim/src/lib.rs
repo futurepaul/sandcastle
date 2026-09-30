@@ -332,7 +332,7 @@ impl Sim {
                     return false;
                 }
                 self.node.record(id, &effect, &outcome).expect("record");
-                if matches!((&effect, &outcome), (sandcastle_core::step::Effect::Pause, sandcastle_core::step::Outcome::Done)) {
+                if matches!((&effect, &outcome), (sandcastle_core::step::Effect::Pause { .. }, sandcastle_core::step::Outcome::Done)) {
                     self.node.settle_paused(id).await;
                 }
                 self.after_record(&c);
@@ -375,7 +375,7 @@ impl Sim {
             Effect::Upload { .. } => self.stats.shipped += 1,
             Effect::DeleteRow => self.stats.deleted += 1,
             Effect::Stop { force: true } => self.stats.kills += 1,
-            Effect::Pause => self.stats.pauses += 1,
+            Effect::Pause { .. } => self.stats.pauses += 1,
             Effect::Rotate { withdraw: false, .. } => self.stats.rotations += 1,
             Effect::Rotate { withdraw: true, .. } => self.stats.withdrawals += 1,
             _ => {}

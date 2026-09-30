@@ -61,6 +61,13 @@ impl Host {
         Ok(text.lines().filter_map(|l| l.strip_prefix(&prefix)).map(str::to_string).collect())
     }
 
+    /// Bytes written to computer `id`'s disk since its newest snapshot.
+    pub async fn written(&self, id: &str) -> Result<u64, String> {
+        assert!(id.len() == 16 && id.bytes().all(|c| c.is_ascii_hexdigit()));
+        let text = self.run(&format!("zfs get -H -p -o value written {}/{id}", self.zfs_parent)).await?;
+        text.trim().parse().map_err(|e| format!("zfs written {text:?}: {e}"))
+    }
+
     /// Watches computer `id` on the host itself (a look every 20 ms; an
     /// SSH round trip is too slow to see a rebase's gap) and SIGKILLs the
     /// daemon's main process (not the machines `KillMode=process` leaves in

@@ -147,11 +147,11 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
         Effect::Rotate { credentials, withdraw } => handed(&mut n, credentials, *withdraw, p, now),
         // Asleep, unless someone woke it meanwhile (the row it is recorded
         // against says so): then its resume is next.
-        Effect::Pause if c.tier != Tier::Awake => {
+        Effect::Pause { .. } if c.tier != Tier::Awake => {
             n.status = Status::Warm;
             n.status_reason = None;
         }
-        Effect::Pause => {}
+        Effect::Pause { .. } => {}
         // Woken: its service answered before the pause, and has the grace
         // to answer again (`serving`); resumed to be stopped: nothing yet.
         Effect::Resume if c.tier == Tier::Awake && c.desired == Desired::Running => {
@@ -198,7 +198,7 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
 
 fn failed(c: &Computer, effect: &Effect, fault: &Fault, now: Millis) -> Change {
     let mut n = c.clone();
-    if matches!(effect, Effect::Pause) {
+    if matches!(effect, Effect::Pause { .. }) {
         // Sleep is the node's economy, never the computer's failure: a
         // machine that would not pause (a guest that could not flush, so
         // likely wedged) sleeps cold instead, its halt killing it if it
@@ -375,7 +375,7 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
             k.synced = false;
         }
         Effect::Launch { .. } => k.probe = None,
-        Effect::Pause => {
+        Effect::Pause { .. } => {
             k.machine = Machine::Paused;
             k.probe = None;
         }

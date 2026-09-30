@@ -466,11 +466,15 @@ impl super::Engine for Msb {
         self.exec("msb exec (sync)", id, &["/bin/sync".into()], &[]).await.map(|_| ())
     }
 
-    async fn pause(&self, id: ComputerId) -> GateResult<()> {
-        // `required`: the pause happens only after the guest flushed its
-        // writes, so a paused machine's disk holds what it wrote (msb 0.7.4
-        // pauses in about 8 ms; a second pause succeeds).
-        let args: Vec<String> = vec!["pause".into(), "--guest-flush".into(), "required".into(), "-q".into(), id.machine_name()];
+    async fn pause(&self, id: ComputerId, flushed: bool) -> GateResult<()> {
+        // `required`: the pause happens only after agentd froze the
+        // workload and flushed its writes, so the disk holds what it wrote
+        // (msb 0.7.4 pauses in about 8 ms; a second pause succeeds). A
+        // machine whose image's init is PID 1 cannot be frozen that way
+        // ("PID 1 handoff workloads are not wholly owned by agentd's
+        // cgroup"): `auto` flushes what it can.
+        let flush = if flushed { "required" } else { "auto" };
+        let args: Vec<String> = vec!["pause".into(), "--guest-flush".into(), flush.into(), "-q".into(), id.machine_name()];
         self.run_ok("msb pause", &args, &[], &[], PAUSE_DEADLINE).await.map(|_| ())
     }
 

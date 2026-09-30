@@ -728,20 +728,23 @@ async fn sleep(r: &mut Run) -> Step {
     r.ensure(S, "idle, it goes warm: its machine paused", machine.as_ref().is_some_and(|m| m.status == "Paused"), format!("{} after its last request (idle after {idle_s} s); {machine:?}", secs(took)))?;
     r.ensure(S, "and its view is settled", v["pending"] == false, summary(&v))?;
 
-    // What it wrote before it slept is backed up while it sleeps.
+    // What it wrote before it slept is backed up while it sleeps: a
+    // snapshot newer than the write (the schedule's, if it came first, or
+    // the one the pause owes), and nothing on the disk since the newest.
+    let newest = |v: &Value| v["snapshots"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str().and_then(snapshot_seq)).max().unwrap_or(0);
+    let before = newest(&r.client.call(&r.alice, "GET", &format!("/v1/computers/{}/snapshots", web.name), None).await?.json());
     let third = format!("e2e-{}-{}", r.tag, random_hex(4));
     r.exec(&web.name, &format!("echo {third} > /data/third && sync")).await?;
     r.until(&web.name, Duration::from_secs(idle_s + 60), |s, v| s == 200 && v["observed"]["state"] == "warm").await?;
     let start = Instant::now();
-    let mut pause_snapshot = None;
-    while start.elapsed() < Duration::from_secs(60) && pause_snapshot.is_none() {
+    let mut seen = (0, u64::MAX, String::new());
+    while start.elapsed() < Duration::from_secs(60) && !(seen.0 > before && seen.1 == 0) {
         let snaps = r.client.call(&r.alice, "GET", &format!("/v1/computers/{}/snapshots", web.name), None).await?.json();
-        pause_snapshot = snaps["snapshots"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str()).find(|n| n.ends_with("-pause")).map(str::to_string);
-        if pause_snapshot.is_none() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let names: Vec<String> = snaps["snapshots"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str().map(str::to_string)).collect();
+        seen = (newest(&snaps), r.host.written(&web.id).await?, names.last().cloned().unwrap_or_default());
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    r.ensure(S, "a warm computer's writes are snapshotted", pause_snapshot.is_some(), pause_snapshot.clone().unwrap_or_else(|| "no pause snapshot in 60 s".into()))?;
+    r.ensure(S, "a warm computer's writes are snapshotted", seen.0 > before && seen.1 == 0, format!("newest {} (before the write: seq {before}); {} bytes written since", seen.2, seen.1))?;
 
     // Awake, warm, and cold requests, measured from the client: each a new
     // TLS connection through the router to the guest's service.

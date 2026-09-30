@@ -421,10 +421,20 @@ impl gates::Engine for World {
         })
     }
 
-    async fn pause(&self, id: ComputerId) -> GateResult<()> {
+    async fn pause(&self, id: ComputerId, flushed: bool) -> GateResult<()> {
         let mut s = self.lock();
-        let roll = s.engine_roll(&format!("pause {}", id.hex()));
+        let roll = s.engine_roll(&format!("pause {}{}", id.hex(), if flushed { "" } else { " (flush what it can)" }));
+        let s = &mut *s;
         gated(roll, || match s.machines.get_mut(&id) {
+            // Like msb 0.7.4: an init's workload cannot be frozen to flush.
+            Some(m) if m.init && flushed => {
+                s.violations.push(format!("{}: an init machine was asked for a flushed pause", id.hex()));
+                Err(fault(GateError::Failed, "workload freezer is unavailable"))
+            }
+            Some(m) if !m.init && !flushed => {
+                s.violations.push(format!("{}: a machine the node launches was paused unflushed", id.hex()));
+                Err(fault(GateError::Failed, "unflushed"))
+            }
             // A wedged guest cannot flush: `--guest-flush required` refuses.
             Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "the guest did not flush")),
             Some(m) if matches!(m.state, Machine::Running | Machine::Paused) => {

@@ -146,8 +146,10 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service, its stop, or its resume failed");
             assert_eq!(*force, crate::plan::stop_failed(c) || unresumed, "a machine is killed only after a graceful stop, or a resume, failed");
         }
-        Effect::Pause => {
+        Effect::Pause { init } => {
             assert_eq!((c.desired, c.tier, k.machine), (Desired::Running, Tier::Warm, Machine::Running), "only a running machine the node means warm is paused");
+            assert_eq!(*init, c.machine_stop.is_some(), "an init machine is paused as one");
+            assert!(!*init || k.synced, "an init machine's guest is synced before its pause");
             let seen = k.activity.expect("a pause follows a fresh look at its activity");
             assert!(!seen.in_flight && seen.last.unwrap_or(0) <= c.active_at, "nothing happened since the sleep was decided");
         }

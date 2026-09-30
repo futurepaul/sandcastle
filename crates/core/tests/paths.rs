@@ -801,7 +801,7 @@ fn warm() -> Run {
     r.k.activity = Some(Seen::NOTHING);
     assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }), "its writes' snapshot is owed before the pause");
     r.noted();
-    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.expect_do(|e| matches!(e, Effect::Pause { .. }));
     r.ok();
     assert_eq!((r.c.status, r.k.machine, r.c.snapshot_due), (Status::Warm, Machine::Paused, Some(SnapshotKind::Pause)));
     assert_eq!(r.next(), Next::Observe(Observe::Disk), "what it wrote before it slept is backed up");
@@ -826,7 +826,7 @@ fn a_warm_computers_writes_are_snapshotted() {
     r.k.activity = Some(Seen::NOTHING);
     assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }));
     r.noted();
-    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.expect_do(|e| matches!(e, Effect::Pause { .. }));
     r.ok();
     assert_eq!(r.next(), Next::Observe(Observe::Disk));
     r.k.disk = Some(disk(8192, &[]));
@@ -891,6 +891,29 @@ fn a_request_wakes_a_warm_computer_in_one_batch() {
     assert!(!r.asked[from..].iter().any(|n| matches!(n, Next::Do(Effect::Launch { .. }))), "a resumed service is not launched again");
 }
 
+/// Goal: a machine whose image's init is PID 1 (Hermes under s6), whose
+/// workload msb cannot freeze to flush, is synced by the node just before
+/// its pause, and paused unflushed; a machine the node launches is
+/// paused only flushed (found on lat-6: msb 0.7.4 refuses `--guest-flush
+/// required` for an init machine).
+#[test]
+fn an_init_machine_is_synced_before_its_pause() {
+    let mut r = serving_sleepy();
+    r.c.machine_stop = Some(vec!["/halt".into()]);
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.k.activity = Some(Seen::NOTHING);
+    r.next();
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    r.next();
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Sync));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "slow".into() }));
+    r.expect_do(|e| matches!(e, Effect::Pause { init: true }));
+}
+
 /// Goal: a crash after a pause and before its record still takes the
 /// snapshot of what the computer wrote (owed before the pause; found by
 /// simulation seed 231).
@@ -933,7 +956,7 @@ fn activity_during_the_sleep_decision_wakes_rather_than_pauses() {
     r.k.activity = Some(Seen { last: Some(r.now), in_flight: false });
     assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }));
     r.noted();
-    assert!(!r.asked.iter().any(|n| matches!(n, Next::Do(Effect::Pause))));
+    assert!(!r.asked.iter().any(|n| matches!(n, Next::Do(Effect::Pause { .. }))));
     assert_eq!((r.c.tier, r.c.status), (Tier::Awake, Status::Starting));
     assert_eq!(r.next(), Next::Note(Note::Served { seq: 1 }), "never paused: it answered this batch, and serves again");
 }
@@ -975,7 +998,7 @@ fn a_machine_that_will_not_pause_goes_cold() {
     r.k.activity = Some(Seen::NOTHING);
     assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }));
     r.noted();
-    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.expect_do(|e| matches!(e, Effect::Pause { .. }));
     r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "the guest did not flush".into() }));
     assert_eq!((r.c.tier, r.c.status, r.c.failure.clone(), r.c.retry_at), (Tier::Cold, Status::Serving, None, None));
     r.restart(Machine::Running);
