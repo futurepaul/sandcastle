@@ -35,6 +35,10 @@ struct Harness {
     dir: PathBuf,
     grantor: Keys,
     server: tokio::task::JoinHandle<std::io::Error>,
+    /// With iroh: the node's secret key and its admitters, and the task
+    /// that keeps its endpoints.
+    iroh: Option<(String, Vec<String>)>,
+    iroh_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -84,12 +88,30 @@ impl Harness {
     }
 
     async fn start_in(dir: PathBuf, grantor: Keys, world: World, port_base: u16, idle_after_s: u64) -> Harness {
+        Harness::start_with(dir, grantor, world, port_base, idle_after_s, None).await
+    }
+
+    /// A node whose computers are reached by their keys, with no relay: a
+    /// peer dials an endpoint at its own addresses.
+    async fn start_iroh(tag: &str, admitters: Vec<String>, idle_after_s: u64) -> Harness {
+        let iroh = Some((Keys::generate().secret_hex(), admitters));
+        Harness::start_with(temp_dir(tag), Keys::generate(), World::new(7), free_port(), idle_after_s, iroh).await
+    }
+
+    async fn start_with(dir: PathBuf, grantor: Keys, world: World, port_base: u16, idle_after_s: u64, iroh: Option<(String, Vec<String>)>) -> Harness {
         let (cert, key, der) = write_cert(&dir);
-        let config = config(&dir, &grantor, port_base, idle_after_s);
+        let mut config = config(&dir, &grantor, port_base, idle_after_s);
+        if let Some((_, admitters)) = &iroh {
+            config.iroh_without_relay = true;
+            config.admitters = admitters.clone();
+            config.check().unwrap();
+        }
         let store = Store::open(&dir.join(crate::reset::STATE_FILE)).unwrap();
         let backup_key = BackupKey::from_hex(&"42".repeat(32)).unwrap();
         let node = Arc::new(Node::new(store, world.clone(), config.policy(), Some(backup_key), sandcastle_node::seal::CHUNK_BYTES).unwrap());
-        let daemon = Arc::new(Daemon::new(config, node));
+        let keys = iroh.as_ref().map(|(secret, _)| crate::iroh::Iroh::new(secret, None).unwrap());
+        let daemon = Arc::new(Daemon::new(config, node, keys));
+        let iroh_task = iroh.as_ref().map(|_| tokio::spawn(crate::iroh::run(daemon.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = crate::router::tls_acceptor(&cert, &key).unwrap();
@@ -99,7 +121,7 @@ impl Harness {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let client = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        Harness { daemon, world, addr, connector, dir, grantor, server }
+        Harness { daemon, world, addr, connector, dir, grantor, server, iroh, iroh_task }
     }
 
     /// The same node started again on its own state (and the same world:
@@ -107,8 +129,9 @@ impl Harness {
     async fn restart(self) -> Harness {
         self.server.abort();
         let (dir, grantor, world, port_base) = (self.dir.clone(), Keys::from_secret_hex(&self.grantor.secret_hex()).unwrap(), self.world.clone(), self.daemon.config.port_base);
+        let iroh = self.iroh.clone();
         drop(self);
-        Harness::start_in(dir, grantor, world, port_base, 0).await
+        Harness::start_with(dir, grantor, world, port_base, 0, iroh).await
     }
 
     fn now_s(&self) -> i64 {
@@ -190,6 +213,9 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.server.abort();
+        if let Some(t) = &self.iroh_task {
+            t.abort();
+        }
     }
 }
 
@@ -670,4 +696,204 @@ async fn cors_origins_replace_the_services_policy() {
     assert_eq!(headers.get("access-control-allow-origin").unwrap(), "http://localhost");
     let (_, view) = h.call(&alice, "GET", "/v1/computers/hermes", None).await;
     assert_eq!(view["pending"], false, "origins are not a new machine");
+}
+
+/// A peer on the test's own iroh endpoint, with no relay: it dials a
+/// computer's endpoint at the endpoint's own addresses.
+struct Peer {
+    ep: iroh::Endpoint,
+}
+
+impl Peer {
+    async fn new() -> Peer {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(iroh::RelayMode::Disabled).bind().await.unwrap();
+        Peer { ep }
+    }
+
+    fn id(&self) -> String {
+        self.ep.id().to_string()
+    }
+
+    async fn dial(&self, h: &Harness, name: &str) -> iroh::endpoint::Connection {
+        let id = h.id_of(name);
+        let iroh = h.daemon.iroh.as_ref().unwrap();
+        eventually("the computer's endpoint", || iroh.endpoint(id).is_some()).await;
+        self.ep.connect(iroh.endpoint(id).unwrap().addr(), crate::iroh::ALPN).await.unwrap()
+    }
+}
+
+/// An admission sent on its own stream: the node's answer.
+async fn admit(conn: &iroh::endpoint::Connection, admission: &str) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&[crate::iroh::STREAM_ADMISSION]).await.unwrap();
+    send.write_u16(u16::try_from(admission.len()).unwrap()).await.unwrap();
+    send.write_all(admission.as_bytes()).await.unwrap();
+    send.finish().unwrap();
+    let len = recv.read_u16().await.unwrap();
+    let mut body = vec![0u8; usize::from(len)];
+    recv.read_exact(&mut body).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// An HTTP/1.1 connection over a new stream.
+async fn http_over(conn: &iroh::endpoint::Connection) -> Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>, String> {
+    let (mut send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+    send.write_all(&[crate::iroh::STREAM_HTTP]).await.map_err(|e| e.to_string())?;
+    let (sender, driver) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tokio::io::join(recv, send))).await.map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let _ = driver.with_upgrades().await;
+    });
+    Ok(sender)
+}
+
+/// A GET over a new stream: its status and body, or why it failed.
+async fn get_over(conn: &iroh::endpoint::Connection, path: &str) -> Result<(StatusCode, serde_json::Value), String> {
+    let mut sender = http_over(conn).await?;
+    let resp = sender.send_request(Request::get(path).header("host", "hermes").body(Full::new(Bytes::new())).unwrap()).await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+    Ok((status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)))
+}
+
+/// Goal: a computer is reached by its key, only by a peer an admission
+/// names, until the admission ends; the service sees the router's account
+/// of the request; the key holds across a restart. Method: real iroh
+/// endpoints on loopback; an admission wrong in each way, then a good one;
+/// two streams and an upgrade on one connection; the clock past its end.
+#[tokio::test]
+async fn a_computer_is_reached_by_its_key() {
+    let h = Harness::start_iroh("iroh", vec![], 0).await;
+    let alice = Keys::generate();
+    h.grant(&alice).await;
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    let id = h.id_of("hermes");
+    let port = h.daemon.node.store.by_name("hermes").unwrap().unwrap().host_port;
+    let _service = service(port).await;
+    let iroh = h.daemon.iroh.as_ref().unwrap();
+    let (_, view) = h.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(view["iroh"]["endpoint"], iroh.endpoint_id(id).as_str(), "its view names its key");
+    assert!(view["iroh"].get("relay").is_none());
+    let node = iroh.node.clone();
+    let peer = Peer::new().await;
+    let now = h.now_s();
+
+    // no admission: its first HTTP stream closes the connection
+    let conn = peer.dial(&h, "hermes").await;
+    assert!(get_over(&conn, "/").await.is_err(), "not admitted, nothing reaches the service");
+
+    // each wrong admission is refused, and closes a connection that has none
+    let stranger = Keys::generate();
+    for (why, adm) in [
+        ("signer", stranger.admission(&peer.id(), "hermes", &node, now, now + 300)),
+        ("another peer", alice.admission(&"f".repeat(64), "hermes", &node, now, now + 300)),
+        ("another computer", alice.admission(&peer.id(), "other", &node, now, now + 300)),
+        ("another node", alice.admission(&peer.id(), "hermes", &"e".repeat(64), now, now + 300)),
+        ("expired", alice.admission(&peer.id(), "hermes", &node, now - 400, now - 100)),
+        ("too long", alice.admission(&peer.id(), "hermes", &node, now, now + crate::iroh::ADMISSION_LIFETIME_MAX_S + 1)),
+    ] {
+        let conn = peer.dial(&h, "hermes").await;
+        let answer = admit(&conn, &adm).await;
+        assert_eq!(answer["admitted"], false, "{why}: {answer}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await.unwrap_or_else(|_| panic!("{why}: the connection stays open"));
+    }
+
+    // admitted: two streams and an upgrade on one connection
+    let conn = peer.dial(&h, "hermes").await;
+    let answer = admit(&conn, &alice.admission(&peer.id(), "hermes", &node, now, now + 300)).await;
+    assert_eq!(answer, serde_json::json!({"admitted": true, "until": now + 300}));
+    let (status, seen) = get_over(&conn, "/over-iroh").await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen["path"], "/over-iroh");
+    assert_eq!(seen["headers"]["x-forwarded-proto"], "https");
+    assert_eq!(seen["headers"]["x-forwarded-for"], "0.0.0.0", "a key has no address to pass on");
+    assert_eq!(get_over(&conn, "/again").await.unwrap().1["path"], "/again");
+    let mut sender = http_over(&conn).await.unwrap();
+    let req = Request::get("/ws").header("host", "hermes").header("connection", "upgrade").header("upgrade", "echo").body(Full::new(Bytes::new())).unwrap();
+    let mut resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let mut io = hyper_util::rt::TokioIo::new(hyper::upgrade::on(&mut resp).await.unwrap());
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    io.write_all(b"ping over iroh").await.unwrap();
+    let mut echoed = [0u8; 14];
+    io.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ping over iroh");
+
+    // the admission ends: so does the connection
+    h.world.lock().now += 301_000;
+    tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await.expect("closed when its admission ends");
+
+    // the key is the computer's, across a restart
+    let before = iroh.endpoint_id(id);
+    let h = h.restart().await;
+    let (_, view) = h.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(view["iroh"]["endpoint"], before.as_str());
+    let conn = peer.dial(&h, "hermes").await;
+    let now = h.now_s();
+    assert_eq!(admit(&conn, &alice.admission(&peer.id(), "hermes", &node, now, now + 60)).await["admitted"], true);
+    assert_eq!(get_over(&conn, "/after-restart").await.unwrap().0, StatusCode::OK);
+}
+
+/// Goal: a node that names its admitters takes their admissions and not
+/// the owner's: a person's own node, whose computers the platform manages
+/// but cannot read. Method: the owner's admission, then the admitter's.
+#[tokio::test]
+async fn admitters_replace_the_owner() {
+    let bob = Keys::generate();
+    let h = Harness::start_iroh("iroh-admitters", vec![bob.pubkey_hex().to_string()], 0).await;
+    let platform = Keys::generate();
+    h.grant(&platform).await;
+    assert_eq!(h.call(&platform, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    let port = h.daemon.node.store.by_name("hermes").unwrap().unwrap().host_port;
+    let _service = service(port).await;
+    let node = h.daemon.iroh.as_ref().unwrap().node.clone();
+    let peer = Peer::new().await;
+    let now = h.now_s();
+    let conn = peer.dial(&h, "hermes").await;
+    let answer = admit(&conn, &platform.admission(&peer.id(), "hermes", &node, now, now + 300)).await;
+    assert_eq!(answer["admitted"], false, "the owner that manages it is not an admitter here: {answer}");
+    let conn = peer.dial(&h, "hermes").await;
+    assert_eq!(admit(&conn, &bob.admission(&peer.id(), "hermes", &node, now, now + 300)).await["admitted"], true);
+    assert_eq!(get_over(&conn, "/").await.unwrap().0, StatusCode::OK);
+}
+
+/// Goal: the key answers while its computer sleeps, and a request over it
+/// wakes the computer as a request to its URL does; an open connection
+/// with nothing on it lets the computer sleep. Method: warm on request,
+/// then a stream; idle past the idle time with the connection open, then
+/// a stream on it.
+#[tokio::test]
+async fn a_sleeping_computer_wakes_for_its_key() {
+    let h = Harness::start_iroh("iroh-sleep", vec![], 30).await;
+    let alice = Keys::generate();
+    h.grant(&alice).await;
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    let id = h.id_of("hermes");
+    let port = h.daemon.node.store.by_name("hermes").unwrap().unwrap().host_port;
+    let _service = service(port).await;
+    let _scheduler = tokio::spawn(sandcastle_node::schedule::run(h.daemon.node.clone()));
+    let machine = |h: &Harness| h.world.lock().machines.get(&id).map(|m| m.state);
+    let node = h.daemon.iroh.as_ref().unwrap().node.clone();
+    let peer = Peer::new().await;
+    let now = h.now_s();
+    let conn = peer.dial(&h, "hermes").await;
+    assert_eq!(admit(&conn, &alice.admission(&peer.id(), "hermes", &node, now, now + 600)).await["admitted"], true);
+
+    let (status, _) = h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "warm"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    eventually("paused", || machine(&h) == Some(Machine::Paused)).await;
+    let started = std::time::Instant::now();
+    assert_eq!(get_over(&conn, "/after-warm").await.unwrap().0, StatusCode::OK);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "a warm wake over iroh: {:?}", started.elapsed());
+    assert_eq!(machine(&h), Some(Machine::Running));
+
+    // Idle with the connection open (QUIC's own keep-alives are the node's,
+    // not the guest's): warm, then woken by the next request on it.
+    h.world.lock().now += 31_000;
+    eventually("idle, then paused under an open connection", || machine(&h) == Some(Machine::Paused)).await;
+    assert_eq!(get_over(&conn, "/after-idle").await.unwrap().0, StatusCode::OK);
+    assert_eq!(machine(&h), Some(Machine::Running));
 }

@@ -216,6 +216,20 @@ pub struct ComputerView {
     pub rollback: Option<Rollback>,
     /// `https://<name>.<domain>/`
     pub url: String,
+    /// How to reach it by its key, on a node that serves computers over
+    /// iroh (fragment-next docs/runtime-seam.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh: Option<IrohAddr>,
+}
+
+/// A computer's iroh address: its endpoint id, and the relay its node's
+/// endpoint listens on (none: reached at its own addresses only).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IrohAddr {
+    /// The endpoint's public key, 64 hex.
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
