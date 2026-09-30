@@ -183,10 +183,11 @@ pub enum Note {
     /// Wake it for the activity at `active_at`.
     Wake { active_at: Millis },
     /// The node's machine is about to be replaced (a rebase, a lost or
-    /// crashed machine): the row forgets it first, so a create whose reply
-    /// is lost is never taken for the old machine (how to stop it, what
-    /// it runs).
-    Replace,
+    /// crashed machine): the row forgets it first and notes how the new
+    /// one stops (`stop`: its generation's init's, or none), so a create
+    /// whose reply is lost is never taken for the old machine, nor stopped
+    /// the way of a generation asked for since.
+    Replace { stop: Option<Vec<String>> },
     /// Another computer wants its room: a warm computer goes cold (and a
     /// computer no longer warm stays as it is). The node decides this
     /// across computers (`executor::Node::make_room`).

@@ -24,9 +24,6 @@ pub fn computer(c: &Computer) {
     if let Some(applied) = c.applied_seq {
         assert!(applied <= c.spec.seq, "no machine is made from a generation that does not exist yet");
     }
-    if c.machine_stop.is_some() {
-        assert!(c.applied_seq.is_some(), "a machine's stop is kept only while the node's machine exists");
-    }
     if c.failures == 0 {
         assert!(c.retry_at.is_none(), "no retry is scheduled without a failure");
     } else {
@@ -171,7 +168,8 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             }
             assert_eq!(c.desired, Desired::Running);
             assert_eq!(*seq, c.target().0.seq, "a machine is made from the target generation");
-            assert!(c.applied_seq.is_none() && c.machine_stop.is_none(), "the row forgets the machine it replaces first");
+            assert!(c.applied_seq.is_none(), "the row forgets the machine it replaces first");
+            assert_eq!(c.machine_stop, machine.init.as_ref().map(|b| b.stop.clone()), "and notes how the new one stops, before it is made");
             assert!(!matches!(k.machine, Machine::Running | Machine::Paused), "a running or paused machine is stopped before it is replaced");
             assert_eq!(c.tier, Tier::Awake, "a machine is made for a computer awake");
             assert!(c.snapshot_due.is_none(), "an owed snapshot is taken before the machine is replaced");

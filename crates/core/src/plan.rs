@@ -58,16 +58,11 @@ pub fn stop_failed(c: &Computer) -> bool {
     c.failure.as_ref().is_some_and(|f| f.step == Step::Stop)
 }
 
-/// How to stop the machine: as the row kept it when it was made; when
-/// the row never heard it was made (a crash after the create), as the
-/// target generation's, which a lost reply almost always made; else the
-/// node's script (a machine made without an init).
+/// How to stop the machine: as the row noted before the create that made
+/// it (`Note::Replace`), whether or not it heard the create's reply; none,
+/// the node's script, for a machine made without an init.
 fn machine_stop(c: &Computer) -> Option<Vec<String>> {
-    match (&c.machine_stop, c.applied_seq) {
-        (Some(stop), _) => Some(stop.clone()),
-        (None, None) => c.target().0.init.as_ref().map(|i| i.stop.clone()),
-        (None, Some(_)) => None,
-    }
+    c.machine_stop.clone()
 }
 
 pub fn launch_failed(c: &Computer) -> bool {
@@ -182,8 +177,9 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
     if let Some(n) = room(c, k, p) {
         return n;
     }
-    if c.applied_seq.is_some() || c.machine_stop.is_some() {
-        return Next::Note(Note::Replace);
+    let stop = target.init.as_ref().map(|i| i.stop.clone());
+    if c.applied_seq.is_some() || c.machine_stop != stop {
+        return Next::Note(Note::Replace { stop });
     }
     let machine = MachineSpec {
         image: target.image.clone(),

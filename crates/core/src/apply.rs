@@ -90,9 +90,9 @@ pub fn note(c: &Computer, note: &Note, p: &Policy, now: Millis) -> Change {
             n.status = Status::Starting;
             n.status_reason = None;
         }
-        Note::Replace => {
+        Note::Replace { stop } => {
             n.applied_seq = None;
-            n.machine_stop = None;
+            n.machine_stop = stop.clone();
             n.launched_at = None;
             if n.status == Status::Serving {
                 n.status = Status::Starting;

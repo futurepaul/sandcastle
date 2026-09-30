@@ -41,9 +41,10 @@ pub struct Setup {
     pub memory_mib: u32,
     #[arg(long, default_value_t = 10)]
     pub data_gib: u32,
-    /// What a paused machine holds, MiB: an idle Hermes measured 425 on
-    /// lat-6; the node's capacity report measures yours.
-    #[arg(long, default_value_t = 425)]
+    /// What a paused machine holds, MiB: a Hermes paused under s6 (its
+    /// gateway and dashboard up) measured 892 on lat-6, and msb returns
+    /// no freed guest memory; the node's capacity report measures yours.
+    #[arg(long, default_value_t = 900)]
     pub warm_resident_mib: u32,
     #[arg(long, default_value_t = 64)]
     pub machine_overhead_mib: u32,

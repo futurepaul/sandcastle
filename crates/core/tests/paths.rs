@@ -112,7 +112,7 @@ impl Run {
         }
         // Bookkeeping before a create, recorded in passing (pinned by
         // `a_lost_create_is_never_taken_for_the_machine_it_replaced`).
-        if n == Next::Note(Note::Replace) {
+        if matches!(n, Next::Note(Note::Replace { .. })) {
             self.noted();
             return self.next();
         }
@@ -217,10 +217,15 @@ fn a_lost_create_is_never_taken_for_the_machine_it_replaced() {
     r.k.disk = Some(disk(0, &[]));
     r.k.disk_ready = true;
     r.k.room = Some(true);
-    assert_eq!(plan(&r.c, &r.k, &r.p, r.now), Next::Note(Note::Replace), "forgotten before it is replaced");
-    r.c = note(&r.c, &Note::Replace, &r.p, r.now).row.unwrap();
+    assert_eq!(plan(&r.c, &r.k, &r.p, r.now), Next::Note(Note::Replace { stop: None }), "forgotten before it is replaced");
+    r.c = note(&r.c, &Note::Replace { stop: None }, &r.p, r.now).row.unwrap();
     assert_eq!((r.c.applied_seq, r.c.machine_stop.clone()), (None, None));
-    // The create happens; its reply is lost; the new machine runs.
+    // The create happens; its reply is lost; the owner asks for a
+    // generation with an init meanwhile (simulation seed 483). The machine
+    // that runs is stopped the way it was made: by the node's script.
+    r.c.spec = generation(3, "img:3");
+    r.c.spec.init = Some(sandcastle_proto::Init { argv: vec!["/init".into()], stop: vec!["/halt".into()] });
+    r.c.spec.argv = vec![];
     r.restart(Machine::Running);
     r.expect_do(|e| matches!(e, Effect::Quiesce { stop: None }));
 }

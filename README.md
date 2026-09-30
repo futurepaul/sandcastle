@@ -237,9 +237,10 @@ some), and prints what that holds for a computer size (running at once,
 paused, and in all, and what bounds it) and the quota and unit settings
 that make ZFS and the kernel hold it. It changes nothing. On
 finite-lat-6 (124 GiB, a 1.7 TB pool), for 4 GiB / 10 GiB Hermes
-computers: 27 running at once, about 234 paused, 71 in all with 4 GiB
-layers (bound by the engine's disk; 120 with 1 GiB layers, bound by
-disk).
+computers: 27 running at once, about 118 paused (a paused Hermes under
+s6 holds about 900 MiB: measured, `--warm-resident-mib`), 71 in all with
+4 GiB layers (bound by the engine's disk; 120 with 1 GiB layers, bound
+by disk).
 
 ## Sleep
 
