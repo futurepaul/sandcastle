@@ -16,6 +16,41 @@ pub enum Command {
     /// in the bucket, and its state. For a test node; asks for the node's
     /// name again.
     Reset(Box<Reset>),
+    /// Choose the node's reserve: reads the host, asks how much of it
+    /// computers may have, and prints what that holds and how to apply it.
+    Setup(Box<Setup>),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct Setup {
+    /// The ZFS dataset computers' disks go under.
+    #[arg(long)]
+    pub zfs_parent: String,
+    /// The engine's home (its images and machines' writable layers).
+    #[arg(long)]
+    pub msb_home: std::path::PathBuf,
+    /// A reserve to use rather than ask for, GiB.
+    #[arg(long)]
+    pub reserve_memory_gib: Option<u32>,
+    #[arg(long)]
+    pub reserve_disk_gib: Option<u32>,
+    #[arg(long)]
+    pub reserve_engine_disk_gib: Option<u32>,
+    /// The computer size to plan for.
+    #[arg(long, default_value_t = 4096)]
+    pub memory_mib: u32,
+    #[arg(long, default_value_t = 10)]
+    pub data_gib: u32,
+    /// What a paused machine holds, MiB: an idle Hermes measured 425 on
+    /// lat-6; the node's capacity report measures yours.
+    #[arg(long, default_value_t = 425)]
+    pub warm_resident_mib: u32,
+    #[arg(long, default_value_t = 64)]
+    pub machine_overhead_mib: u32,
+    #[arg(long, default_value_t = 25)]
+    pub snapshot_headroom_pct: u32,
+    #[arg(long, default_value_t = 4)]
+    pub layer_gib: u32,
 }
 
 #[derive(clap::Args, Debug, Clone)]

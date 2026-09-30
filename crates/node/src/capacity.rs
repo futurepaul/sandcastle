@@ -76,6 +76,39 @@ impl Measures {
     }
 }
 
+/// What a reserve holds for one computer size, before any runs: for an
+/// operator choosing the reserve (`sandcastled setup`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Plan {
+    /// Machines that may run at once, at their whole allocation.
+    pub hot: u64,
+    /// Paused machines the memory holds when none runs, each at what it
+    /// held when it paused (`warm_resident`, measured).
+    pub warm: u64,
+    /// Computers the disk and the engine's disk hold, and which bound it.
+    pub computers: u64,
+    pub bound: Bound,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bound {
+    Disk,
+    EngineDisk,
+    Count,
+}
+
+/// A reserve's plan for computers of `size` (`Fixed`), whose paused
+/// machines hold `warm_resident` bytes each (measured).
+pub fn plan(reserve: &budget::Reserve, costs: &budget::Costs, size: &Fixed, warm_resident: u64) -> Plan {
+    let hot = reserve.memory / budget::machine_memory(size, costs);
+    let warm = reserve.memory / (warm_resident + costs.machine_overhead).max(1);
+    let by_disk = reserve.disk.checked_div(budget::disk(size, costs)).unwrap_or(u64::MAX);
+    let by_layers = reserve.engine_disk / costs.layer.max(1);
+    let by_count = u64::from(COMPUTERS_PER_NODE_MAX);
+    let (computers, bound) = [(by_disk, Bound::Disk), (by_layers, Bound::EngineDisk), (by_count, Bound::Count)].into_iter().min_by_key(|(n, _)| *n).expect("three bounds");
+    Plan { hot, warm, computers, bound }
+}
+
 /// Everything the report is computed from.
 pub struct Inputs<'a> {
     pub policy: &'a Policy,
@@ -266,6 +299,22 @@ mod tests {
         }
         let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Err("df failed".into()), samples: &samples, measures: &Measures::default(), size: (4096, 10) });
         assert!(r.warnings.iter().any(|w| w.contains("df failed")));
+    }
+
+    /// Goal: a plan says what bounds it: lat-6's reserve with msb's default
+    /// 4 GiB layers is bound by the engine's disk, and with 1 GiB layers
+    /// by its disks.
+    #[test]
+    fn a_plan_names_its_bound() {
+        let reserve = Reserve { memory: 112 * GIB, disk: 1500 * GIB, engine_disk: 300 * GIB };
+        let hermes = Fixed { vcpus: 2, memory_mib: 4096, storage: Storage::Data, data_gib: 10, data_path: "/opt/data".into() };
+        let mut costs = Costs { machine_overhead: 64 * MIB, snapshot_headroom_pct: 25, layer: 4 * GIB };
+        let p = plan(&reserve, &costs, &hermes, 425 * MIB);
+        assert_eq!((p.hot, p.computers, p.bound), (27, 75, Bound::EngineDisk));
+        assert_eq!(p.warm, 112 * GIB / (489 * MIB), "at an idle Hermes' 425 MiB and the overhead");
+        costs.layer = GIB;
+        let p = plan(&reserve, &costs, &hermes, 425 * MIB);
+        assert_eq!((p.computers, p.bound), (120, Bound::Disk));
     }
 
     #[test]

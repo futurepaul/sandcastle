@@ -21,6 +21,7 @@ fn main() -> ExitCode {
     let result = match command {
         Command::Serve(s) => runtime.block_on(serve(*s)),
         Command::Reset(r) => runtime.block_on(sandcastled::reset::run(&r)),
+        Command::Setup(s) => runtime.block_on(sandcastled::setup::run(&s)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

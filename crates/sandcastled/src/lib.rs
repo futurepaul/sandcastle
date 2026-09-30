@@ -11,6 +11,7 @@ pub mod http;
 pub mod proxy;
 pub mod reset;
 pub mod router;
+pub mod setup;
 
 #[cfg(test)]
 mod tests;
