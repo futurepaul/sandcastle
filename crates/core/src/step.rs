@@ -59,8 +59,8 @@ pub struct Boot {
     pub argv: Vec<String>,
     /// The command that shuts the guest down, which the row keeps.
     pub stop: Vec<String>,
-    /// The service's own settings and each credential's placeholder:
-    /// never a credential's value.
+    /// The service's own settings, and nothing named for a credential
+    /// (whose value is in the engine's environment under its name).
     pub env: BTreeMap<String, String>,
 }
 

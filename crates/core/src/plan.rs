@@ -167,7 +167,11 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         guest_port: target.port,
         disk_mount: c.has_disk().then(|| c.fixed.data_path.clone()),
         layer_gib: u32::try_from(p.costs.layer.div_ceil(crate::budget::GIB)).expect("a layer is at most 1024 GiB (checked by the config)"),
-        init: target.init.as_ref().map(|i| Boot { argv: i.argv.clone(), stop: i.stop.clone(), env: boot_env(target, &credentials) }),
+        // The service's own settings only: the engine names each
+        // credential's placeholder in the guest itself, and a boot variable
+        // named for a credential would carry the credential's value, which
+        // is in the engine's environment under that name.
+        init: target.init.as_ref().map(|i| Boot { argv: i.argv.clone(), stop: i.stop.clone(), env: target.env.clone() }),
     };
     Next::Do(Effect::Create { seq: target.seq, machine: Box::new(machine), credentials })
 }
@@ -192,17 +196,6 @@ fn start(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         return n;
     }
     Next::Do(Effect::Start { credentials })
-}
-
-/// What an image's init boots with: the service's own settings, and each
-/// credential's placeholder under its name.
-fn boot_env(target: &Generation, credentials: &[Credential]) -> BTreeMap<String, String> {
-    let mut env = target.env.clone();
-    for c in credentials {
-        let shadowed = env.insert(c.name.clone(), credentials::placeholder(c));
-        assert!(shadowed.is_none(), "a credential never shadows a service variable (checked when fetched)");
-    }
-    env
 }
 
 /// What a computer's status says while the node's memory reserve has no

@@ -130,6 +130,12 @@ pub fn report(i: &Inputs<'_>) -> NodeReport {
     let committed_layers = i.rows.len() as u64 * costs.layer;
     let resident: u64 = i.samples.values().map(|s| s.resident).sum();
     let layers: u64 = i.samples.values().map(|s| s.layer).sum();
+    // Machines measured running that no row names: a node whose state was
+    // lost or reset left them, holding memory the ledger cannot see.
+    let orphans: Vec<String> = i.samples.keys().filter(|id| !i.rows.iter().any(|c| c.id == **id)).map(|id| id.hex()).collect();
+    if !orphans.is_empty() {
+        warnings.push(format!("{} machine(s) run with no computer: {} (sandcastled reset removes a test node's)", orphans.len(), orphans.join(", ")));
+    }
     if i.ledger.over() {
         warnings.push(format!("machines found running hold {} MiB, past the memory reserve of {} MiB", i.ledger.committed() / MIB, reserve.memory / MIB));
     }
@@ -251,6 +257,26 @@ mod tests {
         }
     }
 
+    /// One computer of 4 GiB and 10 GiB, made through the commands.
+    fn one_computer(p: &Policy) -> Computer {
+        let store = crate::store::Store::in_memory().unwrap();
+        let (grantor, owner) = ("ff".repeat(32), "aa".repeat(32));
+        let grant = sandcastle_proto::GrantSpec { computers_max: 1, vcpus_max: 2, memory_mib_max: 4096, data_gib_max: 10 };
+        crate::commands::put_grant(&store, std::slice::from_ref(&grantor), &grantor, &owner, grant, 1).unwrap();
+        let spec = sandcastle_proto::ComputerSpec {
+            image: "img:1".into(),
+            vcpus: 2,
+            memory_mib: 4096,
+            storage: Storage::Data,
+            data_gib: 10,
+            data_path: "/data".into(),
+            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 80, health_path: "/".into(), env: Default::default() },
+            url_auth: sandcastle_proto::UrlAuth::Owner,
+            credentials_url: None,
+        };
+        crate::commands::put_computer(&store, &owner, "one", &spec, None, ComputerId::from_bytes([1; 8]), 20_000..20_001, p, 1).unwrap().0
+    }
+
     fn healthy() -> HostFacts {
         HostFacts {
             memory: HostMemory { total: 128 * GIB, available: 120 * GIB },
@@ -265,19 +291,21 @@ mod tests {
     #[test]
     fn a_healthy_node_reports_what_fits() {
         let p = policy();
+        let row = one_computer(&p);
         let mut ledger = Ledger::new(p.reserve.memory);
-        ledger.admit(ComputerId::from_bytes([1; 8]), 4 * GIB + 64 * MIB).unwrap();
+        ledger.admit(row.id, 4 * GIB + 64 * MIB).unwrap();
         let mut samples = std::collections::HashMap::new();
-        samples.insert(ComputerId::from_bytes([1; 8]), Sample { resident: 425 * MIB, limit: 4 * GIB, layer: 3 * MIB, ..Sample::default() });
+        samples.insert(row.id, Sample { resident: 425 * MIB, limit: 4 * GIB, layer: 3 * MIB, ..Sample::default() });
         let mut measures = Measures::default();
         for t in 0..10 {
             measures.record(t * 10_000, &samples);
         }
-        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(healthy()), samples: &samples, measures: &measures, size: (4096, 10) });
+        let rows = [row];
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &rows, host: Ok(healthy()), samples: &samples, measures: &measures, size: (4096, 10) });
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(r.memory.committed_mib, 4096 + 64);
         assert_eq!(r.fits.more_running, 2, "(16 GiB − 4.06) / 4.06");
-        assert_eq!(r.fits.more_computers, 8, "100 GiB / 12.5 GiB, and 40 GiB of layers / 4");
+        assert_eq!(r.fits.more_computers, 7, "(100 GiB − its 12.5) / 12.5 = 7, before (40 GiB − its 4) of layers / 4 = 9");
         assert_eq!((r.measured.len(), r.measured[0].resident_mib_p95, r.measured[0].samples), (1, 425, 10));
     }
 
@@ -299,6 +327,9 @@ mod tests {
         }
         let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Err("df failed".into()), samples: &samples, measures: &Measures::default(), size: (4096, 10) });
         assert!(r.warnings.iter().any(|w| w.contains("df failed")));
+        let orphan = std::collections::HashMap::from([(ComputerId::from_bytes([9; 8]), Sample { resident: MIB, ..Sample::default() })]);
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(healthy()), samples: &orphan, measures: &Measures::default(), size: (4096, 10) });
+        assert!(r.warnings.iter().any(|w| w.contains("with no computer") && w.contains(&ComputerId::from_bytes([9; 8]).hex())), "{:?}", r.warnings);
     }
 
     /// Goal: a plan says what bounds it: lat-6's reserve with msb's default

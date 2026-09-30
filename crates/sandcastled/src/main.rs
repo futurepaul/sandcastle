@@ -39,6 +39,9 @@ async fn serve(config: Serve) -> Result<(), String> {
     let store = Store::open(&config.state_dir.join(sandcastled::reset::STATE_FILE)).map_err(|e| format!("opening the state: {e}"))?;
     let engine = Msb::new(config.engine.msb.clone(), config.engine.msb_home.clone(), config.guest_deny.clone());
     engine.check_version().await.map_err(|f| f.detail)?;
+    for path in engine.remove_stray_secret_configs().map_err(|e| format!("--msb-home: {e}"))? {
+        eprintln!("sandcastled: removed {}, left by a create that did not finish", path.display());
+    }
     let disks = Zfs::new(config.engine.zfs_parent.clone(), config.engine.msb_home.clone());
     // The parent must exist and be ours to use; a listing proves both.
     disks.check_parent().await.map_err(|f| format!("--zfs-parent {}: {}", config.engine.zfs_parent, f.detail))?;

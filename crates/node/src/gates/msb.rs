@@ -335,6 +335,23 @@ impl Msb {
     pub fn home(&self) -> &std::path::Path {
         &self.home
     }
+
+    /// Removes secret config files a create left behind: one lives only
+    /// for its create's call, so at a start none is in use, and an abort
+    /// (an assertion) skips the removal. They hold no value; the names
+    /// and hosts still go. The paths removed.
+    pub fn remove_stray_secret_configs(&self) -> std::io::Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        for entry in std::fs::read_dir(&self.home)? {
+            let path = entry?.path();
+            let stray = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".sandcastle-sc-") && n.ends_with("-secrets.json"));
+            if stray {
+                std::fs::remove_file(&path)?;
+                removed.push(path);
+            }
+        }
+        Ok(removed)
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -27,6 +27,10 @@ pub async fn run(r: &Reset) -> Result<(), String> {
     }
     let mut failed = Vec::new();
     let msb = Msb::new(r.engine.msb.clone(), r.engine.msb_home.clone(), vec![]);
+    match msb.remove_stray_secret_configs() {
+        Ok(paths) => paths.iter().for_each(|p| eprintln!("reset: removed {}", p.display())),
+        Err(e) => failed.push(format!("secret configs: {e}")),
+    }
     match msb.list().await {
         Ok(machines) => {
             for id in machines.keys() {

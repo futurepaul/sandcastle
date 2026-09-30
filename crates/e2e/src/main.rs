@@ -380,11 +380,18 @@ async fn crash(r: &mut Run) -> Step {
     const S: &str = "crash";
     let web = r.web.clone().ok_or("the life section made no computer")?;
     let old = r.host.machine(&web.id).await?.ok_or("no machine to rebase")?;
-    let (status, _) = r.put(&web.name, &web_spec("4", WEB_IMAGE), "").await?;
-    r.ensure(S, "a rebase is accepted", status == 200, format!("{status}"))?;
     // Mid-rebase: the old machine has stopped (its service quiesced, its
-    // disk to be snapshotted), and no new one runs yet.
-    let seen = r.host.kill_when(&web.id, "rebase", &old.created_at).await?;
+    // disk to be snapshotted), and no new one runs yet. The watcher starts
+    // before the call, which a rebase can outrun.
+    let watch = r.host.kill_when(&web.id, "rebase", &old.created_at);
+    let put = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        r.client.call(&r.alice, "PUT", &format!("/v1/computers/{}", web.name), Some(&web_spec("4", WEB_IMAGE))).await
+    };
+    let (seen, put) = tokio::join!(watch, put);
+    let status = put?.status;
+    r.ensure(S, "a rebase is accepted", status == 200, format!("{status}"))?;
+    let seen = seen?;
     r.ensure(S, "the daemon is SIGKILLed mid-rebase", seen.is_some(), format!("the host then: {}", seen.as_deref().unwrap_or("never seen")))?;
     let took = r.back_up().await?;
     r.record(S, "systemd restarts it", true, secs(took));
@@ -545,7 +552,13 @@ async fn hermes(r: &mut Run) -> Step {
     let a = r.client.call(&r.grantor, "PUT", &format!("/v1/grants/{owner}"), Some(&grant)).await?;
     r.ensure(S, "the grantor grants fragment.club's e2e person", a.status == 200, format!("{}", a.status))?;
     let path = r.args.keys_dir.join("hermes-credentials.json");
-    let spec: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| e.to_string())?;
+    let mut spec: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| e.to_string())?;
+    // Hermes as its image means to run: s6 as PID 1, supervising its
+    // dashboard and its gateway (whose ticker runs cron).
+    spec["service"]["argv"] = json!([]);
+    spec["service"]["init"] = json!({"argv": ["/init", "/opt/hermes/docker/main-wrapper.sh", "gateway", "run"], "stop": ["/run/s6/basedir/bin/halt"]});
+    spec["service"]["env"]["HERMES_DASHBOARD"] = json!("1");
+    spec["service"]["env"]["HERMES_DASHBOARD_PORT"] = json!("9119");
     // Its real TLS name, as a person's browser would use.
     let name = "hermes".to_string();
     let (status, v) = r.put_as(Owner::Hermes, &name, &spec, "").await?;
@@ -567,14 +580,32 @@ async fn hermes(r: &mut Run) -> Step {
     let a = r.client.send(&host, "GET", "/", &[("cookie", &cookie)], vec![]).await?;
     r.ensure(S, "with the session, Hermes answers behind it", a.status != 401 || !a.text().contains("This computer is private"), format!("{}", a.status))?;
 
-    let in_env = r.host.exec(&id, "grep -c fsc1_ /run/sandcastle/service.env || true").await?;
+    let pid1 = r.host.exec(&id, "cat /proc/1/comm").await?;
+    let status = r.host.exec(&id, r#"python3 -c "import urllib.request as u; print(u.urlopen(\"http://127.0.0.1:9119/api/status\").read().decode())""#).await?;
+    let running = serde_json::from_str::<Value>(status.trim()).map(|v| v["gateway_running"] == true).unwrap_or(false);
+    r.ensure(S, "its image's init is PID 1 and its gateway runs", pid1.trim() == "s6-svscan" && running, format!("PID 1 {}, gateway_running {running}", pid1.trim()))?;
     let in_procs = r.host.exec(&id, "cat /proc/[0-9]*/environ 2>/dev/null | tr \"\\000\" \"\\n\" | grep -c \"fsc1_[0-9a-f]\" || true").await?;
-    r.ensure(S, "no token in the service's env or any process's", in_env.trim() == "0" && in_procs.trim() == "0", format!("service.env {}, environs {}", in_env.trim(), in_procs.trim()))?;
+    r.ensure(S, "no token in any process's environment", in_procs.trim() == "0", format!("environs {}", in_procs.trim()))?;
+
+    // cron, on the gateway's own ticker: a script-only job (no model)
+    let proof = format!("e2e-{}", r.tag);
+    r.host
+        .exec(&id, &format!("mkdir -p /opt/data/scripts && printf \"#!/bin/sh\\necho {proof} >> /opt/data/cron-proof\\n\" > /opt/data/scripts/e2e-proof.sh && chmod 755 /opt/data/scripts/e2e-proof.sh && chown -R hermes:hermes /opt/data/scripts"))
+        .await?;
+    r.host.exec(&id, "cd /opt/data && /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes cron create 1m --name e2e-proof --script e2e-proof.sh --no-agent --deliver local >/dev/null").await?;
+    let start = Instant::now();
+    let mut fired = false;
+    while start.elapsed() < Duration::from_secs(200) && !fired {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        fired = r.host.exec(&id, "cat /opt/data/cron-proof 2>/dev/null || true").await?.contains(&proof);
+    }
+    r.ensure(S, "a cron job fires on its gateway's ticker", fired, secs(start.elapsed()))?;
     // The service's own environment (the placeholder in OPENAI_API_KEY),
     // and a call to its model route: msb puts the computer's token in on
     // the way out. It prints the status, the model, and the answer only.
+    // Its env is the init's (and every exec's): the placeholder in
+    // OPENAI_API_KEY; msb puts the computer's token in on the way out.
     let call = concat!(
-        "set -a; . /run/sandcastle/service.env; set +a; ",
         "python3 -c \"import os,json,urllib.request as u; ",
         "r=u.Request(os.environ[\\\"OPENAI_BASE_URL\\\"].rstrip(\\\"/\\\")+\\\"/chat/completions\\\", ",
         "data=json.dumps({\\\"model\\\": os.environ[\\\"HERMES_INFERENCE_MODEL\\\"], \\\"max_tokens\\\": 400, ",
