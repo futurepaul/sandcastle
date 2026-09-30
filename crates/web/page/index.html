@@ -71,11 +71,17 @@
       t = now();
       const signedIn = await c.fetch("POST", "/auth/password-login", JSON.stringify({ "content-type": "application/json" }), new TextEncoder().encode(login));
       results.login_ms = now() - t;
+      // A cookie's value may itself hold "=": split at the first only.
       const cookies = JSON.parse(signedIn.headers)["set-cookie"] ?? "";
-      const token = cookies.split("\n").map((c) => c.split(";")[0].split("=")).find(([k]) => k.endsWith("hermes_session_at"))?.[1];
-      if (!token) throw new Error(`no session from Hermes' login (${signedIn.status})`);
+      const token = cookies
+        .split("\n")
+        .map((c) => c.split(";")[0])
+        .map((c) => [c.slice(0, c.indexOf("=")), c.slice(c.indexOf("=") + 1)])
+        .find(([k]) => k.endsWith("hermes_session_at"))?.[1];
+      if (signedIn.status !== 200 || !token) throw new Error(`no session from Hermes' login (${signedIn.status})`);
       const bearer = JSON.stringify({ authorization: `Bearer ${token}` });
       const minted = await c.fetch("POST", "/api/auth/ws-ticket", bearer, new Uint8Array());
+      if (minted.status !== 200) throw new Error(`the socket ticket answered ${minted.status}`);
       const ticket = JSON.parse(new TextDecoder().decode(minted.body)).ticket;
       t = now();
       const s = await c.websocket("/api/ws", ["hermes-gateway-v1", `hermes-gateway-ticket.${ticket}`]);
