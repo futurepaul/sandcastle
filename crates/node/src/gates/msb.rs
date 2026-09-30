@@ -117,7 +117,7 @@ impl Msb {
                 (c.name.as_str(), c.value.as_str())
             })
             .collect();
-        let stdout_max = if what == "msb ls" { LIST_BYTES_MAX } else { SMALL_BYTES_MAX };
+        let stdout_max = if what == "msb ls" || what == "msb metrics" { LIST_BYTES_MAX } else { SMALL_BYTES_MAX };
         process::run(Call { what, program: &self.program, args, home: &self.home, env: &env, stdin, deadline, stdout_max }).await
     }
 
@@ -249,6 +249,51 @@ fn secret_conf(credentials: &[Credential]) -> String {
         })
         .collect();
     serde_json::Value::Object(map).to_string()
+}
+
+/// The node's machines in `msb metrics --format json`.
+fn parse_metrics(text: &str) -> Option<HashMap<ComputerId, super::Sample>> {
+    #[derive(serde::Deserialize)]
+    struct Metric {
+        name: String,
+        memory_host_resident_bytes: u64,
+        memory_bytes: u64,
+        memory_limit_bytes: u64,
+        vcpu_time_ns: u64,
+        net_rx_bytes: u64,
+        net_tx_bytes: u64,
+        upper_host_allocated_bytes: u64,
+    }
+    let listed: Vec<Metric> = serde_json::from_str(text).ok()?;
+    let mut samples = HashMap::new();
+    for m in listed {
+        let Some(id) = ComputerId::of_machine(&m.name) else { continue };
+        let sample = super::Sample {
+            resident: m.memory_host_resident_bytes,
+            used: m.memory_bytes,
+            limit: m.memory_limit_bytes,
+            cpu_ns: m.vcpu_time_ns,
+            net_rx: m.net_rx_bytes,
+            net_tx: m.net_tx_bytes,
+            layer: m.upper_host_allocated_bytes,
+        };
+        if samples.insert(id, sample).is_some() {
+            return None;
+        }
+    }
+    Some(samples)
+}
+
+impl Msb {
+    /// Every running machine the node made, measured (`msb metrics`).
+    pub async fn metrics(&self) -> GateResult<HashMap<ComputerId, super::Sample>> {
+        let out = self.run_ok("msb metrics", &["metrics".into(), "--format".into(), "json".into()], &[], &[], LIST_DEADLINE).await?;
+        parse_metrics(out.stdout_text("msb metrics")?).ok_or_else(|| fault(GateError::BadOutput, "msb metrics: not the measurements this node reads"))
+    }
+
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -401,6 +446,20 @@ mod tests {
     fn an_env_name_that_is_not_a_variable_is_a_bug() {
         let env: BTreeMap<String, String> = [("A;reboot".to_string(), "x".to_string())].into();
         let _ = env_file(&env);
+    }
+
+    #[test]
+    fn measurements_are_read_whole() {
+        let text = r#"[{"cpu_percent":0.5,"cpus":2,"disk_read_bytes":1,"disk_write_bytes":2,"memory_available_bytes":3826774016,"memory_bytes":468193280,
+            "memory_host_resident_bytes":445853696,"memory_limit_bytes":4294967296,"name":"sc-abababababababab","net_rx_bytes":444455,"net_tx_bytes":740701,
+            "state":"running","timestamp":"2026-09-30T00:09:31.879+00:00","upper_free_bytes":4135161856,"upper_host_allocated_bytes":2551808,
+            "upper_used_bytes":94208,"uptime_secs":2294.0,"vcpu_time_ns":11674193192},
+            {"name":"probe","memory_host_resident_bytes":1,"memory_bytes":1,"memory_limit_bytes":1,"vcpu_time_ns":1,"net_rx_bytes":1,"net_tx_bytes":1,"upper_host_allocated_bytes":1}]"#;
+        let m = parse_metrics(text).unwrap();
+        let s = m[&ComputerId::from_bytes([0xab; 8])];
+        assert_eq!((s.resident, s.limit, s.layer, s.net_tx), (445_853_696, 4_294_967_296, 2_551_808, 740_701));
+        assert_eq!(m.len(), 1, "others' machines are not the node's");
+        assert!(parse_metrics(r#"[{"name":"sc-abababababababab"}]"#).is_none(), "a measurement missing its fields");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use sandcastle_core::step::{Effect, GateError, Next, Note, Observe, Outcome};
 use sandcastle_core::{apply, goes_on, learn, note, plan};
 use sandcastle_proto::{Credentials, CredentialsAsk};
 
-use crate::gates::{fault, Disks, Engine, GateResult, ObjectBody, Objects, Prober, Random, ReceiveSink, SendStream, Source, World, Clock};
+use crate::gates::{fault, Clock, Disks, Engine, GateResult, Meter, ObjectBody, Objects, Prober, Random, ReceiveSink, SendStream, Source, World};
 use crate::manifest;
 use crate::seal::{BackupKey, Opener, Sealer, CHUNK_BYTES};
 use crate::store::{Store, StoreError};
@@ -41,6 +41,8 @@ pub struct Node<W: World> {
     pub policy: Policy,
     /// The memory committed to machines, inside `policy.reserve.memory`.
     pub ledger: std::sync::Mutex<Ledger>,
+    /// What the machines measured over the last hour.
+    pub measures: std::sync::Mutex<crate::capacity::Measures>,
     /// The key backups are sealed with: present exactly when the node ships.
     pub backup_key: Option<BackupKey>,
     /// Upload part size (S3's floor is 5 MiB, but for the last part).
@@ -62,7 +64,7 @@ impl<W: World> Node<W> {
         assert!(part_bytes >= CHUNK_BYTES, "a part holds at least one sealed chunk");
         policy.costs.check();
         let ledger = std::sync::Mutex::new(Ledger::new(policy.reserve.memory));
-        Node { store, world, policy, ledger, backup_key, part_bytes }
+        Node { store, world, policy, ledger, measures: std::sync::Mutex::new(crate::capacity::Measures::default()), backup_key, part_bytes }
     }
 
     /// One pass over every computer. The engine's list is taken once; a
@@ -140,6 +142,24 @@ impl<W: World> Node<W> {
             eprintln!("executor: machines found running hold {} MiB, past the memory reserve of {} MiB", ledger.committed() >> 20, ledger.reserve() >> 20);
         }
         Ok(())
+    }
+
+    /// Measures every running machine, for the capacity report.
+    pub async fn sample(&self) {
+        match self.world.meter().samples().await {
+            Ok(samples) => self.measures.lock().expect("never poisoned: panics abort").record(self.world.clock().now(), &samples),
+            Err(f) => eprintln!("executor: measuring the machines: {:?}: {}", f.error, f.detail),
+        }
+    }
+
+    /// The capacity report for a computer size (`memory_mib`, `data_gib`).
+    pub async fn capacity(&self, size: (u32, u32)) -> Result<sandcastle_proto::NodeReport, StoreError> {
+        let rows: Vec<Computer> = self.store.ids()?.into_iter().filter_map(|id| self.store.load(id).transpose()).collect::<Result<_, _>>()?;
+        let host = self.world.meter().host().await.map_err(|f| format!("{:?}: {}", f.error, f.detail));
+        let ledger = self.ledger.lock().expect("never poisoned: panics abort").clone();
+        let measures = self.measures.lock().expect("never poisoned: panics abort");
+        let latest = measures.latest.clone();
+        Ok(crate::capacity::report(&crate::capacity::Inputs { policy: &self.policy, ledger: &ledger, rows: &rows, host, samples: &latest, measures: &measures, size }))
     }
 
     /// The row, and what the core says to do next; `None` when it is gone.

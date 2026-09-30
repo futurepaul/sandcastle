@@ -634,6 +634,30 @@ impl gates::Random for World {
     }
 }
 
+/// A simulated machine's measurements: a quarter of its 1 GiB resident, a
+/// few MiB of writable layer; the host has room to spare.
+impl gates::Meter for World {
+    async fn samples(&self) -> GateResult<HashMap<ComputerId, gates::Sample>> {
+        let s = self.lock();
+        Ok(s.machines
+            .iter()
+            .filter(|(_, m)| m.state == Machine::Running)
+            .map(|(id, _)| (*id, gates::Sample { resident: 256 << 20, used: 300 << 20, limit: 1 << 30, cpu_ns: 0, net_rx: 0, net_tx: 0, layer: 4 << 20 }))
+            .collect())
+    }
+
+    async fn host(&self) -> GateResult<gates::HostFacts> {
+        let s = self.lock();
+        let running = s.machines.values().filter(|m| m.state == Machine::Running).count() as u64;
+        Ok(gates::HostFacts {
+            memory: gates::host::HostMemory { total: 128 << 30, available: (120 << 30) - running * (256 << 20) },
+            cgroup: Some(gates::host::CgroupMemory { cap: Some(100 << 30), current: running * (256 << 20) }),
+            pool: gates::PoolSpace { used: s.disks.len() as u64 * (5 << 30), available: 1 << 40, quota: Some(2 << 40), snapshots: 1 << 30 },
+            engine_disk: gates::host::Space { size: 1 << 40, available: 900 << 30 },
+        })
+    }
+}
+
 impl gates::World for World {
     type Engine = World;
     type Disks = World;
@@ -642,6 +666,7 @@ impl gates::World for World {
     type Prober = World;
     type Clock = World;
     type Random = World;
+    type Meter = World;
 
     fn engine(&self) -> &World {
         self
@@ -662,6 +687,9 @@ impl gates::World for World {
         self
     }
     fn random(&self) -> &World {
+        self
+    }
+    fn meter(&self) -> &World {
         self
     }
 }

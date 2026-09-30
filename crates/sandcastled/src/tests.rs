@@ -482,3 +482,24 @@ async fn a_credential_source_must_be_listed() {
     s.credentials_url = Some(format!("{PLATFORM}/api/sandcastle/credentials"));
     assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&s)).await.0, StatusCode::CREATED);
 }
+
+/// Goal: a node's capacity is its grantors' to read: the reserve, what is
+/// committed and measured, and what more fits for a size.
+#[tokio::test]
+async fn the_capacity_report_is_the_grantors() {
+    let h = Harness::start("capacity").await;
+    let alice = Keys::generate();
+    h.grant(&alice).await;
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    h.daemon.node.sample().await;
+    let (status, r) = h.call(&h.grantor, "GET", "/v1/node?memory_mib=2048&data_gib=5", None).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["reserve"]["memory_mib"], 16 * 1024);
+    assert_eq!(r["memory"]["committed_mib"], 2048 + 64, "the running machine's allocation and overhead");
+    assert_eq!(r["fits"]["more_running"], (16 * 1024 - (2048 + 64)) / (2048 + 64));
+    assert_eq!(r["computers"]["total"], 1);
+    assert_eq!(r["measured"].as_array().map(Vec::len), Some(1), "{r}");
+    assert_eq!(h.call(&alice, "GET", "/v1/node", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(h.call(&h.grantor, "GET", "/v1/node?memory_mib=1", None).await.0, StatusCode::BAD_REQUEST);
+}

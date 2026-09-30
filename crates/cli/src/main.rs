@@ -73,6 +73,14 @@ enum Command {
     Snapshots { name: String },
     /// Your backups on this node's bucket, deleted computers' included.
     Backups,
+    /// The node's capacity: its reserve, what is committed and measured,
+    /// what more fits of a size, and warnings (grantors only).
+    Node {
+        #[arg(long, default_value_t = 4096)]
+        memory_mib: u32,
+        #[arg(long, default_value_t = 10)]
+        data_gib: u32,
+    },
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -212,5 +220,6 @@ async fn main() {
         Command::Ticket { name } => call(&cli, "POST", &format!("/v1/computers/{name}/tickets"), None).await,
         Command::Snapshots { name } => call(&cli, "GET", &format!("/v1/computers/{name}/snapshots"), None).await,
         Command::Backups => call(&cli, "GET", "/v1/backups", None).await,
+        Command::Node { memory_mib, data_gib } => call(&cli, "GET", &format!("/v1/node?memory_mib={memory_mib}&data_gib={data_gib}"), None).await,
     }
 }

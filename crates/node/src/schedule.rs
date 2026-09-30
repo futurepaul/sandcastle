@@ -23,13 +23,21 @@ pub const BATCHES_AT_ONCE_MAX: usize = 32;
 /// within about this long.
 pub const TICK: Duration = Duration::from_secs(2);
 
+/// Every machine is measured once in this many ticks (10 s).
+pub const SAMPLE_EVERY_TICKS: u32 = 5;
+
 pub async fn run<W: World>(node: Arc<Node<W>>) {
     let busy: Arc<Mutex<HashSet<ComputerId>>> = Arc::new(Mutex::new(HashSet::new()));
     let slots = Arc::new(tokio::sync::Semaphore::new(BATCHES_AT_ONCE_MAX));
+    let mut ticks: u32 = 0;
     // Intentionally unbounded: the node's control loop, ended by the
     // process.
     loop {
         tick(&node, &busy, &slots).await;
+        if ticks.is_multiple_of(SAMPLE_EVERY_TICKS) {
+            node.sample().await;
+        }
+        ticks = ticks.wrapping_add(1);
         tokio::time::sleep(TICK).await;
     }
 }

@@ -75,6 +75,13 @@ impl Zfs {
         process::run_ok(Call { what, program: &self.zfs, args: &args, home: &self.home, env: &[], stdin: &[], deadline: ZFS_DEADLINE, stdout_max }).await
     }
 
+    /// The parent's space: what it uses, what is left, its quota, and what
+    /// its snapshots hold.
+    pub async fn pool_space(&self) -> GateResult<super::PoolSpace> {
+        let out = self.zfs("zfs get", &["get", "-Hp", "-o", "value", "used,available,quota,usedbysnapshots", &self.parent], SMALL_BYTES_MAX).await?;
+        parse_pool_space(out.stdout_text("zfs get")?).ok_or_else(|| fault(GateError::BadOutput, "zfs get: not four numbers"))
+    }
+
     /// Fails when the parent is missing or not the daemon's to use.
     pub async fn check_parent(&self) -> GateResult<()> {
         self.zfs("zfs list", &["list", "-H", "-o", "name", &self.parent], SMALL_BYTES_MAX).await.map(|_| ())
@@ -122,6 +129,14 @@ impl Zfs {
             code => Err(process::failed("blkid", code, &out.stderr)),
         }
     }
+}
+
+/// `used`, `available`, `quota` (0: none), and `usedbysnapshots`, a line
+/// each.
+fn parse_pool_space(text: &str) -> Option<super::PoolSpace> {
+    let n: Vec<u64> = text.lines().map(|l| l.trim().parse().ok()).collect::<Option<_>>()?;
+    let [used, available, quota, snapshots] = n[..] else { return None };
+    Some(super::PoolSpace { used, available, quota: (quota > 0).then_some(quota), snapshots })
 }
 
 /// `<parent>/<id>\t<written>` lines; `None` when one is not.
@@ -176,11 +191,12 @@ impl super::Disks for Zfs {
         let dataset = self.dataset(id);
         let device = self.device(id);
         if self.written(id).await?.is_none() {
-            // Sparse (-s): space is taken as the guest writes, and the
-            // pool's own free space is the real limit (ledgered: no
-            // reservation).
+            // Not sparse: ZFS reserves the volume's whole size
+            // (`refreservation`), so a guest can always write its disk full
+            // whatever the others do; the node's disk reserve counted it
+            // when the computer was made (docs/sandcastle-sleep.md).
             let size = format!("{gib}G");
-            self.zfs("zfs create", &["create", "-s", "-V", &size, "-o", "volmode=dev", &dataset], SMALL_BYTES_MAX).await?;
+            self.zfs("zfs create", &["create", "-V", &size, "-o", "volmode=dev", &dataset], SMALL_BYTES_MAX).await?;
         }
         self.wait_for_device(&device).await?;
         let mark = self.zfs("zfs get", &["get", "-H", "-o", "value", FORMATTED_PROP, &dataset], SMALL_BYTES_MAX).await?;
@@ -336,6 +352,15 @@ impl super::ReceiveSink for ZfsReceive {
 mod tests {
     use super::*;
     use sandcastle_core::model::SnapshotKind;
+
+    #[test]
+    fn pool_space_parses_or_refuses() {
+        let p = parse_pool_space("11935744\n1847892926464\n0\n0\n").unwrap();
+        assert_eq!((p.used, p.available, p.quota, p.snapshots), (11_935_744, 1_847_892_926_464, None, 0));
+        assert_eq!(parse_pool_space("1\n2\n3\n4\n").unwrap().quota, Some(3));
+        assert!(parse_pool_space("1\n2\n3\n").is_none());
+        assert!(parse_pool_space("1\n2\n-\n4\n").is_none());
+    }
 
     #[test]
     fn a_parent_is_one_the_node_can_splice() {

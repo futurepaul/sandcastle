@@ -18,6 +18,22 @@ pub struct Live {
     pub random: OsRandom,
 }
 
+impl super::Meter for Live {
+    async fn samples(&self) -> super::GateResult<std::collections::HashMap<sandcastle_core::model::ComputerId, super::Sample>> {
+        self.engine.metrics().await
+    }
+
+    async fn host(&self) -> super::GateResult<super::HostFacts> {
+        let memory = super::host::host_memory()?;
+        // Off Linux (development) there is no cgroup to read.
+        let cgroup = super::host::cgroup_memory().ok();
+        let pool = self.disks.pool_space().await?;
+        let home = self.engine.home().to_path_buf();
+        let engine_disk = super::host::space(&home, &home).await?;
+        Ok(super::HostFacts { memory, cgroup, pool, engine_disk })
+    }
+}
+
 impl super::World for Live {
     type Engine = Msb;
     type Disks = Zfs;
@@ -26,6 +42,7 @@ impl super::World for Live {
     type Prober = TcpProber;
     type Clock = SystemClock;
     type Random = OsRandom;
+    type Meter = Live;
 
     fn engine(&self) -> &Msb {
         &self.engine
@@ -53,5 +70,9 @@ impl super::World for Live {
 
     fn random(&self) -> &OsRandom {
         &self.random
+    }
+
+    fn meter(&self) -> &Live {
+        self
     }
 }

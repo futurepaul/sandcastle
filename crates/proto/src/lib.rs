@@ -283,6 +283,104 @@ pub struct Ticket {
     pub expires_at: i64,
 }
 
+/// A node's capacity (`GET /v1/node`, grantors only; docs/sandcastle-sleep.md,
+/// Budgets): its reserve, what it has committed of it and what it
+/// measures, what more fits for a computer size, and what is wrong.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NodeReport {
+    pub reserve: ReserveView,
+    pub costs: CostsView,
+    pub memory: MemoryView,
+    pub disk: DiskView,
+    pub engine_disk: EngineDiskView,
+    pub computers: CountsView,
+    pub fits: FitsView,
+    /// Per running machine: its memory over the node's recent samples.
+    pub measured: Vec<MeasuredView>,
+    /// What threatens the reserve, for its operator.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReserveView {
+    pub memory_mib: u64,
+    pub disk_gib: u64,
+    pub engine_disk_gib: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CostsView {
+    pub machine_overhead_mib: u64,
+    pub snapshot_headroom_pct: u32,
+    pub layer_gib: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryView {
+    /// Committed to machines that may run (their allocation and overhead).
+    pub committed_mib: u64,
+    pub free_mib: u64,
+    pub machines: u32,
+    /// What those machines hold on the host now, measured.
+    pub resident_mib: u64,
+    /// The kernel's cap on the node's cgroup, and its use now (none off
+    /// Linux; `cap_mib` none when the unit sets no `MemoryMax=`).
+    pub cap_mib: Option<u64>,
+    pub cgroup_mib: Option<u64>,
+    pub host_total_mib: u64,
+    pub host_available_mib: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DiskView {
+    /// Every computer's disk and its snapshots' headroom.
+    pub committed_gib: u64,
+    pub free_gib: u64,
+    pub pool_used_gib: u64,
+    pub pool_available_gib: u64,
+    pub pool_quota_gib: Option<u64>,
+    pub snapshots_gib: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EngineDiskView {
+    /// Every computer's writable layer, at its cap.
+    pub committed_gib: u64,
+    pub free_gib: u64,
+    /// What the layers take, measured, and the filesystem's free space.
+    pub layers_mib: u64,
+    pub available_gib: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CountsView {
+    pub total: u32,
+    pub running: u32,
+    pub waiting: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FitsView {
+    /// The computer size asked about.
+    pub memory_mib: u32,
+    pub data_gib: u32,
+    /// How many more such machines may run now, and how many more such
+    /// computers the node could hold.
+    pub more_running: u64,
+    pub more_computers: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MeasuredView {
+    pub computer_id: String,
+    pub name: String,
+    pub limit_mib: u64,
+    pub resident_mib_p50: u64,
+    pub resident_mib_p95: u64,
+    pub resident_mib_max: u64,
+    pub samples: u32,
+}
+
 /// The body of every refusal. `code` is stable; `message` is for people.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {

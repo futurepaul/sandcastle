@@ -8,6 +8,7 @@
 //! `system`; the simulator (`sandcastle-sim`) implements each over a
 //! simulated world.
 
+pub mod host;
 pub mod live;
 pub mod msb;
 pub mod probe;
@@ -132,6 +133,50 @@ pub trait Random: Send + Sync + 'static {
     }
 }
 
+/// One machine's measurements (`msb metrics`), in bytes and nanoseconds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Sample {
+    /// Resident on the host: what the machine costs now.
+    pub resident: u64,
+    /// Used inside the guest, and the guest's memory.
+    pub used: u64,
+    pub limit: u64,
+    /// vCPU time, and the guest's network bytes, since it started.
+    pub cpu_ns: u64,
+    pub net_rx: u64,
+    pub net_tx: u64,
+    /// The engine disk its writable layer takes.
+    pub layer: u64,
+}
+
+/// The ZFS parent's space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PoolSpace {
+    pub used: u64,
+    pub available: u64,
+    /// The parent's quota: none means the pool's own size bounds it.
+    pub quota: Option<u64>,
+    pub snapshots: u64,
+}
+
+/// What the host says of itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostFacts {
+    pub memory: host::HostMemory,
+    /// The daemon's cgroup; `None` off Linux (development).
+    pub cgroup: Option<host::CgroupMemory>,
+    pub pool: PoolSpace,
+    pub engine_disk: host::Space,
+}
+
+/// Measurements, for the budgets (docs/sandcastle-sleep.md): read-only,
+/// and never entering a guest.
+pub trait Meter: Send + Sync + 'static {
+    /// Every running machine the node made, measured now.
+    fn samples(&self) -> impl Future<Output = GateResult<HashMap<ComputerId, Sample>>> + Send;
+    fn host(&self) -> impl Future<Output = GateResult<HostFacts>> + Send;
+}
+
 /// Everything a node reaches the world through, as one bundle.
 pub trait World: Send + Sync + 'static {
     type Engine: Engine;
@@ -141,6 +186,7 @@ pub trait World: Send + Sync + 'static {
     type Prober: Prober;
     type Clock: Clock;
     type Random: Random;
+    type Meter: Meter;
     fn engine(&self) -> &Self::Engine;
     fn disks(&self) -> &Self::Disks;
     /// `None` on a node with no backup bucket.
@@ -150,4 +196,5 @@ pub trait World: Send + Sync + 'static {
     fn prober(&self) -> &Self::Prober;
     fn clock(&self) -> &Self::Clock;
     fn random(&self) -> &Self::Random;
+    fn meter(&self) -> &Self::Meter;
 }

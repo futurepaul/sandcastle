@@ -137,6 +137,7 @@ pub async fn handle<W: World>(d: &Daemon<W>, req: Request<Incoming>) -> Resp {
         },
         (&Method::POST, ["v1", "computers", name, "tickets"]) => ticket(d, &signer, name),
         (&Method::GET, ["v1", "computers", name, "snapshots"]) => snapshots(d, &signer, name).await,
+        (&Method::GET, ["v1", "node"]) => node_report(d, &signer, &query).await,
         (&Method::GET, ["v1", "backups"]) => match store.backups_of_owner(&signer) {
             Ok(rows) => json(
                 StatusCode::OK,
@@ -157,6 +158,29 @@ pub async fn handle<W: World>(d: &Daemon<W>, req: Request<Incoming>) -> Resp {
             Err(e) => store_error(&e),
         },
         _ => error(StatusCode::NOT_FOUND, "no_route", format!("no route {method} {path}")),
+    }
+}
+
+/// The node's capacity, for its grantors: `?memory_mib=&data_gib=` asks
+/// what more fits of that size (4096 and 10 when left out).
+async fn node_report<W: World>(d: &Daemon<W>, signer: &str, query: &str) -> Resp {
+    if !d.is_grantor(signer) {
+        return error(StatusCode::FORBIDDEN, "not_grantor", "a node's capacity is for its grantors");
+    }
+    let mut size = (4096u32, 10u32);
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let parsed = match pair.split_once('=') {
+            Some(("memory_mib", v)) => v.parse().ok().filter(|m| (sandcastle_proto::MEMORY_MIB_MIN..=sandcastle_proto::MEMORY_MIB_MAX).contains(m)).map(|m| size.0 = m),
+            Some(("data_gib", v)) => v.parse().ok().filter(|g| *g <= sandcastle_proto::DATA_GIB_MAX).map(|g| size.1 = g),
+            _ => None,
+        };
+        if parsed.is_none() {
+            return error(StatusCode::BAD_REQUEST, "invalid", "the query is memory_mib and data_gib, within the spec's limits");
+        }
+    }
+    match d.node.capacity(size).await {
+        Ok(r) => json(StatusCode::OK, &r),
+        Err(e) => store_error(&e),
     }
 }
 

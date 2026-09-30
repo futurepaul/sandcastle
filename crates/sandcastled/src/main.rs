@@ -33,6 +33,7 @@ fn main() -> ExitCode {
 
 async fn serve(config: Serve) -> Result<(), String> {
     config.check()?;
+    memory_capped(&config)?;
     std::fs::create_dir_all(&config.state_dir).map_err(|e| format!("{}: {e}", config.state_dir.display()))?;
     let store = Store::open(&config.state_dir.join(sandcastled::reset::STATE_FILE)).map_err(|e| format!("opening the state: {e}"))?;
     let engine = Msb::new(config.engine.msb.clone(), config.engine.msb_home.clone(), config.guest_deny.clone());
@@ -83,6 +84,30 @@ async fn serve(config: Serve) -> Result<(), String> {
             eprintln!("sandcastled: stopping; computers keep running");
             Ok(())
         }
+    }
+}
+
+/// The kernel holds the memory reserve: the daemon's cgroup (which holds
+/// every machine too, `KillMode=process`) is capped at no less than the
+/// reserve, on a host that has it. Development may run without a cap, and
+/// the capacity report then says so.
+fn memory_capped(config: &Serve) -> Result<(), String> {
+    use sandcastle_node::gates::host;
+    let reserve = config.budget.reserve().memory;
+    let mib = |b: u64| b >> 20;
+    let total = host::host_memory().map_err(|f| format!("reading the host's memory: {}", f.detail))?.total;
+    if reserve > total {
+        return Err(format!("--reserve-memory-gib ({} MiB) is more than the host has ({} MiB)", mib(reserve), mib(total)));
+    }
+    let cap = host::cgroup_memory().ok().and_then(|c| c.cap);
+    match cap {
+        Some(cap) if cap >= reserve => Ok(()),
+        Some(cap) => Err(format!("the unit's MemoryMax= ({} MiB) is below the memory reserve ({} MiB)", mib(cap), mib(reserve))),
+        None if config.budget.allow_uncapped_memory => {
+            eprintln!("sandcastled: no kernel memory cap (--allow-uncapped-memory): the memory reserve is the node's alone to keep");
+            Ok(())
+        }
+        None => Err("the node runs with no kernel memory cap: set MemoryMax= on its unit (at least the reserve, plus the daemon's own), or pass --allow-uncapped-memory for development".into()),
     }
 }
 
