@@ -57,14 +57,14 @@ async fn request(conn: &Connection, host: &str, method: &str, path: &str, header
 }
 
 /// Hermes' socket over a new stream, with its protocols.
-async fn websocket(conn: &Connection, host: &str, protocols: &[&str]) -> Result<(crate::ws::Ws, Option<String>), String> {
+async fn websocket(conn: &Connection, host: &str, path: &str, protocols: &[&str]) -> Result<(crate::ws::Ws, Option<String>), String> {
     let (mut send, recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
     send.write_all(&[STREAM_HTTP]).await.map_err(|e| e.to_string())?;
     let (mut sender, driver) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tokio::io::join(recv, send))).await.map_err(|e| e.to_string())?;
     tokio::spawn(async move {
         let _ = driver.with_upgrades().await;
     });
-    let req = Request::get("/api/ws")
+    let req = Request::get(path)
         .header("host", host)
         .header("connection", "upgrade")
         .header("upgrade", "websocket")
@@ -194,7 +194,7 @@ pub async fn iroh(r: &mut Run) -> Step {
     r.ensure(S, "a socket ticket, by its key", s == 200 && !ticket.is_empty(), format!("{s}"))?;
     let offered = format!("hermes-gateway-ticket.{ticket}");
     let t = Instant::now();
-    let (mut ws, chosen) = websocket(&conn, &host, &["hermes-gateway-v1", &offered]).await?;
+    let (mut ws, chosen) = websocket(&conn, &host, "/api/ws", &["hermes-gateway-v1", &offered]).await?;
     let ready = ws.recv(Duration::from_secs(30)).await?.unwrap_or_default();
     r.ensure(S, "its socket opens over a stream, and the gateway is ready", chosen.as_deref() == Some("hermes-gateway-v1") && ready.contains("gateway.ready"), format!("in {} ms", t.elapsed().as_millis()))?;
     let (created, _) = rpc(&mut ws, 1, "session.create", json!({"title": "sandcastle e2e over iroh"})).await?;
@@ -217,6 +217,84 @@ pub async fn iroh(r: &mut Run) -> Step {
     let t = Instant::now();
     let (s, _, _) = request(&conn, &host, "GET", "/api/status", &[], vec![]).await?;
     r.ensure(S, "and the next request on it wakes it", s == 200, format!("{} ms; {}", t.elapsed().as_millis(), path(&conn)))?;
+    loopback(r, &conn, &spec).await?;
     ep.close().await;
+    Ok(())
+}
+
+/// In the guest, a bridge from the port msb publishes (9119) to Hermes'
+/// dashboard on the guest's loopback (9120): msb reaches only the guest's
+/// external interface, from its gateway's address, and Hermes in loopback
+/// mode takes only loopback peers.
+const BRIDGE: &str = r#"/opt/hermes/.venv/bin/python3 -c '
+import asyncio
+async def pipe(r, w):
+    try:
+        while True:
+            d = await r.read(65536)
+            if not d:
+                break
+            w.write(d)
+            await w.drain()
+    finally:
+        w.close()
+async def conn(cr, cw):
+    try:
+        ur, uw = await asyncio.open_connection("127.0.0.1", 9120)
+    except OSError:
+        cw.close()
+        return
+    await asyncio.gather(pipe(cr, uw), pipe(ur, cw), return_exceptions=True)
+async def main():
+    s = await asyncio.start_server(conn, "0.0.0.0", 9119)
+    async with s:
+        await s.serve_forever()
+asyncio.run(main())
+'"#;
+
+/// Hermes behind the admission alone (docs/runtime-seam.md): its dashboard
+/// in loopback mode (no login, no password anywhere), bridged in the guest,
+/// its session token pinned for the measurement; reached by its key with a
+/// loopback Host, as Finite's agentd reaches it.
+async fn loopback(r: &mut Run, conn: &Connection, spec: &Value) -> Step {
+    const S: &str = "iroh";
+    let name = "hermes";
+    let token = super::random_hex(32);
+    let mut lo = spec.clone();
+    lo["service"]["argv"] = json!([]);
+    lo["service"]["init"] = json!({"argv": ["/init", "/bin/sh", "-c", format!("{BRIDGE} & exec /opt/hermes/docker/main-wrapper.sh gateway run")], "stop": ["/run/s6/basedir/bin/halt"]});
+    let env = lo["service"]["env"].as_object_mut().ok_or("the spec's env")?;
+    env.retain(|k, _| !k.starts_with("HERMES_DASHBOARD_BASIC_AUTH_"));
+    env.insert("HERMES_DASHBOARD".into(), json!("1"));
+    env.insert("HERMES_DASHBOARD_HOST".into(), json!("127.0.0.1"));
+    env.insert("HERMES_DASHBOARD_PORT".into(), json!("9120"));
+    env.insert("HERMES_DASHBOARD_SESSION_TOKEN".into(), json!(token));
+    lo["service"]["health_path"] = json!("/api/status");
+    lo["service"]["busy"] = json!({"path": "/api/status", "field": "active_agents"});
+    lo["url_auth"] = json!("owner");
+    lo["cors_origins"] = json!([]);
+    let (status, v) = r.put_as(Owner::Hermes, name, &lo, "").await?;
+    r.ensure(S, "Hermes respecified in loopback mode, with no password", status == 200, format!("{status} {}", v["code"]))?;
+    let (_, took) = r.serving(name, Duration::from_secs(300)).await?;
+    r.record(S, "it serves behind its bridge", true, secs(took));
+    let lo_host = "127.0.0.1";
+    let (s, _, _) = request(conn, lo_host, "GET", "/api/sessions", &[], vec![]).await?;
+    r.ensure(S, "on the same connection, a read without its session token is refused", s == 401, format!("{s}"))?;
+    let (s, _, body) = request(conn, lo_host, "GET", "/api/sessions", &[("x-hermes-session-token", &token)], vec![]).await?;
+    let listed = serde_json::from_slice::<Value>(&body).map(|v| v["sessions"].is_array()).unwrap_or(false);
+    r.ensure(S, "with it, Hermes answers: no login, the admission its only gate", s == 200 && listed, format!("{s}"))?;
+    let (s, _, _) = request(conn, &format!("{name}.{}", r.client.domain), "GET", "/api/status", &[], vec![]).await?;
+    r.ensure(S, "a Host that is not loopback is refused (Hermes' DNS-rebinding guard)", s == 400, format!("{s}"))?;
+    let t = Instant::now();
+    let (mut ws, _) = websocket(conn, lo_host, &format!("/api/ws?token={token}"), &["hermes-gateway-v1"]).await?;
+    let ready = ws.recv(Duration::from_secs(30)).await?.unwrap_or_default();
+    r.ensure(S, "its socket opens with the session token, and the gateway is ready", ready.contains("gateway.ready"), format!("in {} ms", t.elapsed().as_millis()))?;
+    let (created, _) = rpc(&mut ws, 1, "session.create", json!({"title": "sandcastle e2e, loopback"})).await?;
+    let live = created["session_id"].as_str().unwrap_or("").to_string();
+    let t = Instant::now();
+    let (_, events) = rpc(&mut ws, 2, "prompt.submit", json!({"session_id": live, "text": "Reply with exactly: behind the admission"})).await?;
+    let (text, status, first) = turn(&mut ws, &live, events, Duration::from_secs(120)).await?;
+    r.ensure(S, "a turn, with no login", text.to_lowercase().contains("behind the admission") && status != "error", format!("first words in {} ms, whole in {} ms", first.as_millis(), t.elapsed().as_millis()))?;
+    ws.close().await;
     Ok(())
 }
