@@ -131,6 +131,14 @@ impl Ledger {
         self.held.remove(&id);
     }
 
+    /// A paused machine cannot grow: it holds what it measured resident,
+    /// never more than it held. Nothing for a machine that holds nothing.
+    pub fn shrink(&mut self, id: ComputerId, resident: u64) {
+        if let Some(held) = self.held.get_mut(&id) {
+            *held = (*held).min(resident.max(1));
+        }
+    }
+
     /// Adopts a machine the engine says is running that holds nothing (a
     /// restarted node's), over the reserve if it must: it runs already.
     pub fn adopt(&mut self, id: ComputerId, need: u64) {
@@ -161,6 +169,27 @@ mod tests {
         l.release(id(1));
         l.admit(id(3), 4 * GIB).unwrap();
         assert_eq!((l.committed(), l.free()), (10 * GIB, 0));
+    }
+
+    /// Goal: a paused machine's hold shrinks to what it measured, never
+    /// grows by it, and a wake's admission takes back its whole allocation
+    /// only if the rest leaves room.
+    #[test]
+    fn a_paused_machine_holds_what_it_measured() {
+        let mut l = Ledger::new(10 * GIB);
+        l.admit(id(1), 4 * GIB).unwrap();
+        l.admit(id(2), 4 * GIB).unwrap();
+        l.shrink(id(1), GIB / 2);
+        assert_eq!(l.holds(id(1)), Some(GIB / 2));
+        l.shrink(id(1), 2 * GIB);
+        assert_eq!(l.holds(id(1)), Some(GIB / 2), "never grows");
+        l.shrink(id(3), GIB);
+        assert_eq!(l.holds(id(3)), None, "holds nothing, shrinks nothing");
+        l.admit(id(3), 5 * GIB).unwrap();
+        assert!(l.admit(id(1), 4 * GIB).is_err(), "no room to wake it: 10 − 4 − 5");
+        assert_eq!(l.holds(id(1)), Some(GIB / 2), "a refused wake keeps its warm hold");
+        l.release(id(3));
+        l.admit(id(1), 4 * GIB).unwrap();
     }
 
     /// Goal: machines a restarted node finds running are adopted even past

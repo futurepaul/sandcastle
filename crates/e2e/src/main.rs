@@ -13,6 +13,10 @@
 //! - `net`: from outside only 22 and 443 answer; from a guest, the host's
 //!   own addresses, metadata, and private ranges are refused and the
 //!   public internet is reached;
+//! - `sleep`: an idle computer goes warm (paused) and backs up what it
+//!   wrote; warm and cold wakes through its URL, measured against an
+//!   awake request; a service that says it is busy stays awake; the
+//!   capacity report counts the tiers and what idle guests use;
 //! - `hermes` (with `--hermes`): Hermes with credentials from
 //!   fragment.club, no token in the guest, a real model call through the
 //!   swap (a few cents);
@@ -278,6 +282,73 @@ impl Run {
     async fn put(&mut self, name: &str, spec: &Value, query: &str) -> Result<(u16, Value), String> {
         self.put_as(Owner::Alice, name, spec, query).await
     }
+
+    fn id_of(&self, name: &str) -> Result<String, String> {
+        self.made.iter().find(|(n, _, _)| n == name).map(|(_, id, _)| id.clone()).ok_or_else(|| format!("the run did not make {name}"))
+    }
+
+    /// Wakes `name` (as the grantor: a platform acting for it) and waits
+    /// for its machine to run: a computer that slept takes no exec.
+    async fn awake(&self, name: &str) -> Result<(), String> {
+        let id = self.id_of(name)?;
+        let a = self.client.call(&self.grantor, "POST", &format!("/v1/computers/{name}/wake"), None).await?;
+        if a.status != 202 {
+            return Err(format!("wake {name}: {} {}", a.status, a.json()["code"]));
+        }
+        let start = Instant::now();
+        // Bounded: a cold boot is seconds.
+        while start.elapsed() < Duration::from_secs(120) {
+            if self.host.machine(&id).await?.is_some_and(|m| m.status == "Running") {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(format!("{name} did not wake in 120 s"))
+    }
+
+    /// Runs `script` in `name`'s guest, woken first (and once more if a
+    /// sleep decided just before the wake paused it under the exec).
+    async fn exec(&self, name: &str, script: &str) -> Result<String, String> {
+        let id = self.id_of(name)?;
+        self.awake(name).await?;
+        match self.host.exec(&id, script).await {
+            Ok(out) => Ok(out),
+            Err(_) => {
+                self.awake(name).await?;
+                self.host.exec(&id, script).await
+            }
+        }
+    }
+
+    /// Puts `name` to sleep (as the grantor) and waits until its machine is
+    /// `want` on the host (`Paused`, `Stopped`) and its view says so.
+    async fn slept(&self, name: &str, tier: &str, want: &str) -> Result<Duration, String> {
+        let id = self.id_of(name)?;
+        let start = Instant::now();
+        let a = self.client.call(&self.grantor, "POST", &format!("/v1/computers/{name}/sleep"), Some(&json!({"tier": tier}))).await?;
+        if a.status != 200 {
+            return Err(format!("sleep {name} {tier}: {} {}", a.status, a.json()["code"]));
+        }
+        // Bounded: a cold halt is a graceful stop, seconds.
+        while start.elapsed() < Duration::from_secs(120) {
+            let on_host = self.host.machine(&id).await?.is_some_and(|m| m.status == want);
+            if on_host && self.view(name).await?.1["observed"]["state"] == tier {
+                return Ok(start.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!("{name} was not {tier} ({want}) in 120 s"))
+    }
+}
+
+/// min, median, and max of some durations, in ms.
+fn spread(ds: &[Duration]) -> String {
+    let mut ms: Vec<u128> = ds.iter().map(Duration::as_millis).collect();
+    ms.sort_unstable();
+    match ms.as_slice() {
+        [] => "none".into(),
+        all => format!("min {} ms, median {} ms, max {} ms of {}", all[0], all[all.len() / 2], all[all.len() - 1], all.len()),
+    }
 }
 
 /// What a failure message shows of a view: never its spec.
@@ -321,7 +392,7 @@ async fn life(r: &mut Run) -> Step {
     r.ensure(S, "and holds its disk", volumes.contains(&id), format!("{volumes:?}"))?;
 
     let marker = format!("e2e-{}-{}", r.tag, random_hex(4));
-    r.host.exec(&id, &format!("echo {marker} > /data/marker && sync")).await?;
+    r.exec(&name, &format!("echo {marker} > /data/marker && sync")).await?;
     let served = r.marker_served(&name, "marker", &marker).await;
     r.ensure(S, "a marker written in the guest is read through the URL", served.is_ok(), served.err().unwrap_or_default())?;
     r.web = Some(Web { name: name.clone(), id: id.clone(), marker: marker.clone(), shipped: None });
@@ -411,12 +482,13 @@ async fn backup(r: &mut Run) -> Step {
     const S: &str = "backup";
     let web = r.web.clone().ok_or("the life section made no computer")?;
     let second = format!("e2e-{}-{}", r.tag, random_hex(4));
-    r.host.exec(&web.id, &format!("echo {second} > /data/second && sync")).await?;
+    r.exec(&web.name, &format!("echo {second} > /data/second && sync")).await?;
     let snaps = r.client.call(&r.alice, "GET", &format!("/v1/computers/{}/snapshots", web.name), None).await?.json();
     let newest = snaps["snapshots"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str().and_then(snapshot_seq)).max().unwrap_or(0);
     r.record(S, "the disk's snapshots before the next", true, format!("newest seq {newest}"));
-    // The next scheduled snapshot (every 60 s on the test node) holds the
-    // second marker; wait for it to ship.
+    // The next scheduled snapshot (every 60 s on the test node), or the one
+    // it takes when it sleeps, holds the second marker; wait for it to
+    // ship.
     let start = Instant::now();
     let mut shipped: Option<String> = None;
     while start.elapsed() < Duration::from_secs(300) && shipped.is_none() {
@@ -499,7 +571,7 @@ async fn net(r: &mut Run) -> Step {
         "python3 -c \"import socket\nfor h, p in [{}]:\n    s = socket.socket(socket.AF_INET6 if chr(58) in h else socket.AF_INET)\n    s.settimeout(3)\n    try:\n        s.connect((h, p)); print(h, p, chr(111)+chr(112)+chr(101)+chr(110))\n    except Exception as e:\n        print(h, p, type(e).__name__)\"",
         list.join(", ")
     );
-    let out = r.host.exec(&web.id, &probe).await?;
+    let out = r.exec(&web.name, &probe).await?;
     for (host, port, reachable) in &targets {
         if host.is_empty() {
             continue;
@@ -580,24 +652,26 @@ async fn hermes(r: &mut Run) -> Step {
     let a = r.client.send(&host, "GET", "/", &[("cookie", &cookie)], vec![]).await?;
     r.ensure(S, "with the session, Hermes answers behind it", a.status != 401 || !a.text().contains("This computer is private"), format!("{}", a.status))?;
 
-    let pid1 = r.host.exec(&id, "cat /proc/1/comm").await?;
-    let status = r.host.exec(&id, r#"python3 -c "import urllib.request as u; print(u.urlopen(\"http://127.0.0.1:9119/api/status\").read().decode())""#).await?;
+    let pid1 = r.exec(&name, "cat /proc/1/comm").await?;
+    let status = r.exec(&name, r#"python3 -c "import urllib.request as u; print(u.urlopen(\"http://127.0.0.1:9119/api/status\").read().decode())""#).await?;
     let running = serde_json::from_str::<Value>(status.trim()).map(|v| v["gateway_running"] == true).unwrap_or(false);
     r.ensure(S, "its image's init is PID 1 and its gateway runs", pid1.trim() == "s6-svscan" && running, format!("PID 1 {}, gateway_running {running}", pid1.trim()))?;
-    let in_procs = r.host.exec(&id, "cat /proc/[0-9]*/environ 2>/dev/null | tr \"\\000\" \"\\n\" | grep -c \"fsc1_[0-9a-f]\" || true").await?;
+    let in_procs = r.exec(&name, "cat /proc/[0-9]*/environ 2>/dev/null | tr \"\\000\" \"\\n\" | grep -c \"fsc1_[0-9a-f]\" || true").await?;
     r.ensure(S, "no token in any process's environment", in_procs.trim() == "0", format!("environs {}", in_procs.trim()))?;
 
     // cron, on the gateway's own ticker: a script-only job (no model)
     let proof = format!("e2e-{}", r.tag);
-    r.host
-        .exec(&id, &format!("mkdir -p /opt/data/scripts && printf \"#!/bin/sh\\necho {proof} >> /opt/data/cron-proof\\n\" > /opt/data/scripts/e2e-proof.sh && chmod 755 /opt/data/scripts/e2e-proof.sh && chown -R hermes:hermes /opt/data/scripts"))
+    r.exec(&name, &format!("mkdir -p /opt/data/scripts && printf \"#!/bin/sh\\necho {proof} >> /opt/data/cron-proof\\n\" > /opt/data/scripts/e2e-proof.sh && chmod 755 /opt/data/scripts/e2e-proof.sh && chown -R hermes:hermes /opt/data/scripts"))
         .await?;
-    r.host.exec(&id, "cd /opt/data && /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes cron create 1m --name e2e-proof --script e2e-proof.sh --no-agent --deliver local >/dev/null").await?;
+    r.exec(&name, "cd /opt/data && /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes cron create 1m --name e2e-proof --script e2e-proof.sh --no-agent --deliver local >/dev/null").await?;
     let start = Instant::now();
     let mut fired = false;
+    // Awake meanwhile (each look wakes it, an idle time on): until the
+    // cron provider (docs/sandcastle-sleep.md), a sleeping Hermes' ticker
+    // does not run.
     while start.elapsed() < Duration::from_secs(200) && !fired {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        fired = r.host.exec(&id, "cat /opt/data/cron-proof 2>/dev/null || true").await?.contains(&proof);
+        fired = r.exec(&name, "cat /opt/data/cron-proof 2>/dev/null || true").await?.contains(&proof);
     }
     r.ensure(S, "a cron job fires on its gateway's ticker", fired, secs(start.elapsed()))?;
     // The service's own environment (the placeholder in OPENAI_API_KEY),
@@ -615,10 +689,115 @@ async fn hermes(r: &mut Run) -> Step {
         "print(a.status, b.get(\\\"model\\\"), repr(b[\\\"choices\\\"][0][\\\"message\\\"].get(\\\"content\\\")))\""
     );
     let start = Instant::now();
-    let answer = r.host.exec(&id, call).await;
+    let answer = r.exec(&name, call).await;
     let ok = answer.as_ref().is_ok_and(|a| a.starts_with("200 ") && a.to_lowercase().contains("sandcastle e2e"));
     let detail = format!("{}: {}", secs(start.elapsed()), answer.unwrap_or_else(|e| e).trim().chars().take(200).collect::<String>());
-    r.ensure(S, "a model call from the guest, through the swap, with the computer's token", ok, detail)
+    r.ensure(S, "a model call from the guest, through the swap, with the computer's token", ok, detail)?;
+
+    // What an idle Hermes uses (where the activity floors belong), what it
+    // holds warm, and its wakes through its URL.
+    let report = r.client.call(&r.grantor, "GET", "/v1/node", None).await?.json();
+    let measured = report["measured"].as_array().into_iter().flatten().find(|m| m["computer_id"] == id.as_str()).cloned().unwrap_or(Value::Null);
+    r.record(S, "what Hermes measured", true, measured.to_string());
+    let asleep = r.slept(&name, "warm", "Paused").await?;
+    let resident = r.host.run(&format!("{} metrics --format json", r.args.msb)).await?;
+    let resident = serde_json::from_str::<Value>(&resident).ok().and_then(|v| v.as_array().into_iter().flatten().find(|m| m["name"] == format!("sc-{id}").as_str()).and_then(|m| m["memory_host_resident_bytes"].as_u64()));
+    r.record(S, "Hermes warm", true, format!("paused in {}; resident {} MiB", secs(asleep), resident.unwrap_or(0) >> 20));
+    let health = spec["service"]["health_path"].as_str().unwrap_or("/").to_string();
+    let t = Instant::now();
+    let a = r.client.send(&host, "GET", &health, &[("cookie", &cookie)], vec![]).await?;
+    r.ensure(S, "a request wakes a warm Hermes", a.status < 500, format!("{} in {} ms", a.status, t.elapsed().as_millis()))?;
+    r.slept(&name, "cold", "Stopped").await?;
+    let t = Instant::now();
+    let a = r.client.send(&host, "GET", &health, &[("cookie", &cookie)], vec![]).await?;
+    r.ensure(S, "a request wakes a cold Hermes", a.status < 500, format!("{} in {} ms", a.status, t.elapsed().as_millis()))
+}
+
+async fn sleep(r: &mut Run) -> Step {
+    const S: &str = "sleep";
+    let web = r.web.clone().ok_or("the life section made no computer")?;
+    let report = r.client.call(&r.grantor, "GET", "/v1/node", None).await?.json();
+    let idle_s = report["sleep"]["idle_after_s"].as_u64().ok_or("the node does not put computers to sleep")?;
+    r.record(S, "the node's sleep settings", true, report["sleep"].to_string());
+
+    // Idle: a request, then nothing.
+    let a = r.client.browse(&web.name, "/marker").await?;
+    r.ensure(S, "a request is served", a.status == 200, format!("{}", a.status))?;
+    let (v, took) = r.until(&web.name, Duration::from_secs(idle_s + 60), |s, v| s == 200 && v["observed"]["state"] == "warm").await?;
+    let machine = r.host.machine(&web.id).await?;
+    r.ensure(S, "idle, it goes warm: its machine paused", machine.as_ref().is_some_and(|m| m.status == "Paused"), format!("{} after its last request (idle after {idle_s} s); {machine:?}", secs(took)))?;
+    r.ensure(S, "and its view is settled", v["pending"] == false, summary(&v))?;
+
+    // What it wrote before it slept is backed up while it sleeps.
+    let third = format!("e2e-{}-{}", r.tag, random_hex(4));
+    r.exec(&web.name, &format!("echo {third} > /data/third && sync")).await?;
+    r.until(&web.name, Duration::from_secs(idle_s + 60), |s, v| s == 200 && v["observed"]["state"] == "warm").await?;
+    let start = Instant::now();
+    let mut pause_snapshot = None;
+    while start.elapsed() < Duration::from_secs(60) && pause_snapshot.is_none() {
+        let snaps = r.client.call(&r.alice, "GET", &format!("/v1/computers/{}/snapshots", web.name), None).await?.json();
+        pause_snapshot = snaps["snapshots"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str()).find(|n| n.ends_with("-pause")).map(str::to_string);
+        if pause_snapshot.is_none() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    r.ensure(S, "a warm computer's writes are snapshotted", pause_snapshot.is_some(), pause_snapshot.clone().unwrap_or_else(|| "no pause snapshot in 60 s".into()))?;
+
+    // Awake, warm, and cold requests, measured from the client: each a new
+    // TLS connection through the router to the guest's service.
+    let mut awake = Vec::new();
+    r.awake(&web.name).await?;
+    for _ in 0..10 {
+        let t = Instant::now();
+        let a = r.client.browse(&web.name, "/marker").await?;
+        awake.push(t.elapsed());
+        r.ensure(S, "an awake request is served", a.status == 200 && a.text().trim() == web.marker, format!("{}", a.status))?;
+    }
+    r.record(S, "awake requests", true, spread(&awake));
+    let mut warm = Vec::new();
+    for _ in 0..10 {
+        r.slept(&web.name, "warm", "Paused").await?;
+        let t = Instant::now();
+        let a = r.client.browse(&web.name, "/marker").await?;
+        warm.push(t.elapsed());
+        r.ensure(S, "a request to a warm computer wakes it and is served", a.status == 200 && a.text().trim() == web.marker, format!("{} {}", a.status, a.text().chars().take(80).collect::<String>()))?;
+    }
+    r.record(S, "warm wakes", true, spread(&warm));
+    let mut cold = Vec::new();
+    let mut halts = Vec::new();
+    for _ in 0..10 {
+        halts.push(r.slept(&web.name, "cold", "Stopped").await?);
+        let t = Instant::now();
+        let a = r.client.browse(&web.name, "/marker").await?;
+        cold.push(t.elapsed());
+        r.ensure(S, "a request to a cold computer boots it and is served", a.status == 200 && a.text().trim() == web.marker, format!("{} {}", a.status, a.text().chars().take(80).collect::<String>()))?;
+    }
+    r.record(S, "cold wakes", true, spread(&cold));
+    r.record(S, "cold halts (asked to seen stopped)", true, spread(&halts));
+
+    // A service that says it is working stays awake; once it says it is
+    // not, it sleeps.
+    let name = format!("e2e-{}-busy", r.tag);
+    let mut spec = web_spec("1", WEB_IMAGE);
+    spec["service"]["busy"] = json!({"path": "/busy.json", "field": "active"});
+    let (status, v) = r.put(&name, &spec, "").await?;
+    r.ensure(S, "a computer that says whether it is busy is created", status == 201, format!("{status} {}", v["code"]))?;
+    r.serving(&name, Duration::from_secs(300)).await?;
+    r.exec(&name, "echo {\\\"active\\\": 1} > /data/busy.json").await?;
+    tokio::time::sleep(Duration::from_secs(idle_s + 20)).await;
+    let (_, v) = r.view(&name).await?;
+    let id = r.id_of(&name)?;
+    let machine = r.host.machine(&id).await?;
+    r.ensure(S, "busy, it stays awake past the idle time", v["observed"]["state"] == "serving" && machine.as_ref().is_some_and(|m| m.status == "Running"), format!("{} {machine:?}", summary(&v)))?;
+    r.exec(&name, "echo {\\\"active\\\": 0} > /data/busy.json").await?;
+    let (_, took) = r.until(&name, Duration::from_secs(idle_s + 60), |s, v| s == 200 && v["observed"]["state"] == "warm").await?;
+    r.record(S, "no longer busy, it goes warm", true, secs(took));
+
+    let report = r.client.call(&r.grantor, "GET", "/v1/node", None).await?.json();
+    r.ensure(S, "the report counts warm computers", report["computers"]["warm"].as_u64().is_some_and(|n| n >= 1), report["computers"].to_string())?;
+    let measured: Vec<Value> = report["measured"].as_array().into_iter().flatten().filter(|m| m["computer_id"] == web.id.as_str() || m["computer_id"] == id.as_str()).cloned().collect();
+    r.record(S, "what the web computers measured", true, Value::Array(measured).to_string());
+    Ok(())
 }
 
 async fn cleanup(r: &mut Run) -> Step {
@@ -685,7 +864,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
     let wanted = |s: &str, r: &Run| r.args.only.is_empty() || r.args.only.iter().any(|o| o == s);
-    let mut sections: Vec<&str> = vec!["auth", "life", "crash", "backup", "net"];
+    let mut sections: Vec<&str> = vec!["auth", "life", "crash", "backup", "net", "sleep"];
     if r.args.hermes {
         sections.push("hermes");
     }
@@ -705,6 +884,7 @@ async fn main() -> std::process::ExitCode {
             "crash" => crash(&mut r).await,
             "backup" => backup(&mut r).await,
             "net" => net(&mut r).await,
+            "sleep" => sleep(&mut r).await,
             "hermes" => hermes(&mut r).await,
             "wiped" => wiped(&mut r).await,
             "cleanup" => cleanup(&mut r).await,

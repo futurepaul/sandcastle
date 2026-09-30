@@ -5,7 +5,7 @@
 use crate::check;
 use crate::credentials;
 use crate::limits::{BACKOFF_DOUBLINGS_MAX, BACKOFF_FIRST_MS, BACKOFF_MAX_MS};
-use crate::model::{Computer, Desired, DiskFacts, Failure, FaultKind, Knowledge, Machine, Millis, Policy, SnapshotKind, SnapshotName, Status, Step, Upload};
+use crate::model::{Computer, Desired, DiskFacts, Failure, FaultKind, Knowledge, Machine, Millis, Policy, SnapshotKind, SnapshotName, Status, Step, Tier, Upload};
 use crate::step::{Change, Effect, Fault, GateError, Note, Outcome, Shipped};
 
 /// The wait before retry number `failures` (1 is the first).
@@ -65,12 +65,41 @@ pub fn note(c: &Computer, note: &Note, p: &Policy, now: Millis) -> Change {
         Note::Status { status, reason } => {
             n.status = *status;
             n.status_reason = reason.clone();
-            if matches!(status, Status::Stopped | Status::Absent) {
+            if matches!(status, Status::Stopped | Status::Absent | Status::Cold) {
                 n.failures = 0;
                 n.retry_at = None;
                 n.failure = None;
             }
         }
+        Note::Sleep { tier, active_at } => {
+            assert_ne!(*tier, Tier::Awake, "a sleep is warm or cold");
+            if c.tier == Tier::Awake {
+                n.slept_at = Some(now);
+            }
+            n.tier = *tier;
+            n.active_at = c.active_at.max(*active_at);
+        }
+        Note::Wake { active_at } => {
+            n.tier = Tier::Awake;
+            n.slept_at = None;
+            // Awake, its schedule's snapshots cover what the sleep's owed.
+            if c.snapshot_due == Some(SnapshotKind::Pause) {
+                n.snapshot_due = None;
+            }
+            n.active_at = c.active_at.max(*active_at);
+            n.status = Status::Starting;
+            n.status_reason = None;
+        }
+        Note::Replace => {
+            n.applied_seq = None;
+            n.machine_stop = None;
+            n.launched_at = None;
+            if n.status == Status::Serving {
+                n.status = Status::Starting;
+            }
+        }
+        Note::Demote if c.tier == Tier::Warm => n.tier = Tier::Cold,
+        Note::Demote => {}
     }
     let change = Change { row: Some(n), shipped: None };
     check::change(c, &change);
@@ -84,13 +113,17 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
         // Facts about the world, which the batch's knowledge holds.
         Effect::Quiesce { .. } | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
         Effect::Stop { .. } => {
-            if crate::plan::wedged(c) || crate::plan::launch_failed(c) || crate::plan::stop_failed(c) {
+            if crate::plan::wedged(c) || crate::plan::launch_failed(c) || crate::plan::stop_failed(c) || crate::plan::resume_failed(c) {
                 // Dealt with by the stop: the next stop quiesces first
                 // again, and the next boot launches.
                 n.failure = None;
             }
             n.launched_at = None;
-            n.status = if c.desired == Desired::Stopped { Status::Stopped } else { Status::Starting };
+            n.status = match (c.desired, c.tier) {
+                (Desired::Stopped, _) => Status::Stopped,
+                (_, Tier::Cold) => Status::Cold,
+                _ => Status::Starting,
+            };
             n.status_reason = None;
         }
         Effect::Snapshot { name } => taken(&mut n, *name, p, now),
@@ -112,8 +145,26 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
             n.status_reason = None;
         }
         Effect::Rotate { credentials, withdraw } => handed(&mut n, credentials, *withdraw, p, now),
+        // Asleep, unless someone woke it meanwhile (the row it is recorded
+        // against says so): then its resume is next.
+        Effect::Pause if c.tier != Tier::Awake => {
+            n.status = Status::Warm;
+            n.status_reason = None;
+        }
+        Effect::Pause => {}
+        // Woken: its service answered before the pause, and has the grace
+        // to answer again (`serving`); resumed to be stopped: nothing yet.
+        Effect::Resume if c.tier == Tier::Awake && c.desired == Desired::Running => {
+            n.served_at = Some(now);
+            n.status = Status::Starting;
+            n.status_reason = None;
+        }
+        Effect::Resume => {}
         Effect::Launch { .. } => {
             n.launched_at = Some(now);
+            // Its service answers anew, or the grace runs out: a service
+            // seen answering before this launch is not seen since.
+            n.served_at = None;
             n.status = Status::Starting;
         }
         Effect::Remove => {
@@ -147,6 +198,18 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
 
 fn failed(c: &Computer, effect: &Effect, fault: &Fault, now: Millis) -> Change {
     let mut n = c.clone();
+    if matches!(effect, Effect::Pause) {
+        // Sleep is the node's economy, never the computer's failure: a
+        // machine that would not pause (a guest that could not flush, so
+        // likely wedged) sleeps cold instead, its halt killing it if it
+        // must, and its next wake a fresh boot. Retrying the pause would
+        // hold a batch for its deadline every idle time. The executor logs
+        // the fault; a row woken meanwhile stays awake.
+        if c.tier == Tier::Warm {
+            n.tier = Tier::Cold;
+        }
+        return Change { row: Some(n), shipped: None };
+    }
     if effect.is_advisory() {
         // The executor logs the fault.
         return Change { row: Some(n), shipped: None };
@@ -210,6 +273,8 @@ fn served(n: &mut Computer, p: &Policy, now: Millis) {
     n.status = Status::Serving;
     n.status_reason = None;
     n.served_at = Some(now);
+    // Its service came up: an idle time from now before it may sleep.
+    n.active_at = n.active_at.max(now);
     n.failures = 0;
     n.retry_at = None;
     if !rolled_back {
@@ -260,6 +325,15 @@ pub fn goes_on(effect: &Effect, outcome: &Outcome) -> bool {
     !matches!(outcome, Outcome::Failed(_)) || effect.is_advisory()
 }
 
+/// What the batch knows after recording `note`: a sleep decided from its
+/// activity looks at it afresh before its machine is paused.
+pub fn learn_note(k: &mut Knowledge, note: &Note) {
+    if matches!(note, Note::Sleep { .. }) {
+        k.activity = None;
+        k.busy = None;
+    }
+}
+
 /// What the batch knows after `effect` answered `outcome`: a changed
 /// world is observed again rather than guessed.
 pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
@@ -301,6 +375,16 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
             k.synced = false;
         }
         Effect::Launch { .. } => k.probe = None,
+        Effect::Pause => {
+            k.machine = Machine::Paused;
+            k.probe = None;
+        }
+        Effect::Resume => {
+            k.machine = Machine::Running;
+            k.probe = None;
+            k.quiesced = false;
+            k.synced = false;
+        }
         Effect::Remove => {
             k.machine = Machine::Absent;
             k.probe = None;

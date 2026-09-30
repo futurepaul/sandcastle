@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use sandcastle_proto::Credential;
 
-use crate::model::{ChainLink, FaultKind, Millis, SnapshotKind, SnapshotName, Status, Step, Upload};
+use crate::model::{ChainLink, FaultKind, Millis, SnapshotKind, SnapshotName, Status, Step, Tier, Upload};
 
 /// The core's answer for one computer, now.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -33,6 +33,13 @@ pub enum Observe {
     /// Whether the node's memory reserve has room for this computer's
     /// machine (`need` bytes): a yes commits it (`budget::Ledger`).
     Room { need: u64 },
+    /// The newest activity the node has seen for it: requests through its
+    /// URL (now, while one is in flight), its guest's CPU and network over
+    /// their floors, a wake.
+    Activity,
+    /// Whether its service says it is working (`sandcastle_proto::Busy`):
+    /// a yes is activity.
+    Busy { port: u16, path: String, field: String },
 }
 
 /// What a new machine is made of.
@@ -88,6 +95,11 @@ pub enum Effect {
     /// dead values, because the source refused.
     Rotate { credentials: Vec<Credential>, withdraw: bool },
     Launch { argv: Vec<String>, env: BTreeMap<String, String> },
+    /// Freeze the machine, its memory kept, after its guest flushed its
+    /// writes to its disks.
+    Pause,
+    /// Thaw a paused machine.
+    Resume,
     Remove,
     StartUpload { key: String, snapshot: SnapshotName, base: Option<SnapshotName> },
     /// Stream the snapshot (from `base`), sealed, into the open upload.
@@ -112,6 +124,8 @@ impl Effect {
             Effect::Start { .. } => Step::Start,
             Effect::Rotate { .. } => Step::Rotate,
             Effect::Launch { .. } => Step::Launch,
+            Effect::Pause => Step::Pause,
+            Effect::Resume => Step::Resume,
             Effect::Remove => Step::Remove,
             Effect::StartUpload { .. } | Effect::Upload { .. } | Effect::AbortUpload { .. } => Step::Ship,
             Effect::WriteManifest => Step::Manifest,
@@ -160,6 +174,20 @@ pub enum Note {
     DutiesDone,
     /// What a view shows, corrected to what is observed.
     Status { status: Status, reason: Option<String> },
+    /// Put it to sleep (`Tier::Warm` or `Tier::Cold`), having acted on the
+    /// activity at `active_at`: anything newer wakes it.
+    Sleep { tier: Tier, active_at: Millis },
+    /// Wake it for the activity at `active_at`.
+    Wake { active_at: Millis },
+    /// The node's machine is about to be replaced (a rebase, a lost or
+    /// crashed machine): the row forgets it first, so a create whose reply
+    /// is lost is never taken for the old machine (how to stop it, what
+    /// it runs).
+    Replace,
+    /// Another computer wants its room: a warm computer goes cold (and a
+    /// computer no longer warm stays as it is). The node decides this
+    /// across computers (`executor::Node::make_room`).
+    Demote,
 }
 
 /// Why a gate call failed, as the gate classifies it (never by matching

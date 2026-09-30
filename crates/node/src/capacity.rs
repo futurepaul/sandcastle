@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use sandcastle_core::budget::{self, Ledger, GIB, MIB};
 use sandcastle_core::model::{Computer, ComputerId, Desired, Fixed, Millis, Policy, Status};
-use sandcastle_proto::{CostsView, CountsView, DiskView, EngineDiskView, FitsView, MeasuredView, MemoryView, NodeReport, ReserveView, Storage};
+use sandcastle_proto::{CostsView, CountsView, DiskView, EngineDiskView, FitsView, MeasuredView, MemoryView, NodeReport, ReserveView, SleepView, Storage};
+
+use crate::activity::Floors;
 
 use crate::gates::{HostFacts, Sample};
 use crate::store::COMPUTERS_PER_NODE_MAX;
@@ -21,8 +23,9 @@ const FORGET_AFTER_MS: Millis = 60 * 60 * 1000;
 #[derive(Default)]
 pub struct Measures {
     machines: BTreeMap<ComputerId, Measured>,
-    /// The latest samples, whole.
+    /// The latest samples, whole, and when they were taken.
     pub latest: std::collections::HashMap<ComputerId, Sample>,
+    latest_at: Millis,
 }
 
 struct Measured {
@@ -30,23 +33,55 @@ struct Measured {
     limit: u64,
     layer: u64,
     resident: VecDeque<u64>,
+    /// CPU (thousandths of a vCPU) and network bytes a second between
+    /// samples, while it ran (a paused machine's are not rates).
+    cpu: VecDeque<u64>,
+    net: VecDeque<u64>,
+}
+
+fn keep(q: &mut VecDeque<u64>, v: u64) {
+    if q.len() == SAMPLES_KEPT {
+        q.pop_front();
+    }
+    q.push_back(v);
+    assert!(q.len() <= SAMPLES_KEPT);
 }
 
 impl Measures {
-    pub fn record(&mut self, now: Millis, samples: &std::collections::HashMap<ComputerId, Sample>) {
+    /// Records a sample of every machine, and answers each one's rates
+    /// since the last sample (`activity::rates`), for activity.
+    pub fn record(&mut self, now: Millis, samples: &std::collections::HashMap<ComputerId, Sample>) -> Vec<(ComputerId, (u32, u64))> {
+        let since = now.saturating_sub(self.latest_at);
+        let mut rates = Vec::new();
         for (id, s) in samples {
-            let m = self.machines.entry(*id).or_insert_with(|| Measured { at: now, limit: s.limit, layer: s.layer, resident: VecDeque::with_capacity(SAMPLES_KEPT) });
-            if m.resident.len() == SAMPLES_KEPT {
-                m.resident.pop_front();
+            let m = self.machines.entry(*id).or_insert_with(|| Measured {
+                at: now,
+                limit: s.limit,
+                layer: s.layer,
+                resident: VecDeque::with_capacity(SAMPLES_KEPT),
+                cpu: VecDeque::with_capacity(SAMPLES_KEPT),
+                net: VecDeque::with_capacity(SAMPLES_KEPT),
+            });
+            keep(&mut m.resident, s.resident);
+            if let (Some(before), true) = (self.latest.get(id), since > 0) {
+                let r = crate::activity::rates(before, s, since);
+                // A frozen guest moves nothing: its zeros are not an idle
+                // guest's rates.
+                if s.cpu_ns != before.cpu_ns {
+                    keep(&mut m.cpu, u64::from(r.0));
+                    keep(&mut m.net, r.1);
+                }
+                rates.push((*id, r));
             }
-            m.resident.push_back(s.resident);
             m.at = now;
             m.limit = s.limit;
             m.layer = s.layer;
         }
         self.machines.retain(|_, m| now.saturating_sub(m.at) < FORGET_AFTER_MS);
         self.latest = samples.clone();
+        self.latest_at = now;
         assert!(self.machines.len() <= 2 * COMPUTERS_PER_NODE_MAX as usize + samples.len(), "bounded by the machines seen within the hour");
+        rates
     }
 
     fn quantile(sorted: &[u64], q: u64) -> u64 {
@@ -61,6 +96,17 @@ impl Measures {
             .map(|(id, m)| {
                 let mut sorted: Vec<u64> = m.resident.iter().copied().collect();
                 sorted.sort_unstable();
+                let quantiles = |q: &VecDeque<u64>| {
+                    let mut v: Vec<u64> = q.iter().copied().collect();
+                    v.sort_unstable();
+                    if v.is_empty() {
+                        (0, 0)
+                    } else {
+                        (Self::quantile(&v, 50), Self::quantile(&v, 95))
+                    }
+                };
+                let (cpu_p50, cpu_p95) = quantiles(&m.cpu);
+                let (net_p50, net_p95) = quantiles(&m.net);
                 MeasuredView {
                     computer_id: id.hex(),
                     name: rows.iter().find(|c| c.id == *id).map(|c| c.name.clone()).unwrap_or_default(),
@@ -69,6 +115,10 @@ impl Measures {
                     resident_mib_p95: Self::quantile(&sorted, 95) / MIB,
                     resident_mib_max: sorted[sorted.len() - 1] / MIB,
                     layer_mib: m.layer / MIB,
+                    cpu_permille_p50: u32::try_from(cpu_p50).unwrap_or(u32::MAX),
+                    cpu_permille_p95: u32::try_from(cpu_p95).unwrap_or(u32::MAX),
+                    net_bytes_per_s_p50: net_p50,
+                    net_bytes_per_s_p95: net_p95,
                     samples: u32::try_from(sorted.len()).expect("at most SAMPLES_KEPT"),
                 }
             })
@@ -121,6 +171,8 @@ pub struct Inputs<'a> {
     pub measures: &'a Measures,
     /// The computer size `fits` answers for.
     pub size: (u32, u32),
+    /// What counts as a guest being active.
+    pub floors: Floors,
 }
 
 pub fn report(i: &Inputs<'_>) -> NodeReport {
@@ -157,7 +209,8 @@ pub fn report(i: &Inputs<'_>) -> NodeReport {
     let more_by_layers = reserve.engine_disk.saturating_sub(committed_layers) / costs.layer.max(1);
     let more_by_count = u64::from(COMPUTERS_PER_NODE_MAX).saturating_sub(i.rows.len() as u64);
     let waiting = i.rows.iter().filter(|c| c.status_reason.as_deref() == Some(sandcastle_core::plan::WAITING_FOR_ROOM)).count();
-    let running = i.rows.iter().filter(|c| c.desired == Desired::Running && c.status == Status::Serving).count();
+    let count = |status: Status| i.rows.iter().filter(|c| c.desired == Desired::Running && c.status == status).count();
+    let (running, warm, cold) = (count(Status::Serving), count(Status::Warm), count(Status::Cold));
     NodeReport {
         reserve: ReserveView { memory_mib: reserve.memory / MIB, disk_gib: reserve.disk / GIB, engine_disk_gib: reserve.engine_disk / GIB },
         costs: CostsView { machine_overhead_mib: costs.machine_overhead / MIB, snapshot_headroom_pct: costs.snapshot_headroom_pct, layer_gib: costs.layer / GIB },
@@ -188,8 +241,16 @@ pub fn report(i: &Inputs<'_>) -> NodeReport {
         computers: CountsView {
             total: u32::try_from(i.rows.len()).expect("bounded"),
             running: u32::try_from(running).expect("bounded"),
+            warm: u32::try_from(warm).expect("bounded"),
+            cold: u32::try_from(cold).expect("bounded"),
             waiting: u32::try_from(waiting).expect("bounded"),
         },
+        sleep: i.policy.sleep.map(|s| SleepView {
+            idle_after_s: s.idle_after_ms / 1000,
+            cold_after_s: s.cold_after_ms / 1000,
+            cpu_floor_permille: i.floors.cpu_permille,
+            net_floor_bytes_per_s: i.floors.net_bytes_per_s,
+        }),
         fits: FitsView {
             memory_mib: i.size.0,
             data_gib: i.size.1,
@@ -253,9 +314,12 @@ mod tests {
             ships: false,
             reserve: Reserve { memory: 16 * GIB, disk: 100 * GIB, engine_disk: 40 * GIB },
             costs: Costs { machine_overhead: 64 * MIB, snapshot_headroom_pct: 25, layer: 4 * GIB },
+            sleep: None,
             node: "n".into(),
         }
     }
+
+    const FLOORS: Floors = Floors { cpu_permille: 50, net_bytes_per_s: 4096 };
 
     /// One computer of 4 GiB and 10 GiB, made through the commands.
     fn one_computer(p: &Policy) -> Computer {
@@ -270,7 +334,7 @@ mod tests {
             storage: Storage::Data,
             data_gib: 10,
             data_path: "/data".into(),
-            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 80, health_path: "/".into(), env: Default::default() },
+            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 80, health_path: "/".into(), env: Default::default(), busy: None },
             url_auth: sandcastle_proto::UrlAuth::Owner,
             credentials_url: None,
         };
@@ -298,10 +362,10 @@ mod tests {
         samples.insert(row.id, Sample { resident: 425 * MIB, limit: 4 * GIB, layer: 3 * MIB, ..Sample::default() });
         let mut measures = Measures::default();
         for t in 0..10 {
-            measures.record(t * 10_000, &samples);
+            let _ = measures.record(t * 10_000, &samples);
         }
         let rows = [row];
-        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &rows, host: Ok(healthy()), samples: &samples, measures: &measures, size: (4096, 10) });
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &rows, host: Ok(healthy()), samples: &samples, measures: &measures, size: (4096, 10), floors: FLOORS });
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(r.memory.committed_mib, 4096 + 64);
         assert_eq!(r.fits.more_running, 2, "(16 GiB − 4.06) / 4.06");
@@ -320,15 +384,15 @@ mod tests {
         h.pool.quota = None;
         h.engine_disk.size = 10 * GIB;
         let samples = std::collections::HashMap::new();
-        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(h), samples: &samples, measures: &Measures::default(), size: (4096, 10) });
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(h), samples: &samples, measures: &Measures::default(), size: (4096, 10), floors: FLOORS });
         let all = r.warnings.join(" | ");
         for want in ["no MemoryMax", "other processes use", "no quota", "smaller than its reserve"] {
             assert!(all.contains(want), "{want}: {all}");
         }
-        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Err("df failed".into()), samples: &samples, measures: &Measures::default(), size: (4096, 10) });
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Err("df failed".into()), samples: &samples, measures: &Measures::default(), size: (4096, 10), floors: FLOORS });
         assert!(r.warnings.iter().any(|w| w.contains("df failed")));
         let orphan = std::collections::HashMap::from([(ComputerId::from_bytes([9; 8]), Sample { resident: MIB, ..Sample::default() })]);
-        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(healthy()), samples: &orphan, measures: &Measures::default(), size: (4096, 10) });
+        let r = report(&Inputs { policy: &p, ledger: &ledger, rows: &[], host: Ok(healthy()), samples: &orphan, measures: &Measures::default(), size: (4096, 10), floors: FLOORS });
         assert!(r.warnings.iter().any(|w| w.contains("with no computer") && w.contains(&ComputerId::from_bytes([9; 8]).hex())), "{:?}", r.warnings);
     }
 
@@ -353,10 +417,10 @@ mod tests {
         let mut m = Measures::default();
         let one = std::collections::HashMap::from([(ComputerId::from_bytes([1; 8]), Sample { resident: MIB, ..Sample::default() })]);
         for t in 0..(SAMPLES_KEPT as u64 + 50) {
-            m.record(t, &one);
+            let _ = m.record(t, &one);
         }
         assert_eq!(m.machines[&ComputerId::from_bytes([1; 8])].resident.len(), SAMPLES_KEPT);
-        m.record(FORGET_AFTER_MS + 1_000, &std::collections::HashMap::new());
+        let _ = m.record(FORGET_AFTER_MS + 1_000, &std::collections::HashMap::new());
         assert!(m.machines.is_empty());
     }
 }

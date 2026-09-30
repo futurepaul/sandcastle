@@ -82,10 +82,13 @@ pub struct Generation {
     pub credentials_url: Option<String>,
     /// The image's own init runs the service (`argv` is then empty).
     pub init: Option<sandcastle_proto::Init>,
+    /// How to ask the service whether it is working, before it sleeps.
+    pub busy: Option<sandcastle_proto::Busy>,
 }
 
 impl Generation {
-    /// Whether `other` makes the same machine (the number aside).
+    /// Whether `other` makes the same machine (the number aside). `busy`
+    /// counts too: a generation carries it, so a new one is numbered.
     pub fn same_machine(&self, other: &Generation) -> bool {
         self.image == other.image
             && self.argv == other.argv
@@ -94,6 +97,7 @@ impl Generation {
             && self.env == other.env
             && self.credentials_url == other.credentials_url
             && self.init == other.init
+            && self.busy == other.busy
     }
 }
 
@@ -124,6 +128,8 @@ pub enum Step {
     Rotate,
     Launch,
     Grace,
+    Pause,
+    Resume,
     Remove,
     Destroy,
     Ship,
@@ -145,6 +151,8 @@ impl Step {
             Step::Rotate => "rotate",
             Step::Launch => "launch",
             Step::Grace => "grace",
+            Step::Pause => "pause",
+            Step::Resume => "resume",
             Step::Remove => "remove",
             Step::Destroy => "destroy",
             Step::Ship => "ship",
@@ -166,6 +174,8 @@ impl Step {
             Step::Rotate,
             Step::Launch,
             Step::Grace,
+            Step::Pause,
+            Step::Resume,
             Step::Remove,
             Step::Destroy,
             Step::Ship,
@@ -213,6 +223,9 @@ pub enum SnapshotKind {
     Stop,
     /// After the old machine stopped, before a rebase replaced it.
     Rebase,
+    /// After the machine paused (its guest flushed first): what it wrote
+    /// before it slept, backed up while it sleeps.
+    Pause,
 }
 
 impl SnapshotKind {
@@ -221,6 +234,7 @@ impl SnapshotKind {
             SnapshotKind::Auto => "auto",
             SnapshotKind::Stop => "stop",
             SnapshotKind::Rebase => "rebase",
+            SnapshotKind::Pause => "pause",
         }
     }
 
@@ -229,6 +243,7 @@ impl SnapshotKind {
             "auto" => Some(SnapshotKind::Auto),
             "stop" => Some(SnapshotKind::Stop),
             "rebase" => Some(SnapshotKind::Rebase),
+            "pause" => Some(SnapshotKind::Pause),
             _ => None,
         }
     }
@@ -348,6 +363,9 @@ pub enum Status {
     Absent,
     Starting,
     Serving,
+    /// Asleep: its machine paused, or stopped.
+    Warm,
+    Cold,
     Stopped,
     Failed,
 }
@@ -358,6 +376,8 @@ impl Status {
             Status::Absent => "absent",
             Status::Starting => "starting",
             Status::Serving => "serving",
+            Status::Warm => "warm",
+            Status::Cold => "cold",
             Status::Stopped => "stopped",
             Status::Failed => "failed",
         }
@@ -368,8 +388,42 @@ impl Status {
             "absent" => Some(Status::Absent),
             "starting" => Some(Status::Starting),
             "serving" => Some(Status::Serving),
+            "warm" => Some(Status::Warm),
+            "cold" => Some(Status::Cold),
             "stopped" => Some(Status::Stopped),
             "failed" => Some(Status::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// How awake the node keeps a computer it runs (docs/sandcastle-sleep.md,
+/// Tiers): the node's intent, which the machine converges to. The owner
+/// wants it running; whether its machine is awake is the node's economy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Its machine runs.
+    Awake,
+    /// Its machine is paused, its memory kept: a wake is milliseconds.
+    Warm,
+    /// Its machine is stopped, its disk kept: a wake is a boot.
+    Cold,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Awake => "awake",
+            Tier::Warm => "warm",
+            Tier::Cold => "cold",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Tier> {
+        match s {
+            "awake" => Some(Tier::Awake),
+            "warm" => Some(Tier::Warm),
+            "cold" => Some(Tier::Cold),
             _ => None,
         }
     }
@@ -413,6 +467,14 @@ pub struct Computer {
     pub credentials_at: Option<Millis>,
     pub restore: Option<Restore>,
     pub ship: Ship,
+    /// How awake the node keeps it, and since when it has slept (None
+    /// while awake).
+    pub tier: Tier,
+    pub slept_at: Option<Millis>,
+    /// The last activity the node acted on: its making, what it slept
+    /// after, what woke it, or when its service came up. Newer activity
+    /// wakes it; it only moves forward.
+    pub active_at: Millis,
     pub status: Status,
     pub status_reason: Option<String>,
     /// Bumped by every write.
@@ -444,8 +506,10 @@ impl Computer {
 pub enum Machine {
     Absent,
     Running,
+    /// Paused, its memory kept: it takes no exec and no graceful stop.
+    Paused,
     Stopped,
-    /// Anything else the engine says (crashed, paused): not up.
+    /// Anything else the engine says (crashed, half made): not up.
     Other,
 }
 
@@ -502,12 +566,39 @@ pub struct Knowledge {
     pub disk_ready: bool,
     /// Whether the node's memory reserve admitted this computer's machine.
     pub room: Option<bool>,
+    /// What the node has seen it doing.
+    pub activity: Option<Seen>,
+    /// Whether its service says it is working.
+    pub busy: Option<bool>,
 }
 
 impl Knowledge {
     pub fn new(machine: Machine) -> Knowledge {
-        Knowledge { machine, disk: None, probe: None, credentials: None, quiesced: false, synced: false, disk_ready: false, room: None }
+        Knowledge { machine, disk: None, probe: None, credentials: None, quiesced: false, synced: false, disk_ready: false, room: None, activity: None, busy: None }
     }
+}
+
+/// What the node has seen a computer doing (`Observe::Activity`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Seen {
+    /// Its newest activity; None when none since the node started.
+    pub last: Option<Millis>,
+    /// A request through its URL is in flight: active now, whatever the
+    /// clock says.
+    pub in_flight: bool,
+}
+
+impl Seen {
+    pub const NOTHING: Seen = Seen { last: None, in_flight: false };
+}
+
+/// When the node puts a computer to sleep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sleep {
+    /// Awake with no activity this long, and not busy: warm.
+    pub idle_after_ms: u64,
+    /// Warm this long: cold.
+    pub cold_after_ms: u64,
 }
 
 /// The node's settings the core decides with.
@@ -523,5 +614,7 @@ pub struct Policy {
     /// its guest's memory and a disk beyond its volume.
     pub reserve: crate::budget::Reserve,
     pub costs: crate::budget::Costs,
+    /// None: computers stay awake while they run.
+    pub sleep: Option<Sleep>,
     pub node: String,
 }

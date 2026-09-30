@@ -18,7 +18,7 @@ use sandcastle_core::step::GateError;
 use sandcastle_node::commands::{self, CommandError, Put, RestorePlan};
 use sandcastle_node::gates::{Disks, Source, World};
 use sandcastle_node::store::StoreError;
-use sandcastle_proto::{BackupList, BackupView, ComputerList, ComputerSpec, GrantSpec, SnapshotList, SnapshotView, Storage, Ticket, TICKET_TTL_S};
+use sandcastle_proto::{BackupList, BackupView, ComputerList, ComputerSpec, GrantSpec, SleepAsk, SnapshotList, SnapshotView, Storage, Ticket, TICKET_TTL_S};
 
 use crate::daemon::{token_hash, Daemon};
 use crate::http::{error, json, Body};
@@ -132,8 +132,22 @@ pub async fn handle<W: World>(d: &Daemon<W>, req: Request<Incoming>) -> Resp {
         (&Method::POST, ["v1", "computers", name, "start"]) => desire(d, &signer, name, Desired::Running),
         (&Method::POST, ["v1", "computers", name, "stop"]) => desire(d, &signer, name, Desired::Stopped),
         (&Method::DELETE, ["v1", "computers", name]) => match commands::set_desired(store, &signer, name, Desired::Deleted, now) {
-            Ok(_) => json(StatusCode::ACCEPTED, &serde_json::json!({"deleting": name})),
+            Ok(c) => {
+                d.node.nudges.nudge(c.id);
+                json(StatusCode::ACCEPTED, &serde_json::json!({"deleting": name}))
+            }
             Err(e) => command_error(e),
+        },
+        (&Method::POST, ["v1", "computers", name, "wake"]) => wake(d, &signer, name),
+        (&Method::POST, ["v1", "computers", name, "sleep"]) => match parse::<SleepAsk>(&body) {
+            Ok(ask) => match commands::sleep_now(store, grantors, &signer, name, ask.tier, &d.node.policy, now) {
+                Ok(c) => {
+                    d.node.nudges.nudge(c.id);
+                    json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name)))
+                }
+                Err(e) => command_error(e),
+            },
+            Err(r) => *r,
         },
         (&Method::POST, ["v1", "computers", name, "tickets"]) => ticket(d, &signer, name),
         (&Method::GET, ["v1", "computers", name, "snapshots"]) => snapshots(d, &signer, name).await,
@@ -209,7 +223,26 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Box<Resp>> {
 
 fn desire<W: World>(d: &Daemon<W>, signer: &str, name: &str, desired: Desired) -> Resp {
     match commands::set_desired(&d.node.store, signer, name, desired, d.now()) {
-        Ok(c) => json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name))),
+        Ok(c) => {
+            d.node.nudges.nudge(c.id);
+            json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name)))
+        }
+        Err(e) => command_error(e),
+    }
+}
+
+/// Wakes a sleeping computer ahead of a request (its owner, or a grantor:
+/// a scheduler acting for it, before a job it fires), and steps it at
+/// once; an awake one is kept awake an idle time from now. 202: the view
+/// says `starting` until it serves; a request through its URL waits for
+/// that anyway.
+fn wake<W: World>(d: &Daemon<W>, signer: &str, name: &str) -> Resp {
+    match commands::wake_now(&d.node.store, &d.config.grantors, signer, name, d.now()) {
+        Ok(c) => {
+            d.node.activity.touch(c.id, d.now());
+            d.node.nudges.nudge(c.id);
+            json(StatusCode::ACCEPTED, &commands::view(&c, d.config.computer_url(&c.name)))
+        }
         Err(e) => command_error(e),
     }
 }
@@ -246,6 +279,7 @@ async fn put_computer<W: World>(d: &Daemon<W>, signer: &str, name: &str, query: 
     let id = d.node.new_id();
     match commands::put_computer(&d.node.store, signer, name, &spec, plan, id, d.config.ports(), &d.node.policy, d.now()) {
         Ok((c, put)) => {
+            d.node.nudges.nudge(c.id);
             let status = if put == Put::Created { StatusCode::CREATED } else { StatusCode::OK };
             json(status, &commands::view(&c, d.config.computer_url(&c.name)))
         }

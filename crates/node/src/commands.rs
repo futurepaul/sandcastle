@@ -8,7 +8,7 @@
 
 use rusqlite::{params, OptionalExtension};
 use sandcastle_core::budget;
-use sandcastle_core::model::{ChainLink, Computer, ComputerId, Desired, Fixed, Generation, Millis, Policy, Restore, Ship, Status};
+use sandcastle_core::model::{ChainLink, Computer, ComputerId, Desired, Fixed, Generation, Millis, Policy, Restore, Ship, Status, Tier};
 use sandcastle_proto::{ComputerSpec, ComputerView, GrantSpec, GrantView, Observed, Rollback, Storage};
 
 use crate::store::{self, Store, StoreError, COMPUTERS_PER_NODE_MAX};
@@ -114,7 +114,7 @@ pub fn delete_grant(store: &Store, grantors: &[String], signer: &str, pubkey: &s
         let id = ComputerId::parse(&hex).ok_or_else(|| StoreError::Corrupt(format!("computer id {hex:?}")))?;
         let before = store::read_in(&tx, id)?.ok_or_else(|| StoreError::Corrupt("a listed computer vanished".into()))?;
         let mut after = before.clone();
-        desire(&mut after, Desired::Stopped);
+        desire(&mut after, Desired::Stopped, now);
         store::update_computer(&tx, &before, &after, now)?;
     }
     tx.commit()?;
@@ -125,14 +125,28 @@ pub fn delete_grant(store: &Store, grantors: &[String], signer: &str, pubkey: &s
 
 /// Sets what the owner wants, and clears what an earlier attempt left: a
 /// new desire is a fresh start (and `start` is also the retry of a
-/// generation that was rolled back).
-fn desire(c: &mut Computer, desired: Desired) {
+/// generation that was rolled back). A start wakes it.
+fn desire(c: &mut Computer, desired: Desired, now: Millis) {
     assert_ne!(c.desired, Desired::Deleted, "nothing leaves deleted");
     c.desired = desired;
     c.failures = 0;
     c.retry_at = None;
     if desired == Desired::Running {
         c.failed_seq = None;
+        wake(c, now);
+    }
+}
+
+/// An owner's act on a sleeping computer wakes it: the node converges an
+/// awake computer to what its owner asked (a new generation is a new
+/// machine, which boots).
+fn wake(c: &mut Computer, now: Millis) {
+    c.tier = Tier::Awake;
+    c.slept_at = None;
+    c.active_at = c.active_at.max(now);
+    if matches!(c.status, Status::Warm | Status::Cold) {
+        c.status = Status::Starting;
+        c.status_reason = None;
     }
 }
 
@@ -147,6 +161,7 @@ fn generation_of(spec: &ComputerSpec, seq: u32) -> Generation {
         env: spec.service.env.clone(),
         credentials_url: spec.credentials_url.clone(),
         init: spec.service.init.clone(),
+        busy: spec.service.busy.clone(),
     }
 }
 
@@ -169,6 +184,7 @@ pub fn spec_of(c: &Computer) -> ComputerSpec {
             port: c.spec.port,
             health_path: c.spec.health_path.clone(),
             env: c.spec.env.clone(),
+            busy: c.spec.busy.clone(),
         },
         url_auth: c.url_auth,
         credentials_url: c.spec.credentials_url.clone(),
@@ -275,6 +291,9 @@ fn create(
         credentials_at: None,
         restore: restore.map(|r| Restore { source: r.source, chain: r.chain }),
         ship: Ship::default(),
+        tier: Tier::Awake,
+        slept_at: None,
+        active_at: now,
         status: Status::Absent,
         status_reason: None,
         version: 1,
@@ -351,10 +370,11 @@ fn converge(tx: &rusqlite::Transaction<'_>, signer: &str, current: &Computer, sp
     if !wanted.same_machine(&current.spec) {
         let seq = current.spec.seq.checked_add(1).filter(|s| *s <= sandcastle_core::limits::GENERATION_SEQ_MAX).ok_or(CommandError::Invalid("this computer has had too many generations".into()))?;
         next.spec = generation_of(spec, seq);
-        // A new generation is a fresh attempt.
+        // A new generation is a fresh attempt, on a machine awake.
         next.failed_seq = None;
         next.failures = 0;
         next.retry_at = None;
+        wake(&mut next, now);
     }
     let written = store::update_computer(tx, current, &next, now)?;
     Ok((written, Put::Updated))
@@ -387,7 +407,79 @@ pub fn set_desired(store: &Store, signer: &str, name: &str, desired: Desired, no
         return Ok(current);
     }
     let mut next = current.clone();
-    desire(&mut next, desired);
+    desire(&mut next, desired, now);
+    let written = store::update_computer(&tx, &current, &next, now)?;
+    tx.commit()?;
+    Ok(written)
+}
+
+/// Wakes a sleeping computer now (`POST .../wake`), its owner's or a
+/// grantor's call (a scheduler acting for it, before a job it fires):
+/// written to its row, so a restart keeps it. An awake computer, or one
+/// not meant to run, answers as it is.
+pub fn wake_now(store: &Store, grantors: &[String], signer: &str, name: &str, now: Millis) -> Result<Computer, CommandError> {
+    let mut conn = store.conn();
+    let tx = conn.transaction()?;
+    let hex: Option<String> = tx.query_row("SELECT id FROM computers WHERE name = ?1", params![name], |r| r.get(0)).optional()?;
+    let Some(hex) = hex else { return Err(CommandError::NotFound) };
+    let id = ComputerId::parse(&hex).ok_or_else(|| StoreError::Corrupt(format!("computer id {hex:?}")))?;
+    let current = store::read_in(&tx, id)?.ok_or_else(|| StoreError::Corrupt("a named computer vanished".into()))?;
+    if current.owner != signer && !grantors.iter().any(|g| g == signer) {
+        return Err(CommandError::NotFound);
+    }
+    if current.desired == Desired::Deleted {
+        return Err(CommandError::Deleting);
+    }
+    if current.tier == Tier::Awake || current.desired != Desired::Running {
+        return Ok(current);
+    }
+    let mut next = current.clone();
+    wake(&mut next, now);
+    let written = store::update_computer(&tx, &current, &next, now)?;
+    tx.commit()?;
+    Ok(written)
+}
+
+/// Puts a running computer to sleep now (`POST .../sleep`), its owner's or
+/// a grantor's call: warm pauses it, cold stops it; any request wakes it
+/// again. Only a node that sleeps computers does; a computer that is not
+/// serving (starting, failed, stopped) is refused. Asking again, or for
+/// warm when it is colder, answers the same.
+pub fn sleep_now(store: &Store, grantors: &[String], signer: &str, name: &str, tier: sandcastle_proto::SleepTier, policy: &Policy, now: Millis) -> Result<Computer, CommandError> {
+    if policy.sleep.is_none() {
+        return Err(CommandError::Invalid("this node never puts computers to sleep".into()));
+    }
+    let mut conn = store.conn();
+    let tx = conn.transaction()?;
+    let hex: Option<String> = tx.query_row("SELECT id FROM computers WHERE name = ?1", params![name], |r| r.get(0)).optional()?;
+    let Some(hex) = hex else { return Err(CommandError::NotFound) };
+    let id = ComputerId::parse(&hex).ok_or_else(|| StoreError::Corrupt(format!("computer id {hex:?}")))?;
+    let current = store::read_in(&tx, id)?.ok_or_else(|| StoreError::Corrupt("a named computer vanished".into()))?;
+    if current.owner != signer && !grantors.iter().any(|g| g == signer) {
+        // Someone else's computer reads as missing.
+        return Err(CommandError::NotFound);
+    }
+    let want = match tier {
+        sandcastle_proto::SleepTier::Warm => Tier::Warm,
+        sandcastle_proto::SleepTier::Cold => Tier::Cold,
+    };
+    let colder = |t: Tier| match t {
+        Tier::Awake => 0,
+        Tier::Warm => 1,
+        Tier::Cold => 2,
+    };
+    if colder(current.tier) >= colder(want) {
+        return Ok(current);
+    }
+    let asleep = current.tier != Tier::Awake;
+    if current.desired != Desired::Running || !(asleep || current.status == Status::Serving) {
+        return Err(CommandError::Invalid("only a serving computer is put to sleep".into()));
+    }
+    let mut next = current.clone();
+    next.tier = want;
+    next.slept_at = Some(current.slept_at.unwrap_or(now));
+    // Acted on as of now: a request after this wakes it.
+    next.active_at = current.active_at.max(now);
     let written = store::update_computer(&tx, &current, &next, now)?;
     tx.commit()?;
     Ok(written)
@@ -423,12 +515,15 @@ pub fn view(c: &Computer, url: String) -> ComputerView {
         Status::Absent => Observed::Absent,
         Status::Starting => Observed::Starting,
         Status::Serving => Observed::Serving,
+        Status::Warm => Observed::Warm,
+        Status::Cold => Observed::Cold,
         Status::Stopped => Observed::Stopped,
         Status::Failed => Observed::Failed { reason },
     };
     let (target, rolled_back) = c.target();
     let settled = match c.desired {
-        Desired::Running => c.applied_seq == Some(target.seq) && matches!(c.status, Status::Serving | Status::Failed) && c.restore.is_none(),
+        // Asleep is settled: sleep is the node's to choose, not pending.
+        Desired::Running => c.applied_seq == Some(target.seq) && matches!(c.status, Status::Serving | Status::Warm | Status::Cold | Status::Failed) && c.restore.is_none(),
         Desired::Stopped => matches!(c.status, Status::Stopped | Status::Absent | Status::Failed),
         Desired::Deleted => false,
     };

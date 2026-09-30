@@ -71,7 +71,9 @@ async fn serve(config: Serve) -> Result<(), String> {
     };
     let world = Live { engine, disks, objects, source, prober: TcpProber, clock: SystemClock, random: OsRandom };
     let part_bytes = usize::try_from(config.backup_part_mib).expect("checked") * 1024 * 1024;
-    let node = Arc::new(Node::new(store, world, config.policy(), backup_key, part_bytes));
+    let mut node = Node::new(store, world, config.policy(), backup_key, part_bytes).map_err(|e| format!("the node's state: {e}"))?;
+    node.floors = config.sleep.floors();
+    let node = Arc::new(node);
     eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
     let daemon = Arc::new(Daemon::new(config, node.clone()));
     // Computers keep running when the daemon stops: a restart picks them

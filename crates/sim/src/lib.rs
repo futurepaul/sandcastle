@@ -12,7 +12,7 @@ pub mod world;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use sandcastle_core::model::{ComputerId, Desired, FaultKind, Knowledge, Machine, Policy, Status};
+use sandcastle_core::model::{ComputerId, Desired, FaultKind, Knowledge, Machine, Policy, Sleep, Status, Tier};
 use sandcastle_core::step::Next;
 use sandcastle_node::commands::{self, Put, RestorePlan};
 use sandcastle_node::executor::Node;
@@ -54,6 +54,10 @@ pub struct Stats {
     pub wedges: u64,
     pub kills: u64,
     pub waits: u64,
+    pub pauses: u64,
+    pub wakes: u64,
+    pub colds: u64,
+    pub demotions: u64,
 }
 
 pub struct Sim {
@@ -68,6 +72,8 @@ pub struct Sim {
     /// What each restore must bring back: the target's content.
     restores: HashMap<ComputerId, u64>,
     secret_serial: u64,
+    /// Requests through computers' URLs that have not ended.
+    open_requests: Vec<ComputerId>,
     pub actions: u64,
 }
 
@@ -82,6 +88,12 @@ fn memory_reserve(seed: u64) -> u64 {
     }
 }
 
+/// Every fifth seed's node never sleeps computers; the rest sleep them
+/// after a minute idle, and cold after an hour warm.
+fn sleep(seed: u64) -> Option<Sleep> {
+    (!seed.is_multiple_of(5)).then_some(Sleep { idle_after_ms: 60_000, cold_after_ms: 3_600_000 })
+}
+
 fn policy(seed: u64) -> Policy {
     Policy {
         startup_grace_ms: 120_000,
@@ -91,6 +103,7 @@ fn policy(seed: u64) -> Policy {
         ships: true,
         reserve: sandcastle_core::budget::Reserve { memory: memory_reserve(seed), disk: 1 << 40, engine_disk: 1 << 40 },
         costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        sleep: sleep(seed),
         node: "sim".into(),
     }
 }
@@ -116,7 +129,7 @@ impl Sim {
         for owner in OWNERS {
             commands::put_grant(&store, &[GRANTOR.to_string()], GRANTOR, owner, grant(), 0).expect("a grant");
         }
-        let node = Node::new(store, world.clone(), policy(seed), Some(key.clone()), sandcastle_node::seal::CHUNK_BYTES);
+        let node = Node::new(store, world.clone(), policy(seed), Some(key.clone()), sandcastle_node::seal::CHUNK_BYTES).expect("a node");
         let mut sim = Sim {
             stats: Stats::default(),
             seed,
@@ -128,6 +141,7 @@ impl Sim {
             key,
             restores: HashMap::new(),
             secret_serial: 0,
+            open_requests: vec![],
             actions: 0,
         };
         sim.set_source(true);
@@ -165,7 +179,12 @@ impl Sim {
             // A third of the computers run their service under their image's init.
             service: Service {
                 argv: if init { vec![] } else { vec!["/bin/serve".into()] },
-                init: init.then(|| sandcastle_proto::Init { argv: vec!["/init".into(), "serve".into()], stop: vec!["/halt".into()] }), port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH".to_string(), "x".to_string())]) },
+                init: init.then(|| sandcastle_proto::Init { argv: vec!["/init".into(), "serve".into()], stop: vec!["/halt".into()] }), port: 9119,
+                health_path: "/health".into(),
+                env: BTreeMap::from([("DASH".to_string(), "x".to_string())]),
+                // Half the computers say whether they are busy.
+                busy: self.rng.chance(500).then(|| sandcastle_proto::Busy { path: "/busy".into(), field: "active".into() }),
+            },
             url_auth: UrlAuth::Owner,
             credentials_url: self.rng.chance(400).then(|| CREDENTIALS_URL.to_string()),
         }
@@ -175,11 +194,12 @@ impl Sim {
     pub async fn act(&mut self) {
         self.actions += 1;
         match self.rng.below(100) {
-            0..=44 => self.node_batch().await,
-            45..=61 => self.advance(),
-            62..=77 => self.command().await,
-            78..=91 => self.guest(),
-            92..=97 => self.weather(),
+            0..=41 => self.node_batch().await,
+            42..=56 => self.advance().await,
+            57..=70 => self.command().await,
+            71..=82 => self.guest(),
+            83..=89 => self.traffic(),
+            90..=96 => self.weather(),
             _ => self.crash(),
         }
         self.check(false);
@@ -188,16 +208,20 @@ impl Sim {
     fn crash(&mut self) {
         self.stats.crashes += 1;
         self.knowledge.clear();
-        // The ledger lives in the process: a restarted node adopts what it
-        // finds running at its next reconcile.
-        *self.node.ledger.lock().expect("never poisoned") = sandcastle_core::budget::Ledger::new(self.node.policy.reserve.memory);
-        if self.rng.chance(300) {
+        // The process's memory is gone: its ledger (a restarted node adopts
+        // what it finds running at its next reconcile), what it saw
+        // computers doing, the requests it was carrying.
+        self.open_requests.clear();
+        let store = if self.rng.chance(300) {
             // The process comes back from its file.
-            self.node.store = Store::open(&self.path).expect("the store reopens");
-        }
+            Store::open(&self.path).expect("the store reopens")
+        } else {
+            std::mem::replace(&mut self.node.store, Store::in_memory().expect("a placeholder"))
+        };
+        self.node = Node::new(store, self.world.clone(), policy(self.seed), Some(self.key.clone()), sandcastle_node::seal::CHUNK_BYTES).expect("a node restarts");
     }
 
-    fn advance(&mut self) {
+    async fn advance(&mut self) {
         let by = match self.rng.below(4) {
             0 => 1_000,
             1 => 30_000,
@@ -205,8 +229,35 @@ impl Sim {
             _ => 600_000,
         };
         self.world.lock().now += by;
-        // A new tick: the engine is listed again.
+        // A new tick: the engine is listed again, and measured.
         self.knowledge.clear();
+        let listing: HashMap<ComputerId, Machine> = self.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
+        self.node.sample(&listing).await;
+    }
+
+    /// Someone uses a computer's URL: a request that comes and goes, one
+    /// that stays open (a streamed answer), or the end of one.
+    fn traffic(&mut self) {
+        let ids = self.node.store.ids().expect("ids");
+        if ids.is_empty() {
+            return;
+        }
+        let id = ids[self.rng.below(ids.len() as u64) as usize];
+        let now = self.now();
+        match self.rng.below(4) {
+            0 | 1 => self.node.activity.touch(id, now),
+            2 if self.open_requests.len() < 8 => {
+                self.node.activity.begin(id, now);
+                self.open_requests.push(id);
+            }
+            _ => {
+                if !self.open_requests.is_empty() {
+                    let at = self.rng.below(self.open_requests.len() as u64) as usize;
+                    let ended = self.open_requests.swap_remove(at);
+                    self.node.activity.end(ended, now);
+                }
+            }
+        }
     }
 
     fn machine_of(&self, id: ComputerId) -> Machine {
@@ -230,6 +281,13 @@ impl Sim {
         // As the scheduler's tick does before it starts a batch.
         let listing: HashMap<ComputerId, Machine> = self.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
         self.node.reconcile(&listing, &std::collections::HashSet::new()).expect("reconcile");
+        let before: Vec<(ComputerId, Tier)> = self.tiers();
+        self.node.make_room(&std::collections::HashSet::new()).expect("make room");
+        for (id, tier) in before {
+            if tier == Tier::Warm && self.node.store.load(id).expect("load").is_some_and(|c| c.tier == Tier::Cold) {
+                self.stats.demotions += 1;
+            }
+        }
         for _ in 0..sandcastle_core::limits::STEPS_PER_TICK_MAX {
             if !self.node_step(id, crashes).await {
                 break;
@@ -253,11 +311,14 @@ impl Sim {
             Next::Note(n) => {
                 match &n {
                     sandcastle_core::step::Note::Served { .. } => self.stats.served += 1,
+                    sandcastle_core::step::Note::Wake { .. } => self.stats.wakes += 1,
+                    sandcastle_core::step::Note::Sleep { tier: Tier::Cold, .. } => self.stats.colds += 1,
                     sandcastle_core::step::Note::Status { reason: Some(r), .. } if r == sandcastle_core::plan::WAITING_FOR_ROOM => self.stats.waits += 1,
                     sandcastle_core::step::Note::RestoreDone { .. } => self.stats.restores_done += 1,
                     _ => {}
                 }
                 self.node.record_note(id, &n).expect("note");
+                sandcastle_core::learn_note(&mut k, &n);
                 self.after_record(&c);
                 self.knowledge.insert(id, k);
                 true
@@ -271,6 +332,9 @@ impl Sim {
                     return false;
                 }
                 self.node.record(id, &effect, &outcome).expect("record");
+                if matches!((&effect, &outcome), (sandcastle_core::step::Effect::Pause, sandcastle_core::step::Outcome::Done)) {
+                    self.node.settle_paused(id).await;
+                }
                 self.after_record(&c);
                 sandcastle_core::learn(&mut k, &effect, &outcome);
                 self.knowledge.insert(id, k);
@@ -282,6 +346,11 @@ impl Sim {
             return false;
         }
         more
+    }
+
+    fn tiers(&self) -> Vec<(ComputerId, Tier)> {
+        let ids = self.node.store.ids().expect("ids");
+        ids.into_iter().filter_map(|id| self.node.store.load(id).expect("load").map(|c| (id, c.tier))).collect()
     }
 
     /// A rollback is only ever for the spec's own fault: checked at the
@@ -306,6 +375,7 @@ impl Sim {
             Effect::Upload { .. } => self.stats.shipped += 1,
             Effect::DeleteRow => self.stats.deleted += 1,
             Effect::Stop { force: true } => self.stats.kills += 1,
+            Effect::Pause => self.stats.pauses += 1,
             Effect::Rotate { withdraw: false, .. } => self.stats.rotations += 1,
             Effect::Rotate { withdraw: true, .. } => self.stats.withdrawals += 1,
             _ => {}
@@ -400,18 +470,30 @@ impl Sim {
     /// The guest writes, a service dies, or a machine crashes.
     fn guest(&mut self) {
         let mut w = self.world.lock();
-        let running: Vec<ComputerId> = w.machines.iter().filter(|(_, m)| m.state == Machine::Running).map(|(id, _)| *id).collect();
-        if running.is_empty() {
+        let up: Vec<ComputerId> = w.machines.iter().filter(|(_, m)| matches!(m.state, Machine::Running | Machine::Paused)).map(|(id, _)| *id).collect();
+        if up.is_empty() {
             return;
         }
-        let id = running[self.rng.below(running.len() as u64) as usize];
-        match self.rng.below(10) {
-            0..=6 => {
-                let alive = w.machines[&id].service_alive;
+        let id = up[self.rng.below(up.len() as u64) as usize];
+        let what = self.rng.below(10);
+        if w.machines[&id].state == Machine::Paused && what != 9 {
+            // A frozen guest does nothing; its VMM may still die.
+            return;
+        }
+        match what {
+            0..=5 => {
+                let m = w.machines.get_mut(&id).expect("up");
+                // Work: a second of CPU, far over the activity floor.
+                m.cpu_ns += 1_000_000_000;
+                let alive = m.service_alive;
                 if let (true, Some(d)) = (alive, w.disks.get_mut(&id)) {
                     d.content += 1;
                     d.written += 4096;
                 }
+            }
+            6 => {
+                let m = w.machines.get_mut(&id).expect("up");
+                m.busy = !m.busy;
             }
             7 => w.machines.get_mut(&id).expect("running").service_alive = false,
             8 => {
@@ -539,13 +621,29 @@ impl Sim {
             Desired::Running if !broken && waiting => {
                 assert!(free < need, "seed {seed}: {} waits for room, but {} MiB of the reserve are free and it needs {}", c.name, free >> 20, need >> 20);
             }
-            Desired::Running if !broken => {
-                assert_eq!(c.status, Status::Serving, "seed {seed}: {} is {:?}: {:?}; the last calls:\n  {story}", c.name, c.status, c.status_reason);
-                assert_eq!(c.applied_seq, Some(target.seq), "seed {seed}: {} runs a stale generation", c.name);
-                assert!(machine.is_some_and(|m| m.service_alive), "seed {seed}: {} does not answer", c.name);
-            }
+            Desired::Running if !broken => match c.tier {
+                Tier::Awake => {
+                    assert_eq!(c.status, Status::Serving, "seed {seed}: {} is {:?}: {:?}; the last calls:\n  {story}", c.name, c.status, c.status_reason);
+                    assert_eq!(c.applied_seq, Some(target.seq), "seed {seed}: {} runs a stale generation", c.name);
+                    assert!(machine.is_some_and(|m| m.service_alive && m.state == Machine::Running), "seed {seed}: {} does not answer", c.name);
+                }
+                Tier::Warm => {
+                    assert_eq!(c.status, Status::Warm, "seed {seed}: {} is warm but says {:?}; the last calls:\n  {story}", c.name, c.status);
+                    assert!(machine.is_some_and(|m| m.state == Machine::Paused), "seed {seed}: {} is warm but its machine is not paused", c.name);
+                }
+                Tier::Cold => {
+                    assert_eq!(c.status, Status::Cold, "seed {seed}: {} is cold but says {:?}; the last calls:\n  {story}", c.name, c.status);
+                    assert!(machine.is_none_or(|m| !matches!(m.state, Machine::Running | Machine::Paused)), "seed {seed}: {} is cold but its machine is up", c.name);
+                    let held = self.node.ledger.lock().expect("never poisoned").holds(c.id);
+                    assert_eq!(held, None, "seed {seed}: {} is cold and still holds room", c.name);
+                }
+            },
             Desired::Stopped => assert!(machine.is_none_or(|m| m.state != Machine::Running), "seed {seed}: {} still runs", c.name),
             _ => {}
+        }
+        if c.desired == Desired::Running && c.tier != Tier::Awake && !broken {
+            let written = w.disks.get(&c.id).map_or(0, |d| d.written);
+            assert_eq!(written, 0, "seed {seed}: {} sleeps with writes never snapshotted; the last calls:\n  {story}", c.name);
         }
         if c.has_disk() && w.disks.contains_key(&c.id) && c.restore.is_none() {
             assert!(c.ship.upload.is_none(), "seed {seed}: {} left an upload open: {:?}; the last calls:\n  {story}", c.name, c.ship);
@@ -580,26 +678,52 @@ impl Sim {
         }
     }
 
-    /// Faults off, the source answering, the guest quiet: ticks until the
-    /// node converges, then the settled invariants.
+    /// Faults off, the source answering, the guests quiet and idle, no
+    /// requests: ticks until the node converges (on a node that sleeps
+    /// computers, asleep), then the settled invariants. Then a request to
+    /// every computer: each wakes and serves, or waits for room.
     pub async fn settle(&mut self) {
         {
             let mut w = self.world.lock();
             w.faults = Faults::NONE;
+            for m in w.machines.values_mut() {
+                m.busy = false;
+            }
+        }
+        let now = self.now();
+        for id in std::mem::take(&mut self.open_requests) {
+            self.node.activity.end(id, now);
         }
         self.set_source(false);
-        self.knowledge.clear();
-        // Bounded: a few hundred ticks is past every backoff and every step.
-        for _ in 0..300 {
-            self.world.lock().now += 30_000;
+        self.rounds(300, 30_000).await;
+        self.check(true);
+        // Everyone at once, as held requests are.
+        let ids = self.node.store.ids().expect("ids");
+        let now = self.now();
+        for id in &ids {
+            self.node.activity.begin(*id, now);
+        }
+        self.rounds(40, 1_000).await;
+        self.check(true);
+        let now = self.now();
+        for id in &ids {
+            self.node.activity.end(*id, now);
+        }
+    }
+
+    /// `n` ticks `ms` apart, every computer stepped, then the executor's
+    /// own tick, which must agree there is nothing left to do.
+    async fn rounds(&mut self, n: u32, ms: u64) {
+        for _ in 0..n {
+            self.world.lock().now += ms;
             self.knowledge.clear();
+            let listing: HashMap<ComputerId, Machine> = self.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
+            self.node.sample(&listing).await;
             for id in self.node.store.ids().expect("ids") {
                 self.batch(id, false).await;
             }
         }
-        // And the executor's own tick agrees there is nothing left to do.
         self.node.tick().await.expect("tick");
-        self.check(true);
     }
 
     pub fn cleanup(&self) {

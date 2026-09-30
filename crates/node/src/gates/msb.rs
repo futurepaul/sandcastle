@@ -29,6 +29,8 @@ const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(60);
 /// An exec of the node's own scripts: the stop script waits up to 10 s
 /// for the service, then syncs.
 const EXEC_DEADLINE: Duration = Duration::from_secs(45);
+/// A pause waits for the guest to flush what it has not written back.
+const PAUSE_DEADLINE: Duration = Duration::from_secs(60);
 /// `msb ls` of every machine on the host (a few hundred bytes each).
 const LIST_BYTES_MAX: usize = 4 * 1024 * 1024;
 const SMALL_BYTES_MAX: usize = 64 * 1024;
@@ -360,8 +362,8 @@ struct Listed {
     status: String,
 }
 
-/// The node's machines in `msb ls --format json`: `Running` and
-/// `Stopped` as they are; anything else (`Crashed`, `Created`, `Paused`,
+/// The node's machines in `msb ls --format json`: `Running`, `Paused`,
+/// and `Stopped` as they are; anything else (`Crashed`, `Created`,
 /// and `Starting` or `Draining`, which only a daemon that died mid-create
 /// or mid-stop leaves to be seen, since msb's create, start, and stop
 /// wait for their machine) is `Other`, which the core replaces after a
@@ -374,6 +376,7 @@ fn parse_list(text: &str) -> Option<HashMap<ComputerId, Machine>> {
         let Some(id) = ComputerId::of_machine(&m.name) else { continue };
         let state = match m.status.as_str() {
             "Running" => Machine::Running,
+            "Paused" => Machine::Paused,
             "Stopped" => Machine::Stopped,
             _ => Machine::Other,
         };
@@ -462,6 +465,18 @@ impl super::Engine for Msb {
     async fn sync(&self, id: ComputerId) -> GateResult<()> {
         self.exec("msb exec (sync)", id, &["/bin/sync".into()], &[]).await.map(|_| ())
     }
+
+    async fn pause(&self, id: ComputerId) -> GateResult<()> {
+        // `required`: the pause happens only after the guest flushed its
+        // writes, so a paused machine's disk holds what it wrote (msb 0.7.4
+        // pauses in about 8 ms; a second pause succeeds).
+        let args: Vec<String> = vec!["pause".into(), "--guest-flush".into(), "required".into(), "-q".into(), id.machine_name()];
+        self.run_ok("msb pause", &args, &[], &[], PAUSE_DEADLINE).await.map(|_| ())
+    }
+
+    async fn resume(&self, id: ComputerId) -> GateResult<()> {
+        self.run_ok("msb resume", &["resume".into(), "-q".into(), id.machine_name()], &[], &[], LIFECYCLE_DEADLINE).await.map(|_| ())
+    }
 }
 
 #[cfg(test)]
@@ -538,11 +553,12 @@ mod tests {
     #[test]
     fn the_list_is_read_whole() {
         let id = ComputerId::from_bytes([0xab; 8]);
-        let text = r#"[{"name":"sc-abababababababab","status":"Running","extra":1},{"name":"mine","status":"Running"},{"name":"sc-cdcdcdcdcdcdcdcd","status":"Crashed"}]"#;
+        let text = r#"[{"name":"sc-abababababababab","status":"Running","extra":1},{"name":"mine","status":"Running"},{"name":"sc-cdcdcdcdcdcdcdcd","status":"Crashed"},{"name":"sc-efefefefefefefef","status":"Paused"}]"#;
         let m = parse_list(text).unwrap();
         assert_eq!(m.get(&id), Some(&Machine::Running));
         assert_eq!(m.get(&ComputerId::from_bytes([0xcd; 8])), Some(&Machine::Other));
-        assert_eq!(m.len(), 2, "others' machines are not the node's");
+        assert_eq!(m.get(&ComputerId::from_bytes([0xef; 8])), Some(&Machine::Paused));
+        assert_eq!(m.len(), 3, "others' machines are not the node's");
         assert!(parse_list("not json").is_none());
         assert!(parse_list(r#"[{"name":"sc-abababababababab"}]"#).is_none(), "a machine with no status");
     }

@@ -61,6 +61,10 @@ pub struct SimMachine {
     pub hung: bool,
     /// Its image's init runs the service: it starts with each boot.
     pub init: bool,
+    /// Its service says it is working.
+    pub busy: bool,
+    /// vCPU time it has used.
+    pub cpu_ns: u64,
     pub credentials: Vec<Credential>,
 }
 
@@ -268,6 +272,8 @@ impl gates::Engine for World {
                     wedged: false,
                     hung: false,
                     init,
+                    busy: false,
+                    cpu_ns: 0,
                     credentials: credentials.to_vec(),
                 },
             );
@@ -296,8 +302,14 @@ impl gates::Engine for World {
     async fn stop(&self, id: ComputerId, force: bool) -> GateResult<()> {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("stop {}{}", id.hex(), if force { " -f" } else { "" }));
+        let s = &mut *s;
         gated(roll, || {
             if let Some(m) = s.machines.get_mut(&id) {
+                if m.state == Machine::Paused && !force {
+                    // Like msb 0.7.4: "resume it first or explicitly kill it".
+                    s.violations.push(format!("{}: a paused machine was asked to stop gracefully", id.hex()));
+                    return Err(fault(GateError::Failed, "cannot gracefully stop a paused sandbox"));
+                }
                 if m.hung && !force {
                     return Err(fault(GateError::Timeout, "msb stop: no answer within 60 s"));
                 }
@@ -314,8 +326,8 @@ impl gates::Engine for World {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("remove {}", id.hex()));
         gated(roll, || {
-            // Like msb: a running machine is not removed.
-            if s.machines.get(&id).is_some_and(|m| m.state == Machine::Running) {
+            // Like msb: a running or paused machine is not removed.
+            if s.machines.get(&id).is_some_and(|m| matches!(m.state, Machine::Running | Machine::Paused)) {
                 return Err(fault(GateError::Failed, "the machine is running"));
             }
             s.machines.remove(&id);
@@ -326,7 +338,12 @@ impl gates::Engine for World {
     async fn rotate(&self, id: ComputerId, credentials: &[Credential]) -> GateResult<()> {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("rotate {}", id.hex()));
+        let s = &mut *s;
         gated(roll, || match s.machines.get_mut(&id) {
+            Some(m) if m.state == Machine::Paused => {
+                s.violations.push(format!("{}: a paused machine's credentials were rotated", id.hex()));
+                Err(fault(GateError::Failed, "paused"))
+            }
             Some(m) if m.state == Machine::Running => {
                 m.credentials = credentials.to_vec();
                 Ok(())
@@ -341,6 +358,9 @@ impl gates::Engine for World {
         let s = &mut *s;
         gated(roll, || {
             let Some(m) = s.machines.get_mut(&id) else { return Err(fault(GateError::Failed, "no such machine")) };
+            if m.state == Machine::Paused {
+                s.violations.push(format!("{}: a paused machine was sent an exec (launch)", id.hex()));
+            }
             if m.state != Machine::Running {
                 return Err(fault(GateError::Failed, "not running"));
             }
@@ -364,6 +384,10 @@ impl gates::Engine for World {
         let roll = s.engine_roll(&format!("quiesce {}{}", id.hex(), if stop.is_some() { " (its init's stop)" } else { "" }));
         let s = &mut *s;
         gated(roll, || match s.machines.get_mut(&id) {
+            Some(m) if m.state == Machine::Paused => {
+                s.violations.push(format!("{}: a paused machine was sent an exec (quiesce)", id.hex()));
+                Err(fault(GateError::Failed, "paused"))
+            }
             Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "msb exec timed out")),
             Some(m) if m.state == Machine::Running => {
                 if m.init != stop.is_some() {
@@ -385,10 +409,41 @@ impl gates::Engine for World {
     async fn sync(&self, id: ComputerId) -> GateResult<()> {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("sync {}", id.hex()));
+        let s = &mut *s;
         gated(roll, || match s.machines.get(&id) {
+            Some(m) if m.state == Machine::Paused => {
+                s.violations.push(format!("{}: a paused machine was sent an exec (sync)", id.hex()));
+                Err(fault(GateError::Failed, "paused"))
+            }
             Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "msb exec timed out")),
             Some(m) if m.state == Machine::Running => Ok(()),
             _ => Err(fault(GateError::Failed, "not running")),
+        })
+    }
+
+    async fn pause(&self, id: ComputerId) -> GateResult<()> {
+        let mut s = self.lock();
+        let roll = s.engine_roll(&format!("pause {}", id.hex()));
+        gated(roll, || match s.machines.get_mut(&id) {
+            // A wedged guest cannot flush: `--guest-flush required` refuses.
+            Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "the guest did not flush")),
+            Some(m) if matches!(m.state, Machine::Running | Machine::Paused) => {
+                m.state = Machine::Paused;
+                Ok(())
+            }
+            _ => Err(fault(GateError::Failed, "not running")),
+        })
+    }
+
+    async fn resume(&self, id: ComputerId) -> GateResult<()> {
+        let mut s = self.lock();
+        let roll = s.engine_roll(&format!("resume {}", id.hex()));
+        gated(roll, || match s.machines.get_mut(&id) {
+            Some(m) if matches!(m.state, Machine::Running | Machine::Paused) => {
+                m.state = Machine::Running;
+                Ok(())
+            }
+            _ => Err(fault(GateError::Failed, "not paused")),
         })
     }
 }
@@ -640,6 +695,12 @@ impl gates::Prober for World {
         let s = self.lock();
         s.machines.values().any(|m| m.host_port == port && m.state == Machine::Running && m.service_alive)
     }
+
+    /// No answer (a paused or stopped machine, a dead service) is busy.
+    async fn busy(&self, port: u16, _path: &str, _field: &str) -> bool {
+        let s = self.lock();
+        !s.machines.values().any(|m| m.host_port == port && m.state == Machine::Running && m.service_alive && !m.busy)
+    }
 }
 
 impl gates::Clock for World {
@@ -665,8 +726,8 @@ impl gates::Meter for World {
         let s = self.lock();
         Ok(s.machines
             .iter()
-            .filter(|(_, m)| m.state == Machine::Running)
-            .map(|(id, _)| (*id, gates::Sample { resident: 256 << 20, used: 300 << 20, limit: 1 << 30, cpu_ns: 0, net_rx: 0, net_tx: 0, layer: 4 << 20 }))
+            .filter(|(_, m)| matches!(m.state, Machine::Running | Machine::Paused))
+            .map(|(id, m)| (*id, gates::Sample { resident: 256 << 20, used: 300 << 20, limit: 1 << 30, cpu_ns: m.cpu_ns, net_rx: 0, net_tx: 0, layer: 4 << 20 }))
             .collect())
     }
 

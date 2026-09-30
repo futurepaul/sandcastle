@@ -15,12 +15,14 @@ use sandcastle_core::limits::STEPS_PER_TICK_MAX;
 use std::collections::{HashMap, HashSet};
 
 use sandcastle_core::budget::{self, Ledger};
-use sandcastle_core::model::{Computer, ComputerId, Desired, Fetched, FaultKind, Knowledge, Machine, Policy, Step, Upload};
+use sandcastle_core::model::{Computer, ComputerId, Desired, Fetched, FaultKind, Knowledge, Machine, Policy, Step, Tier, Upload};
 use sandcastle_core::step::{Effect, GateError, Next, Note, Observe, Outcome};
-use sandcastle_core::{apply, goes_on, learn, note, plan};
+use sandcastle_core::{apply, goes_on, learn, learn_note, note, plan};
 use sandcastle_proto::{Credentials, CredentialsAsk};
 
+use crate::activity::{Activity, Floors};
 use crate::gates::{fault, Clock, Disks, Engine, GateResult, Meter, ObjectBody, Objects, Prober, Random, ReceiveSink, SendStream, Source, World};
+use crate::schedule::Nudges;
 use crate::manifest;
 use crate::seal::{BackupKey, Opener, Sealer, CHUNK_BYTES};
 use crate::store::{Store, StoreError};
@@ -43,6 +45,17 @@ pub struct Node<W: World> {
     pub ledger: std::sync::Mutex<Ledger>,
     /// What the machines measured over the last hour.
     pub measures: std::sync::Mutex<crate::capacity::Measures>,
+    /// What the node sees computers doing, and what counts.
+    pub activity: Activity,
+    pub floors: Floors,
+    /// Computers refused room, and what they asked for: the node demotes
+    /// warm computers to make it (`make_room`).
+    pub wanting: std::sync::Mutex<HashMap<ComputerId, u64>>,
+    /// Computers to step now, not at the next tick (a request waits).
+    pub nudges: Nudges,
+    /// Bumped by every row the executor writes: the proxy waits on it for
+    /// a computer it holds a request for to serve.
+    pub changed: tokio::sync::watch::Sender<u64>,
     /// The key backups are sealed with: present exactly when the node ships.
     pub backup_key: Option<BackupKey>,
     /// Upload part size (S3's floor is 5 MiB, but for the last part).
@@ -59,12 +72,40 @@ pub enum Stepped {
 }
 
 impl<W: World> Node<W> {
-    pub fn new(store: Store, world: W, policy: Policy, backup_key: Option<BackupKey>, part_bytes: usize) -> Node<W> {
+    /// What counts as a guest being active when the operator does not say.
+    pub const FLOORS: Floors = Floors { cpu_permille: 50, net_bytes_per_s: 4_096 };
+
+    pub fn new(store: Store, world: W, policy: Policy, backup_key: Option<BackupKey>, part_bytes: usize) -> Result<Node<W>, StoreError> {
         assert_eq!(policy.ships, backup_key.is_some() && world.objects().is_some(), "a node ships exactly when it has a bucket and a key");
         assert!(part_bytes >= CHUNK_BYTES, "a part holds at least one sealed chunk");
         policy.costs.check();
+        if let Some(sleep) = &policy.sleep {
+            assert!(sleep.idle_after_ms > 0 && sleep.cold_after_ms > 0);
+        }
         let ledger = std::sync::Mutex::new(Ledger::new(policy.reserve.memory));
-        Node { store, world, policy, ledger, measures: std::sync::Mutex::new(crate::capacity::Measures::default()), backup_key, part_bytes }
+        let node = Node {
+            store,
+            world,
+            policy,
+            ledger,
+            measures: std::sync::Mutex::new(crate::capacity::Measures::default()),
+            activity: Activity::default(),
+            floors: Self::FLOORS,
+            wanting: std::sync::Mutex::new(HashMap::new()),
+            nudges: Nudges::default(),
+            changed: tokio::sync::watch::Sender::new(0),
+            backup_key,
+            part_bytes,
+        };
+        // What an awake computer did before a restart is not known: it is
+        // counted active from now, an idle time before it may sleep.
+        let now = node.world.clock().now();
+        for id in node.store.ids()? {
+            if node.store.load(id)?.is_some_and(|c| c.tier == Tier::Awake) {
+                node.activity.touch(id, now);
+            }
+        }
+        Ok(node)
     }
 
     /// One pass over every computer. The engine's list is taken once; a
@@ -78,6 +119,7 @@ impl<W: World> Node<W> {
             }
         };
         self.reconcile(&machines, &HashSet::new())?;
+        self.make_room(&HashSet::new())?;
         for id in self.store.ids()? {
             let machine = machines.get(&id).copied().unwrap_or(Machine::Absent);
             self.batch(id, machine).await?;
@@ -103,34 +145,54 @@ impl<W: World> Node<W> {
             Next::Observe(o) => self.observe(&c, &o, k).await,
             Next::Note(n) => {
                 self.record_note(id, &n)?;
+                learn_note(k, &n);
                 Ok(Stepped::Acted)
             }
             Next::Do(effect) => {
                 let outcome = self.perform(&c, &effect).await;
                 self.record(id, &effect, &outcome)?;
+                if matches!((&effect, &outcome), (Effect::Pause, Outcome::Done)) {
+                    self.settle_paused(id).await;
+                }
                 learn(k, &effect, &outcome);
                 Ok(if goes_on(&effect, &outcome) { Stepped::Acted } else { Stepped::Done })
             }
         }
     }
 
-    /// Squares the ledger with the engine's listing: a running machine that
-    /// holds nothing (a restarted node's) is adopted, over the reserve if
-    /// it must be; a computer whose machine is not running and that is not
-    /// meant to run, or that is gone, holds nothing. Computers whose batch
-    /// is in flight (`busy`) are left alone: one may have just been
-    /// admitted and not made its machine yet.
+    /// A paused machine holds only what it measured resident: it cannot
+    /// grow while frozen, and the rest is room for others. Unmeasured, it
+    /// keeps its whole allocation until the next sample.
+    pub async fn settle_paused(&self, id: ComputerId) {
+        match self.world.meter().samples().await {
+            Ok(samples) => {
+                if let Some(s) = samples.get(&id) {
+                    self.ledger.lock().expect("never poisoned: panics abort").shrink(id, s.resident);
+                }
+            }
+            Err(f) => eprintln!("executor: {}: measuring a paused machine: {:?}: {}", id.hex(), f.error, f.detail),
+        }
+    }
+
+    /// Squares the ledger with the engine's listing: a running or paused
+    /// machine that holds nothing (a restarted node's) is adopted, over the
+    /// reserve if it must be (a paused one shrinks at the next sample); a
+    /// computer whose machine is down and that is not meant to run, or is
+    /// cold, or is gone, holds nothing. Computers whose batch is in flight
+    /// (`busy`) are left alone: one may have just been admitted and not
+    /// made its machine yet.
     pub fn reconcile(&self, machines: &HashMap<ComputerId, Machine>, busy: &HashSet<ComputerId>) -> Result<(), StoreError> {
         let rows: Vec<Computer> = self.store.ids()?.into_iter().filter_map(|id| self.store.load(id).transpose()).collect::<Result<_, _>>()?;
+        self.activity.retain(&rows.iter().map(|c| c.id).collect());
         let mut ledger = self.ledger.lock().expect("never poisoned: panics abort");
         for c in &rows {
             if busy.contains(&c.id) {
                 continue;
             }
-            let running = machines.get(&c.id) == Some(&Machine::Running);
-            match (running, ledger.holds(c.id).is_some()) {
+            let up = matches!(machines.get(&c.id), Some(Machine::Running | Machine::Paused));
+            match (up, ledger.holds(c.id).is_some()) {
                 (true, false) => ledger.adopt(c.id, budget::machine_memory(&c.fixed, &self.policy.costs)),
-                (false, true) if c.desired != Desired::Running => ledger.release(c.id),
+                (false, true) if c.desired != Desired::Running || c.tier == Tier::Cold => ledger.release(c.id),
                 _ => {}
             }
         }
@@ -144,12 +206,70 @@ impl<W: World> Node<W> {
         Ok(())
     }
 
-    /// Measures every running machine, for the capacity report.
-    pub async fn sample(&self) {
-        match self.world.meter().samples().await {
-            Ok(samples) => self.measures.lock().expect("never poisoned: panics abort").record(self.world.clock().now(), &samples),
-            Err(f) => eprintln!("executor: measuring the machines: {:?}: {}", f.error, f.detail),
+    /// Measures every machine, for the capacity report and for activity:
+    /// a guest over a floor since the last sample is active; a paused
+    /// machine holds what it measured (`machines`: the latest listing).
+    pub async fn sample(&self, machines: &HashMap<ComputerId, Machine>) {
+        let samples = match self.world.meter().samples().await {
+            Ok(s) => s,
+            Err(f) => {
+                eprintln!("executor: measuring the machines: {:?}: {}", f.error, f.detail);
+                return;
+            }
+        };
+        let now = self.world.clock().now();
+        let rates = self.measures.lock().expect("never poisoned: panics abort").record(now, &samples);
+        for (id, r) in rates {
+            if self.floors.active(r) {
+                self.activity.touch(id, now);
+            }
         }
+        let mut ledger = self.ledger.lock().expect("never poisoned: panics abort");
+        for (id, s) in &samples {
+            if machines.get(id) == Some(&Machine::Paused) {
+                ledger.shrink(*id, s.resident);
+            }
+        }
+    }
+
+    /// Makes room for computers refused it: while what they want is more
+    /// than is free (counting what cold computers still being stopped will
+    /// free), the least recently active warm computers go cold, and give
+    /// back what they hold once stopped. Computers in a batch (`busy`) are
+    /// left alone; a demotion is a transaction on the row as it is.
+    pub fn make_room(&self, busy: &HashSet<ComputerId>) -> Result<(), StoreError> {
+        let rows: Vec<Computer> = self.store.ids()?.into_iter().filter_map(|id| self.store.load(id).transpose()).collect::<Result<_, _>>()?;
+        let wants: Vec<(ComputerId, u64)> = {
+            let mut wanting = self.wanting.lock().expect("never poisoned: panics abort");
+            // Only a computer awake and meant to run still waits.
+            wanting.retain(|id, _| rows.iter().any(|c| c.id == *id && c.desired == Desired::Running && c.tier == Tier::Awake));
+            let mut w: Vec<(ComputerId, u64)> = wanting.iter().map(|(id, n)| (*id, *n)).collect();
+            w.sort();
+            w
+        };
+        if wants.is_empty() {
+            return Ok(());
+        }
+        let ledger = self.ledger.lock().expect("never poisoned: panics abort").clone();
+        let freeing: u64 = rows.iter().filter(|c| c.tier == Tier::Cold).filter_map(|c| ledger.holds(c.id)).sum();
+        let mut free = ledger.free() + freeing;
+        let mut warm: Vec<&Computer> = rows.iter().filter(|c| c.tier == Tier::Warm && c.desired == Desired::Running && !busy.contains(&c.id)).collect();
+        warm.sort_by_key(|c| (c.active_at, c.id));
+        let mut victims = warm.into_iter();
+        for (id, need) in wants {
+            let more = need.saturating_sub(ledger.holds(id).unwrap_or(0));
+            // Bounded by the warm computers, each demoted once.
+            while free < more {
+                let Some(v) = victims.next() else { break };
+                free += ledger.holds(v.id).unwrap_or(0);
+                let now = self.world.clock().now();
+                self.store.record(v.id, now, |current| note(current, &Note::Demote, &self.policy, now))?;
+                eprintln!("executor: {}: demoted to cold for {}'s room", v.name, id.hex());
+            }
+            free = free.saturating_sub(more);
+        }
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
     }
 
     /// The capacity report for a computer size (`memory_mib`, `data_gib`).
@@ -159,7 +279,7 @@ impl<W: World> Node<W> {
         let ledger = self.ledger.lock().expect("never poisoned: panics abort").clone();
         let measures = self.measures.lock().expect("never poisoned: panics abort");
         let latest = measures.latest.clone();
-        Ok(crate::capacity::report(&crate::capacity::Inputs { policy: &self.policy, ledger: &ledger, rows: &rows, host, samples: &latest, measures: &measures, size }))
+        Ok(crate::capacity::report(&crate::capacity::Inputs { policy: &self.policy, ledger: &ledger, rows: &rows, host, samples: &latest, measures: &measures, size, floors: self.floors }))
     }
 
     /// The row, and what the core says to do next; `None` when it is gone.
@@ -176,22 +296,24 @@ impl<W: World> Node<W> {
             eprintln!("executor: {}: {}: {:?}: {}", id.hex(), effect.step().as_str(), f.error, f.detail);
         }
         let written = self.store.record(id, now, |current| apply(current, effect, outcome, &self.policy, now))?;
-        // A machine stopped for good, or removed, holds no memory; one
-        // stopped to be made again (a rebase, a restart) keeps its room.
+        // A machine stopped for good, or cold, or removed, holds no memory;
+        // one stopped to be made again (a rebase, a restart) keeps its room.
         let released = match (effect, outcome, &written) {
-            (Effect::Stop { .. }, Outcome::Done, Some(c)) => c.desired != Desired::Running,
+            (Effect::Stop { .. }, Outcome::Done, Some(c)) => c.desired != Desired::Running || c.tier == Tier::Cold,
             (Effect::Remove | Effect::DeleteRow, Outcome::Done, _) => true,
             _ => false,
         };
         if released {
             self.ledger.lock().expect("never poisoned: panics abort").release(id);
         }
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
     pub fn record_note(&self, id: ComputerId, n: &Note) -> Result<(), StoreError> {
         let now = self.world.clock().now();
         self.store.record(id, now, |current| note(current, n, &self.policy, now))?;
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
@@ -208,7 +330,24 @@ impl<W: World> Node<W> {
             },
             Observe::Probe { port, path } => k.probe = Some(self.world.prober().probe(*port, path).await),
             Observe::Credentials { url } => k.credentials = Some(self.credentials(c, url).await),
-            Observe::Room { need } => k.room = Some(self.ledger.lock().expect("never poisoned: panics abort").admit(c.id, *need).is_ok()),
+            Observe::Room { need } => {
+                let admitted = self.ledger.lock().expect("never poisoned: panics abort").admit(c.id, *need).is_ok();
+                let mut wanting = self.wanting.lock().expect("never poisoned: panics abort");
+                if admitted {
+                    wanting.remove(&c.id);
+                } else {
+                    wanting.insert(c.id, *need);
+                }
+                k.room = Some(admitted);
+            }
+            Observe::Activity => k.activity = Some(self.activity.seen(c.id)),
+            Observe::Busy { port, path, field } => {
+                let busy = self.world.prober().busy(*port, path, field).await;
+                if busy {
+                    self.activity.touch(c.id, self.world.clock().now());
+                }
+                k.busy = Some(busy);
+            }
         }
         Ok(Stepped::Acted)
     }
@@ -273,6 +412,8 @@ impl<W: World> Node<W> {
             Effect::Start { credentials } => done(engine.start(c.id, credentials).await),
             Effect::Rotate { credentials, .. } => done(engine.rotate(c.id, credentials).await),
             Effect::Launch { argv, env } => done(engine.launch(c.id, argv, env).await),
+            Effect::Pause => done(engine.pause(c.id).await),
+            Effect::Resume => done(engine.resume(c.id).await),
             Effect::Remove => done(engine.remove(c.id).await),
             Effect::StartUpload { key, .. } => match self.objects() {
                 Ok(objects) => match objects.start_upload(key).await {

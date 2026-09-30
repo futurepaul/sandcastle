@@ -7,6 +7,7 @@
 pub mod api;
 pub mod config;
 pub mod daemon;
+pub mod frames;
 pub mod http;
 pub mod proxy;
 pub mod reset;

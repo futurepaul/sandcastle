@@ -62,6 +62,8 @@ one).
 | `POST /v1/computers/{name}/start` \| `/stop` | the owner | stop stays stopped |
 | `DELETE /v1/computers/{name}` | the owner | 202; the computer reads `desired: deleted` until its machine and disk are gone, then 404 |
 | `POST /v1/computers/{name}/tickets` | the owner | a single-use link, good for 60 s, that opens the computer's URL in a browser |
+| `POST /v1/computers/{name}/wake` | the owner, or a grantor | 202; a sleeping computer wakes (written to its row), an awake one stays awake an idle time from now: a scheduler's call before a job it fires |
+| `POST /v1/computers/{name}/sleep` | the owner, or a grantor | `{"tier": "warm" \| "cold"}`: a serving computer sleeps now rather than when next idle; only ever colder; any request wakes it |
 
 A computer's spec:
 
@@ -99,6 +101,7 @@ Each field in brief:
   }
   ```
 - **`env`** holds the service's own settings. It reaches the guest through an exec's stdin into a root-only file, never a command line.
+- **`service.busy`** (`{path, field}`) is how the node asks the service whether it is working before it puts the computer to sleep: a GET of `path` through its port, busy when the JSON's top-level `field` is true or above zero, and when the answer says nothing (no answer, not JSON, no such field). Hermes: `{"path": "/api/status", "field": "active_agents"}`.
 - **Outbound credentials** come from `credentials_url`, never `env` (below).
 
 ## Credentials
@@ -237,6 +240,50 @@ finite-lat-6 (124 GiB, a 1.7 TB pool), for 4 GiB / 10 GiB Hermes
 computers: 27 running at once, about 234 paused, 71 in all with 4 GiB
 layers (bound by the engine's disk; 120 with 1 GiB layers, bound by
 disk).
+
+## Sleep
+
+A computer its owner wants running is awake, warm, or cold, as the node
+chooses (`../docs/sandcastle-sleep.md`, Tiers):
+
+| | Its machine | Its memory | A request waits |
+|---|---|---|---|
+| **awake** | running | its whole allocation, in the ledger | nothing |
+| **warm** | paused (`msb pause --guest-flush required`) | what it measured resident when it paused | a resume: milliseconds |
+| **cold** | stopped, its disk and layer kept | nothing | a boot: seconds |
+
+- **Idle** (`--idle-after-s`, 30; 0 turns sleep off): no activity for
+  that long, and its service not busy, puts a serving computer warm.
+  Activity is what the node sees: a request through its URL (for as
+  long as it is in flight: a long stream is never idle), data a client
+  sends through an open WebSocket (not its pings or pongs: a quiet
+  dashboard keeps nothing awake; any byte of another upgrade), its
+  guest's CPU or network over the floors between samples
+  (`--activity-cpu-permille`, 50; `--activity-net-bytes-per-s`, 4096;
+  tuned from the report's measured rates), and a wake.
+- **Warm** for `--cold-after-s` (86400) goes cold: the machine is
+  resumed, its service stopped cleanly, the machine stopped, and the
+  snapshot after a stop taken. A computer whose machine would not pause
+  (a guest that cannot flush) goes cold instead of warm.
+- **Room**: a wake asks the ledger for the machine's whole allocation;
+  with none, the least recently active warm computers go cold until
+  there is, and the woken one waits. A warm computer holds only what it
+  measured, since a frozen machine cannot grow.
+- **A request** to a sleeping computer is held, its computer stepped at
+  once rather than at the next tick, and forwarded when it serves
+  (`WAKE_DEADLINE`, 60 s, then 503). The request counts as activity
+  before the router reads the computer's row, and the node pauses a
+  machine only after a fresh look at its activity, so a request that
+  arrives while a sleep is decided wakes the computer instead of meeting
+  a frozen one.
+- **While asleep**: what it wrote before it slept is snapshotted once
+  its guest has flushed (`sc-<n>-pause`), and shipped; no credential
+  rotation (a paused machine takes no exec); a stop or a deletion
+  resumes it first, so its service stops gracefully.
+- **The view** says `warm` or `cold`, and is not pending: sleep is the
+  node's to choose. An owner's new generation or start wakes it.
+- **Cron** inside a sleeping guest does not run: its ticker is frozen.
+  The cron provider (phase 5 step 4) wakes it.
 
 ## Backups
 

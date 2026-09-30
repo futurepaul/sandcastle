@@ -31,6 +31,10 @@ async fn seeds_hold_their_invariants_and_converge() {
         all.wedges += s.wedges;
         all.kills += s.kills;
         all.waits += s.waits;
+        all.pauses += s.pauses;
+        all.wakes += s.wakes;
+        all.colds += s.colds;
+        all.demotions += s.demotions;
     }
     println!("{all:?}");
     // The seeds must have done what they claim to test.
@@ -39,5 +43,6 @@ async fn seeds_hold_their_invariants_and_converge() {
         assert!(all.snapshots > 0 && all.shipped > 0 && all.deleted > 0, "{all:?}");
         assert!(all.rollbacks > 0 && all.restores_done > 0, "{all:?}");
         assert!(all.rotations > 0 && all.withdrawals > 0 && all.wedges > 0 && all.kills > 0 && all.waits > 0, "{all:?}");
+        assert!(all.pauses > 0 && all.wakes > 0 && all.colds > 0 && all.demotions > 0, "{all:?}");
     }
 }

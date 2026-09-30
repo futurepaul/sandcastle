@@ -18,6 +18,8 @@ pub const MEMORY_MIB_MIN: u32 = 256;
 pub const MEMORY_MIB_MAX: u32 = 64 * 1024;
 pub const DATA_GIB_MAX: u32 = 1024;
 pub const PATH_BYTES_MAX: usize = 128;
+/// A busy probe's JSON field name.
+pub const BUSY_FIELD_BYTES_MAX: usize = 64;
 pub const ARGV_ENTRIES_MAX: usize = 32;
 pub const ARGV_BYTES_MAX: usize = 8 * 1024;
 pub const ENV_VARS_MAX: usize = 32;
@@ -86,6 +88,23 @@ pub struct Service {
     /// the guest.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// How the node asks the service whether it is working before it puts
+    /// the computer to sleep: busy computers stay awake. None: only what
+    /// the node sees (requests, the guest's CPU and network) keeps it awake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy: Option<Busy>,
+}
+
+/// A service's own answer to "are you working?": a GET of `path` through
+/// its port, busy when the JSON object's top-level `field` is true or a
+/// number above zero (Hermes: `/api/status`, `active_agents`). An answer
+/// that does not say, or no answer, counts as busy: sleep is the node's
+/// economy, and never worth interrupting work.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Busy {
+    pub path: String,
+    pub field: String,
 }
 
 /// The body of `PUT /v1/computers/{name}`: create, or converge to, this.
@@ -137,7 +156,28 @@ pub enum Observed {
     Starting,
     /// The service answered its health path.
     Serving,
+    /// Asleep with its memory kept (paused): a request wakes it in
+    /// milliseconds. Not pending: sleep is the node's to choose.
+    Warm,
+    /// Asleep with its machine stopped (its disk kept): a request boots it.
+    Cold,
     Failed { reason: String },
+}
+
+/// The body of `POST /v1/computers/{name}/sleep`: put a computer to sleep
+/// now rather than when it is next idle (a platform that knows it is done
+/// with it, or a test). Any request wakes it again.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SleepAsk {
+    pub tier: SleepTier,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepTier {
+    Warm,
+    Cold,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -301,6 +341,8 @@ pub struct NodeReport {
     pub disk: DiskView,
     pub engine_disk: EngineDiskView,
     pub computers: CountsView,
+    /// None: this node never puts computers to sleep.
+    pub sleep: Option<SleepView>,
     pub fits: FitsView,
     /// Per running machine: its memory over the node's recent samples.
     pub measured: Vec<MeasuredView>,
@@ -362,8 +404,23 @@ pub struct EngineDiskView {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CountsView {
     pub total: u32,
+    /// Awake and serving; asleep with their memory kept; asleep stopped.
     pub running: u32,
+    pub warm: u32,
+    pub cold: u32,
     pub waiting: u32,
+}
+
+/// When the node puts computers to sleep, and what it counts as activity
+/// (docs/sandcastle-sleep.md, Tiers), tuned from `measured`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SleepView {
+    pub idle_after_s: u64,
+    pub cold_after_s: u64,
+    /// A guest using more of one vCPU than this (thousandths) between
+    /// samples, or moving more network bytes a second than this, is active.
+    pub cpu_floor_permille: u32,
+    pub net_floor_bytes_per_s: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -387,6 +444,13 @@ pub struct MeasuredView {
     pub resident_mib_max: u64,
     /// What its writable layer takes of the engine's disk now.
     pub layer_mib: u64,
+    /// Its CPU (thousandths of one vCPU) and network bytes a second
+    /// between samples while it ran: what an idle one uses is where the
+    /// activity floors belong.
+    pub cpu_permille_p50: u32,
+    pub cpu_permille_p95: u32,
+    pub net_bytes_per_s_p50: u64,
+    pub net_bytes_per_s_p95: u64,
     pub samples: u32,
 }
 
@@ -467,6 +531,12 @@ pub fn validate_pubkey(pubkey: &str) -> Result<(), Invalid> {
     } else {
         invalid("a public key is 64 lowercase hex characters")
     }
+}
+
+/// A path the node GETs through a service's port (its health, whether it
+/// is busy): starts with '/', printable, bounded.
+pub fn valid_http_path(path: &str) -> bool {
+    path.starts_with('/') && path.len() <= PATH_BYTES_MAX && path.bytes().all(|c| c.is_ascii_graphic())
 }
 
 /// An absolute path below `/` of `[A-Za-z0-9/_.-]` with no `.` or `..`
@@ -643,10 +713,17 @@ impl ComputerSpec {
         if self.service.port == 0 {
             return invalid("service.port is 1 to 65535");
         }
-        let health = &self.service.health_path;
-        let health_ok = health.starts_with('/') && health.len() <= PATH_BYTES_MAX && health.bytes().all(|c| c.is_ascii_graphic());
-        if !health_ok {
+        if !valid_http_path(&self.service.health_path) {
             return invalid(format!("service.health_path starts with '/' and is at most {PATH_BYTES_MAX} printable bytes"));
+        }
+        if let Some(b) = &self.service.busy {
+            if !valid_http_path(&b.path) {
+                return invalid(format!("service.busy.path starts with '/' and is at most {PATH_BYTES_MAX} printable bytes"));
+            }
+            let field_ok = !b.field.is_empty() && b.field.len() <= BUSY_FIELD_BYTES_MAX && b.field.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !field_ok {
+                return invalid(format!("service.busy.field is 1 to {BUSY_FIELD_BYTES_MAX} characters of [A-Za-z0-9_]"));
+            }
         }
         if let Some(url) = &self.credentials_url {
             validate_url(url, "credentials_url")?;
@@ -710,6 +787,7 @@ mod tests {
                 port: 9119,
                 health_path: "/api/auth/providers".into(),
                 env: BTreeMap::new(),
+                busy: Some(Busy { path: "/api/status".into(), field: "active_agents".into() }),
             },
             url_auth: UrlAuth::Owner,
             credentials_url: None,
@@ -753,6 +831,10 @@ mod tests {
             ("too many args", Box::new(|s| s.service.argv = vec!["/x".into(); ARGV_ENTRIES_MAX + 1])),
             ("port 0", Box::new(|s| s.service.port = 0)),
             ("health path relative", Box::new(|s| s.service.health_path = "health".into())),
+            ("busy path relative", Box::new(|s| s.service.busy = Some(Busy { path: "status".into(), field: "active".into() }))),
+            ("busy field empty", Box::new(|s| s.service.busy = Some(Busy { path: "/status".into(), field: String::new() }))),
+            ("busy field a path", Box::new(|s| s.service.busy = Some(Busy { path: "/status".into(), field: "a.b".into() }))),
+            ("busy field long", Box::new(|s| s.service.busy = Some(Busy { path: "/status".into(), field: "a".repeat(BUSY_FIELD_BYTES_MAX + 1) }))),
             ("lowercase env name", Box::new(|s| { s.service.env.insert("path".into(), "x".into()); })),
             ("env name with a digit first", Box::new(|s| { s.service.env.insert("1A".into(), "x".into()); })),
             ("newline in an env value", Box::new(|s| { s.service.env.insert("A".into(), "x\ny".into()); })),

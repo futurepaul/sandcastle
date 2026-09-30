@@ -4,6 +4,7 @@
 //! HTTP layer (`sandcastled`) and the simulator (`sandcastle-sim`) sit on
 //! top of it.
 
+pub mod activity;
 pub mod capacity;
 pub mod commands;
 pub mod executor;

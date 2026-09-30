@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use sandcastle_core::model::*;
 use sandcastle_core::step::*;
-use sandcastle_core::{apply, learn, note, plan};
+use sandcastle_core::{apply, learn, learn_note, note, plan};
 use sandcastle_proto::{Credential, Storage, UrlAuth};
 
 const MIN: u64 = 60_000;
@@ -22,6 +22,7 @@ fn policy() -> Policy {
         ships: true,
         reserve: sandcastle_core::budget::Reserve { memory: 64 << 30, disk: 1 << 40, engine_disk: 1 << 40 },
         costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        sleep: None,
         node: "n".into(),
     }
 }
@@ -36,6 +37,7 @@ fn generation(seq: u32, image: &str) -> Generation {
         env: BTreeMap::from([("DASH".to_string(), "x".to_string())]),
         credentials_url: None,
         init: None,
+        busy: None,
     }
 }
 
@@ -65,6 +67,9 @@ fn computer() -> Computer {
         credentials_at: None,
         restore: None,
         ship: Ship::default(),
+        tier: Tier::Awake,
+        slept_at: None,
+        active_at: 0,
         status: Status::Absent,
         status_reason: None,
         version: 1,
@@ -105,6 +110,12 @@ impl Run {
             self.k.room = Some(!self.full);
             return self.next();
         }
+        // Bookkeeping before a create, recorded in passing (pinned by
+        // `a_lost_create_is_never_taken_for_the_machine_it_replaced`).
+        if n == Next::Note(Note::Replace) {
+            self.noted();
+            return self.next();
+        }
         n
     }
 
@@ -123,6 +134,7 @@ impl Run {
     fn noted(&mut self) {
         let Some(Next::Note(n)) = self.asked.last().cloned() else { panic!("the last answer was not a note") };
         self.c = note(&self.c, &n, &self.p, self.now).row.expect("the row stays");
+        learn_note(&mut self.k, &n);
     }
 
     /// Plans and expects an effect matching `want`, and answers it Done.
@@ -186,6 +198,31 @@ fn a_rebase_stops_cleanly_and_snapshots_before_replacing() {
     r.expect_do(|e| matches!(e, Effect::EnsureDisk { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Create { seq: 2, machine, .. } if machine.image == "img:2"));
+}
+
+/// Goal: a create whose reply is lost is never taken for the machine it
+/// replaced: the row forgets the old one (how it stops, what it ran)
+/// before the create, so the new machine is stopped the new generation's
+/// way (found by simulation seed 251: an init's stop sent to a machine the
+/// node launches).
+#[test]
+fn a_lost_create_is_never_taken_for_the_machine_it_replaced() {
+    let mut r = serving();
+    r.c.machine_stop = Some(vec!["/halt".into()]);
+    r.c.spec.init = Some(sandcastle_proto::Init { argv: vec!["/init".into()], stop: vec!["/halt".into()] });
+    r.c.spec.argv = vec![];
+    r.c.good = Some(r.c.spec.clone());
+    r.c.spec = generation(2, "img:2");
+    r.restart(Machine::Stopped);
+    r.k.disk = Some(disk(0, &[]));
+    r.k.disk_ready = true;
+    r.k.room = Some(true);
+    assert_eq!(plan(&r.c, &r.k, &r.p, r.now), Next::Note(Note::Replace), "forgotten before it is replaced");
+    r.c = note(&r.c, &Note::Replace, &r.p, r.now).row.unwrap();
+    assert_eq!((r.c.applied_seq, r.c.machine_stop.clone()), (None, None));
+    // The create happens; its reply is lost; the new machine runs.
+    r.restart(Machine::Running);
+    r.expect_do(|e| matches!(e, Effect::Quiesce { stop: None }));
 }
 
 /// Goal: a crash after a rebase's stop, before its record, never replaces
@@ -256,7 +293,12 @@ fn a_new_generation_that_fails_rolls_back() {
     assert_eq!(r.c.failure.as_ref().map(|f| f.kind), Some(FaultKind::Spec));
     assert_eq!(r.c.retry_at, None, "a rollback is at once");
     assert_eq!(r.c.target().0.seq, 1);
-    r.expect_do(|e| matches!(e, Effect::Start { .. }));
+    // The row forgot the old machine before the create (a failed `create
+    // --replace` may have removed it): the generation that served is made
+    // again, after a look at what the disk holds.
+    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    r.k.disk = Some(disk(0, &[]));
+    r.expect_do(|e| matches!(e, Effect::Create { seq: 1, .. }));
 }
 
 /// Goal: an engine that times out or cannot run while making a new
@@ -722,4 +764,354 @@ fn a_stale_served_does_not_bless_a_newer_spec() {
     let after = note(&r.c, &stale, &r.p, r.now).row.unwrap();
     assert_eq!(after.good.as_ref().map(|g| g.seq), Some(1), "generation 2 never served");
     assert_eq!(after.status, Status::Starting);
+}
+
+// Tiers (docs/sandcastle-sleep.md) -------------------------------------------
+
+const SEC: u64 = 1_000;
+const DAY: u64 = 24 * 60 * MIN;
+
+fn sleepy_policy() -> Policy {
+    Policy { sleep: Some(Sleep { idle_after_ms: 30 * SEC, cold_after_ms: DAY }), ..policy() }
+}
+
+/// A serving computer on a node that sleeps computers, its schedule's
+/// snapshot not due for a while.
+fn serving_sleepy() -> Run {
+    let mut r = serving();
+    r.p = sleepy_policy();
+    r.c.snapshot_at = Some(r.now + DAY * 10);
+    r
+}
+
+/// Brings a serving computer to warm: idle past the idle time, the sleep
+/// decided, its activity looked at again, the machine paused.
+fn warm() -> Run {
+    let mut r = serving_sleepy();
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    assert_eq!(r.next(), Next::Observe(Observe::Activity));
+    r.k.activity = Some(Seen::NOTHING);
+    let served = r.c.active_at;
+    assert_eq!(r.next(), Next::Note(Note::Sleep { tier: Tier::Warm, active_at: served }), "idle since it came up");
+    r.noted();
+    assert_eq!((r.c.tier, r.c.slept_at, r.c.status), (Tier::Warm, Some(r.now), Status::Serving), "decided, not yet paused");
+    assert_eq!(r.next(), Next::Observe(Observe::Activity), "a pause follows a fresh look at its activity");
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }), "its writes' snapshot is owed before the pause");
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.ok();
+    assert_eq!((r.c.status, r.k.machine, r.c.snapshot_due), (Status::Warm, Machine::Paused, Some(SnapshotKind::Pause)));
+    assert_eq!(r.next(), Next::Observe(Observe::Disk), "what it wrote before it slept is backed up");
+    r.k.disk = Some(disk(0, &[]));
+    assert_eq!(r.next(), Next::Note(Note::SnapshotSkipped { owed: true }), "nothing written since the last");
+    r.noted();
+    assert_eq!(r.next(), Next::Rest(Some(r.c.slept_at.unwrap() + DAY)), "asleep until it goes cold");
+    r
+}
+
+/// Goal: what a computer wrote before it slept is snapshotted while it is
+/// warm, so a day warm is never a day without a backup of it.
+#[test]
+fn a_warm_computers_writes_are_snapshotted() {
+    let mut r = serving_sleepy();
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.k.activity = Some(Seen::NOTHING);
+    r.next();
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.ok();
+    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    r.k.disk = Some(disk(8192, &[]));
+    r.expect_do(|e| matches!(e, Effect::Snapshot { name } if name.kind == SnapshotKind::Pause));
+    r.ok();
+    assert_eq!((r.c.snapshot_due, r.c.ship.pending), (None, true), "taken, and to be shipped");
+}
+
+/// Goal: an idle computer goes warm, and a day later cold: resumed, its
+/// service stopped cleanly, its machine stopped, the snapshot after a stop
+/// owed; the room it held is the executor's to release. Method: the
+/// clock, no activity.
+#[test]
+fn an_idle_computer_goes_warm_then_cold() {
+    let mut r = warm();
+    r.now = r.c.slept_at.unwrap() + DAY;
+    r.restart(Machine::Paused);
+    assert_eq!(r.next(), Next::Observe(Observe::Activity));
+    r.k.activity = Some(Seen::NOTHING);
+    assert!(matches!(r.next(), Next::Note(Note::Sleep { tier: Tier::Cold, .. })));
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    r.expect_do(|e| matches!(e, Effect::Resume));
+    r.ok();
+    assert_eq!(r.c.status, Status::Warm, "resumed to be stopped, not woken");
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Quiesce { stop: None }));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    r.ok();
+    assert_eq!((r.c.status, r.c.tier), (Status::Cold, Tier::Cold));
+    assert_eq!(r.next(), Next::Observe(Observe::Disk), "the snapshot after a stop");
+    r.k.disk = Some(disk(4096, &[]));
+    r.expect_do(|e| matches!(e, Effect::Snapshot { name } if name.kind == SnapshotKind::Stop));
+}
+
+/// Goal: a request to a warm computer wakes it within one batch: the wake
+/// recorded, room for all it may use taken, the machine resumed, its
+/// service seen answering; never relaunched. Method: activity newer than
+/// what it slept after.
+#[test]
+fn a_request_wakes_a_warm_computer_in_one_batch() {
+    let mut r = warm();
+    r.now += 10 * MIN;
+    r.restart(Machine::Paused);
+    let from = r.asked.len();
+    assert_eq!(r.next(), Next::Observe(Observe::Activity));
+    r.k.activity = Some(Seen { last: Some(r.now - 5), in_flight: false });
+    assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }), "woken now, for what came after it slept");
+    r.noted();
+    assert_eq!((r.c.tier, r.c.slept_at, r.c.status), (Tier::Awake, None, Status::Starting));
+    r.expect_do(|e| matches!(e, Effect::Resume));
+    assert_eq!(r.k.room, Some(true), "with room for its whole allocation");
+    r.ok();
+    assert!(matches!(r.next(), Next::Observe(Observe::Probe { .. })));
+    r.k.probe = Some(true);
+    assert_eq!(r.next(), Next::Note(Note::Served { seq: 1 }));
+    r.noted();
+    assert_eq!(r.c.status, Status::Serving);
+    assert_eq!(r.next(), Next::Rest(None), "awake, and active a moment ago");
+    assert!(!r.asked[from..].iter().any(|n| matches!(n, Next::Do(Effect::Launch { .. }))), "a resumed service is not launched again");
+}
+
+/// Goal: a crash after a pause and before its record still takes the
+/// snapshot of what the computer wrote (owed before the pause; found by
+/// simulation seed 231).
+#[test]
+fn a_crash_after_the_pause_still_snapshots() {
+    let mut r = serving_sleepy();
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.k.activity = Some(Seen::NOTHING);
+    r.next();
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }));
+    r.noted();
+    // The pause happens; the node crashes before it records it.
+    r.restart(Machine::Paused);
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Status { status: Status::Warm, reason: None }));
+    r.noted();
+    assert_eq!(r.next(), Next::Observe(Observe::Disk));
+    r.k.disk = Some(disk(4096, &[]));
+    r.expect_do(|e| matches!(e, Effect::Snapshot { name } if name.kind == SnapshotKind::Pause));
+}
+
+/// Goal: a request that arrives while the sleep is being decided wakes the
+/// computer instead of meeting a frozen machine (the proxy marks activity
+/// before it reads the row; the pause waits for a look after the note).
+#[test]
+fn activity_during_the_sleep_decision_wakes_rather_than_pauses() {
+    let mut r = serving_sleepy();
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.next();
+    r.k.activity = Some(Seen::NOTHING);
+    assert!(matches!(r.next(), Next::Note(Note::Sleep { .. })));
+    r.noted();
+    assert_eq!(r.next(), Next::Observe(Observe::Activity));
+    r.k.activity = Some(Seen { last: Some(r.now), in_flight: false });
+    assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }));
+    r.noted();
+    assert!(!r.asked.iter().any(|n| matches!(n, Next::Do(Effect::Pause))));
+    assert_eq!((r.c.tier, r.c.status), (Tier::Awake, Status::Starting));
+    assert_eq!(r.next(), Next::Note(Note::Served { seq: 1 }), "never paused: it answered this batch, and serves again");
+}
+
+/// Goal: a service that says it is working stays awake, and is asked again
+/// only after another idle time; one that says it is not sleeps.
+#[test]
+fn a_busy_service_stays_awake() {
+    let mut r = serving_sleepy();
+    r.c.spec.busy = Some(sandcastle_proto::Busy { path: "/api/status".into(), field: "active_agents".into() });
+    r.c.good = Some(r.c.spec.clone());
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.next();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Observe(Observe::Busy { port: 20000, path: "/api/status".into(), field: "active_agents".into() }));
+    r.k.busy = Some(true);
+    assert_eq!(r.next(), Next::Rest(None), "working: awake");
+    r.k.busy = Some(false);
+    assert!(matches!(r.next(), Next::Note(Note::Sleep { tier: Tier::Warm, .. })));
+}
+
+/// Goal: a machine that will not pause (its guest could not flush: likely
+/// wedged) sleeps cold instead, with no failure shown: its halt goes on
+/// through the wedge, and its next wake is a fresh boot. Never a pause
+/// retried every idle time.
+#[test]
+fn a_machine_that_will_not_pause_goes_cold() {
+    let mut r = serving_sleepy();
+    r.now += 31 * SEC;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.next();
+    r.k.activity = Some(Seen::NOTHING);
+    r.next();
+    r.noted();
+    r.next();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Pause }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Pause));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "the guest did not flush".into() }));
+    assert_eq!((r.c.tier, r.c.status, r.c.failure.clone(), r.c.retry_at), (Tier::Cold, Status::Serving, None, None));
+    r.restart(Machine::Running);
+    r.k.activity = Some(Seen::NOTHING);
+    // The snapshot owed at the pause is taken after the stop instead.
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
+    r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb exec timed out".into() }));
+    r.now = r.c.retry_at.unwrap();
+    r.restart(Machine::Running);
+    r.k.activity = Some(Seen::NOTHING);
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    r.ok();
+    assert_eq!((r.c.status, r.c.failure.clone()), (Status::Cold, None), "cold, the wedge dealt with by the stop");
+}
+
+/// Goal: a machine that will not resume is killed and booted afresh, with
+/// room, rather than left frozen.
+#[test]
+fn a_resume_that_fails_kills_and_boots_afresh() {
+    let mut r = warm();
+    r.now += MIN;
+    r.restart(Machine::Paused);
+    r.k.activity = Some(Seen { last: Some(r.now), in_flight: false });
+    r.next();
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Resume));
+    r.answer(Outcome::Failed(Fault { error: GateError::Failed, detail: "resume refused".into() }));
+    assert_eq!(r.c.status, Status::Failed);
+    r.now = r.c.retry_at.unwrap();
+    r.restart(Machine::Paused);
+    r.expect_do(|e| matches!(e, Effect::Stop { force: true }));
+    r.ok();
+    assert_eq!((r.c.failure.clone(), r.c.status), (None, Status::Starting), "dealt with by the kill");
+    r.expect_do(|e| matches!(e, Effect::Start { .. }));
+}
+
+/// Goal: stopping or deleting a warm computer resumes its machine first,
+/// so its service stops gracefully (msb refuses a graceful stop of a
+/// paused machine), with no room asked for.
+#[test]
+fn stopping_or_deleting_a_warm_computer_resumes_it_first() {
+    for desired in [Desired::Stopped, Desired::Deleted] {
+        let mut r = warm();
+        r.c.desired = desired;
+        r.restart(Machine::Paused);
+        if desired == Desired::Stopped {
+            assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
+            r.noted();
+        }
+        r.expect_do(|e| matches!(e, Effect::Resume));
+        assert_eq!(r.k.room, None, "resumed to stop: no room asked");
+        r.ok();
+        r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
+        r.ok();
+        r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+        r.ok();
+        let want = if desired == Desired::Stopped { Status::Stopped } else { Status::Starting };
+        assert_eq!(r.c.status, want, "{desired:?}");
+    }
+}
+
+/// Goal: a cold computer wakes by booting, with room; a warm one whose
+/// machine died meanwhile is cold, and is made again on its next wake.
+#[test]
+fn cold_computers_wake_by_booting() {
+    let mut r = warm();
+    r.restart(Machine::Other);
+    r.k.activity = Some(Seen::NOTHING);
+    assert!(matches!(r.next(), Next::Note(Note::Sleep { tier: Tier::Cold, .. })), "its machine died while it slept");
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Status { status: Status::Cold, reason: None }));
+    r.noted();
+    assert_eq!(r.next(), Next::Rest(None));
+    r.now += MIN;
+    r.restart(Machine::Stopped);
+    r.k.activity = Some(Seen { last: Some(r.now), in_flight: false });
+    assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }));
+    r.noted();
+    r.expect_do(|e| matches!(e, Effect::Start { .. }));
+    assert_eq!(r.k.room, Some(true));
+}
+
+/// Goal: a woken computer waiting for room goes back to sleep when nothing
+/// has happened for an idle time (the requests that woke it gave up), so
+/// it does not wait for room forever.
+#[test]
+fn a_woken_computer_waiting_for_room_sleeps_again_when_idle() {
+    let mut r = warm();
+    r.full = true;
+    r.now += MIN;
+    r.restart(Machine::Paused);
+    r.k.activity = Some(Seen { last: Some(r.now), in_flight: false });
+    r.next();
+    r.noted();
+    assert_eq!(r.next(), Next::Note(Note::Status { status: Status::Starting, reason: Some(sandcastle_core::plan::WAITING_FOR_ROOM.into()) }));
+    r.noted();
+    r.now += 31 * SEC;
+    r.restart(Machine::Paused);
+    r.k.activity = Some(Seen::NOTHING);
+    assert!(matches!(r.next(), Next::Note(Note::Sleep { tier: Tier::Warm, .. })));
+    r.noted();
+    r.k.activity = Some(Seen::NOTHING);
+    assert_eq!(r.next(), Next::Note(Note::Status { status: Status::Warm, reason: None }));
+}
+
+/// Goal: a request in flight wakes a sleeping computer however the clock
+/// reads (the sleep may have been decided in the same millisecond), and
+/// keeps an awake one awake however long it runs.
+#[test]
+fn a_request_in_flight_always_wakes_and_keeps_awake() {
+    let mut r = warm();
+    r.restart(Machine::Paused);
+    r.k.activity = Some(Seen { last: Some(r.c.active_at), in_flight: true });
+    assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }));
+    let mut r = serving_sleepy();
+    r.now += DAY;
+    r.restart(Machine::Running);
+    r.k.probe = Some(true);
+    r.k.activity = Some(Seen { last: Some(0), in_flight: true });
+    assert_eq!(r.next(), Next::Rest(None), "a day-long stream is not idle");
+}
+
+/// Goal: a node whose operator turned sleep off wakes what slept; a
+/// demotion makes only a warm computer cold.
+#[test]
+fn sleep_off_wakes_sleepers_and_demotion_touches_only_warm() {
+    let mut r = warm();
+    r.p.sleep = None;
+    r.restart(Machine::Paused);
+    assert_eq!(r.next(), Next::Note(Note::Wake { active_at: r.now }));
+    let r = warm();
+    let cold = note(&r.c, &Note::Demote, &r.p, r.now).row.unwrap();
+    assert_eq!(cold.tier, Tier::Cold);
+    let again = note(&cold, &Note::Demote, &r.p, r.now).row.unwrap();
+    assert_eq!(again.tier, Tier::Cold);
+    let awake = note(&serving_sleepy().c, &Note::Demote, &r.p, r.now).row.unwrap();
+    assert_eq!(awake.tier, Tier::Awake, "an awake computer is never demoted");
 }

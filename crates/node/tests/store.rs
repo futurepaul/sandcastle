@@ -33,7 +33,7 @@ fn spec() -> ComputerSpec {
         storage: Storage::Data,
         data_gib: 5,
         data_path: "/data".into(),
-        service: Service { argv: vec!["/bin/serve".into(), "--port".into(), "9119".into()], init: None, port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH_PASSWORD".into(), "it's secret".into())]) },
+        service: Service { argv: vec!["/bin/serve".into(), "--port".into(), "9119".into()], init: None, port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH_PASSWORD".into(), "it's secret".into())]), busy: Some(sandcastle_proto::Busy { path: "/api/status".into(), field: "active_agents".into() }) },
         url_auth: UrlAuth::Owner,
         credentials_url: None,
     }
@@ -48,6 +48,7 @@ fn policy() -> Policy {
         ships: true,
         reserve: sandcastle_core::budget::Reserve { memory: 16 << 30, disk: 100 << 30, engine_disk: 50 << 30 },
         costs: sandcastle_core::budget::Costs { machine_overhead: 64 << 20, snapshot_headroom_pct: 25, layer: 4 << 30 },
+        sleep: Some(sandcastle_core::model::Sleep { idle_after_ms: 30_000, cold_after_ms: 86_400_000 }),
         node: "n".into(),
     }
 }
@@ -203,6 +204,9 @@ fn busy(c: Computer) -> Computer {
         failures: 1,
         retry_at: Some(NOW + 2_000),
     };
+    n.tier = Tier::Warm;
+    n.slept_at = Some(NOW - 1);
+    n.active_at = NOW - 100;
     n.status = Status::Serving;
     n.status_reason = None;
     n
@@ -339,4 +343,68 @@ fn a_computer_is_made_only_inside_the_reserve() {
     assert!(matches!(&e, CommandError::NoRoom(m) if m.contains("writable layers")), "{e}");
     // converging an existing computer is not a new commitment
     commands::put_computer(&store, ALICE, "one", &spec(), None, id(9), PORTS, &layers, NOW).unwrap();
+}
+
+/// Goal: putting a computer to sleep is its owner's or a grantor's, only
+/// for a serving computer on a node that sleeps them, and only colder;
+/// an owner's new generation or start wakes it; a view of a sleeping
+/// computer is settled.
+#[test]
+fn sleep_now_and_owners_acts_wake() {
+    use sandcastle_proto::{Observed, SleepTier};
+    let store = granted();
+    let c = create(&store, "hermes", 1);
+    let refused = commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &policy(), NOW).unwrap_err();
+    assert!(matches!(refused, CommandError::Invalid(_)), "not serving yet: {refused}");
+    let mut serving = busy(c);
+    serving.tier = Tier::Awake;
+    serving.slept_at = None;
+    serving.snapshot_due = None;
+    serving.failure = None;
+    serving.failures = 0;
+    serving.retry_at = None;
+    store.record(serving.id, NOW, |_| Change { row: Some(serving.clone()), shipped: None }).unwrap();
+    assert!(matches!(commands::sleep_now(&store, &grantors(), BOB, "hermes", SleepTier::Warm, &policy(), NOW), Err(CommandError::NotFound)), "someone else's");
+    let off = Policy { sleep: None, ..policy() };
+    assert!(matches!(commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &off, NOW), Err(CommandError::Invalid(_))), "a node that never sleeps them");
+    let warm = commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &policy(), NOW + 5).unwrap();
+    assert_eq!((warm.tier, warm.slept_at, warm.active_at), (Tier::Warm, Some(NOW + 5), NOW + 5));
+    let again = commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &policy(), NOW + 6).unwrap();
+    assert_eq!(again.version, warm.version, "asked again: the same");
+    let cold = commands::sleep_now(&store, &grantors(), GRANTOR, "hermes", SleepTier::Cold, &policy(), NOW + 7).unwrap();
+    assert_eq!((cold.tier, cold.slept_at), (Tier::Cold, Some(NOW + 5)), "a grantor may; asleep since the first");
+    let warmer = commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &policy(), NOW + 8).unwrap();
+    assert_eq!(warmer.tier, Tier::Cold, "never warmer: a request wakes it");
+    // The node stops it: cold, settled.
+    let mut stopped = cold.clone();
+    stopped.status = Status::Cold;
+    store.record(stopped.id, NOW, |_| Change { row: Some(stopped.clone()), shipped: None }).unwrap();
+    let v = commands::view(&store.by_name("hermes").unwrap().unwrap(), String::new());
+    assert_eq!((v.observed, v.pending), (Observed::Cold, false));
+    assert!(matches!(commands::wake_now(&store, &grantors(), BOB, "hermes", NOW + 9), Err(CommandError::NotFound)), "someone else's");
+    let same = commands::set_desired(&store, ALICE, "hermes", Desired::Running, NOW + 9).unwrap();
+    assert_eq!(same.tier, Tier::Cold, "a start of a running computer changes nothing");
+    let mut next = spec();
+    next.image = "img:2".into();
+    let (woken, _) = commands::put_computer(&store, ALICE, "hermes", &next, None, id(9), PORTS, &policy(), NOW + 10).unwrap();
+    assert_eq!((woken.tier, woken.slept_at, woken.status, woken.active_at), (Tier::Awake, None, Status::Starting, NOW + 10), "a new generation wakes it");
+}
+
+/// Goal: a wake is its owner's or a grantor's, written to the row (a
+/// restart keeps it), and a no-op for a computer awake or not meant to run.
+#[test]
+fn a_wake_is_written_to_the_row() {
+    use sandcastle_proto::SleepTier;
+    let store = granted();
+    let mut c = busy(create(&store, "hermes", 1));
+    (c.failure, c.failures, c.retry_at, c.snapshot_due) = (None, 0, None, None);
+    c.tier = Tier::Awake;
+    c.slept_at = None;
+    store.record(c.id, NOW, |_| Change { row: Some(c.clone()), shipped: None }).unwrap();
+    let awake = commands::wake_now(&store, &grantors(), ALICE, "hermes", NOW + 1).unwrap();
+    assert_eq!(awake.tier, Tier::Awake, "awake already: as it is");
+    commands::sleep_now(&store, &grantors(), ALICE, "hermes", SleepTier::Warm, &policy(), NOW + 2).unwrap();
+    let woken = commands::wake_now(&store, &grantors(), GRANTOR, "hermes", NOW + 2).unwrap();
+    assert_eq!((woken.tier, woken.slept_at, woken.active_at), (Tier::Awake, None, NOW + 2), "the same millisecond as its sleep: still woken");
+    assert_eq!(store.load(c.id).unwrap().unwrap().tier, Tier::Awake, "written");
 }

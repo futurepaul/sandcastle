@@ -14,5 +14,5 @@ pub mod model;
 pub mod plan;
 pub mod step;
 
-pub use apply::{apply, goes_on, learn, note};
+pub use apply::{apply, goes_on, learn, learn_note, note};
 pub use plan::plan;

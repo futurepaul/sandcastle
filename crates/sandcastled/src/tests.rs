@@ -59,15 +59,18 @@ fn write_cert(dir: &Path) -> (PathBuf, PathBuf, rustls_pki_types::CertificateDer
     (cert_path, key_path, cert.cert.der().clone())
 }
 
-fn config(dir: &Path, grantor: &Keys, port_base: u16) -> Serve {
+/// The node's configuration; `idle_after_s` 0: computers never sleep (the
+/// tests that tick by hand, five simulated seconds at a time).
+fn config(dir: &Path, grantor: &Keys, port_base: u16, idle_after_s: u64) -> Serve {
     let s = |p: &Path| p.display().to_string();
     let port = port_base.to_string();
+    let idle = idle_after_s.to_string();
     let args = [
         "sandcastled", "serve", "--state-dir", &s(dir), "--domain", DOMAIN, "--tls-cert", &s(&dir.join("cert.pem")), "--tls-key", &s(&dir.join("key.pem")),
         "--grantor", grantor.pubkey_hex(), "--msb-home", &s(dir), "--zfs-parent", "tank/sc", "--node-name", "test-node", "--port-base", &port,
         "--port-count", "10", "--snapshot-every-s", "60", "--startup-grace-s", "30", "--backup-bucket", "backups", "--backup-credentials", "/unused",
         "--backup-key-file", "/unused", "--node-key-file", "/unused", "--credentials-origin", PLATFORM, "--reserve-memory-gib", "16",
-        "--reserve-disk-gib", "100", "--reserve-engine-disk-gib", "50", "--allow-uncapped-memory",
+        "--reserve-disk-gib", "100", "--reserve-engine-disk-gib", "50", "--allow-uncapped-memory", "--idle-after-s", &idle,
     ];
     let Command::Serve(serve) = Command::try_parse_from(args).unwrap() else { panic!("serve") };
     serve.check().unwrap();
@@ -77,15 +80,15 @@ fn config(dir: &Path, grantor: &Keys, port_base: u16) -> Serve {
 impl Harness {
     async fn start(tag: &str) -> Harness {
         let dir = temp_dir(tag);
-        Harness::start_in(dir, Keys::generate(), World::new(7), free_port()).await
+        Harness::start_in(dir, Keys::generate(), World::new(7), free_port(), 0).await
     }
 
-    async fn start_in(dir: PathBuf, grantor: Keys, world: World, port_base: u16) -> Harness {
+    async fn start_in(dir: PathBuf, grantor: Keys, world: World, port_base: u16, idle_after_s: u64) -> Harness {
         let (cert, key, der) = write_cert(&dir);
-        let config = config(&dir, &grantor, port_base);
+        let config = config(&dir, &grantor, port_base, idle_after_s);
         let store = Store::open(&dir.join(crate::reset::STATE_FILE)).unwrap();
         let backup_key = BackupKey::from_hex(&"42".repeat(32)).unwrap();
-        let node = Arc::new(Node::new(store, world.clone(), config.policy(), Some(backup_key), sandcastle_node::seal::CHUNK_BYTES));
+        let node = Arc::new(Node::new(store, world.clone(), config.policy(), Some(backup_key), sandcastle_node::seal::CHUNK_BYTES).unwrap());
         let daemon = Arc::new(Daemon::new(config, node));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -105,7 +108,7 @@ impl Harness {
         self.server.abort();
         let (dir, grantor, world, port_base) = (self.dir.clone(), Keys::from_secret_hex(&self.grantor.secret_hex()).unwrap(), self.world.clone(), self.daemon.config.port_base);
         drop(self);
-        Harness::start_in(dir, grantor, world, port_base).await
+        Harness::start_in(dir, grantor, world, port_base, 0).await
     }
 
     fn now_s(&self) -> i64 {
@@ -203,6 +206,7 @@ fn spec(url_auth: UrlAuth) -> ComputerSpec {
             port: 9119,
             health_path: "/health".into(),
             env: [("DASH_PASSWORD".to_string(), "it's secret".to_string())].into(),
+            busy: None,
         },
         url_auth,
         credentials_url: None,
@@ -492,7 +496,8 @@ async fn the_capacity_report_is_the_grantors() {
     h.grant(&alice).await;
     assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
     h.converge("serving", |h| h.serving("hermes")).await;
-    h.daemon.node.sample().await;
+    let listing: std::collections::HashMap<ComputerId, Machine> = h.world.lock().machines.iter().map(|(id, m)| (*id, m.state)).collect();
+    h.daemon.node.sample(&listing).await;
     let (status, r) = h.call(&h.grantor, "GET", "/v1/node?memory_mib=2048&data_gib=5", None).await;
     assert_eq!(status, StatusCode::OK, "{r}");
     assert_eq!(r["reserve"]["memory_mib"], 16 * 1024);
@@ -502,4 +507,104 @@ async fn the_capacity_report_is_the_grantors() {
     assert_eq!(r["measured"].as_array().map(Vec::len), Some(1), "{r}");
     assert_eq!(h.call(&alice, "GET", "/v1/node", None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(h.call(&h.grantor, "GET", "/v1/node?memory_mib=1", None).await.0, StatusCode::BAD_REQUEST);
+}
+
+/// Waits, in real time, until `done` (the node's own scheduler runs).
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("never: {what}");
+}
+
+/// Goal: sleep through the daemon, with its own scheduler running: a
+/// computer put to sleep warm or cold, or gone idle, pauses or stops; a
+/// request through its URL is held, wakes it (its batch nudged, not left
+/// to the next tick), and is answered by its service; the wake API wakes
+/// it too; bytes through a tunnel opened while it was awake wake it.
+#[tokio::test]
+async fn a_sleeping_computer_wakes_for_a_request() {
+    let dir = temp_dir("sleep");
+    let h = Harness::start_in(dir, Keys::generate(), World::new(7), free_port(), 30).await;
+    let alice = Keys::generate();
+    h.grant(&alice).await;
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&spec(UrlAuth::Owner))).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    let id = h.id_of("hermes");
+    let port = h.daemon.node.store.by_name("hermes").unwrap().unwrap().host_port;
+    let _service = service(port).await;
+    let (_, ticket) = h.call(&alice, "POST", "/v1/computers/hermes/tickets", None).await;
+    let redeem = ticket["url"].as_str().unwrap().strip_prefix(&format!("https://hermes.{DOMAIN}")).unwrap().to_string();
+    let (_, headers, _) = h.browse("hermes", &redeem, None).await;
+    let session = headers.get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    let _scheduler = tokio::spawn(sandcastle_node::schedule::run(h.daemon.node.clone()));
+    let machine = |h: &Harness| h.world.lock().machines.get(&id).map(|m| m.state);
+    let observed = |h: &Harness| commands_view(h, "hermes");
+
+    // Warm on request: paused, its view settled.
+    let (status, _) = h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "warm"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    eventually("paused", || machine(&h) == Some(Machine::Paused) && observed(&h) == "warm").await;
+    let held = h.daemon.node.ledger.lock().unwrap().holds(id).unwrap();
+    assert_eq!(held, 256 << 20, "a paused machine holds what it measured");
+    let started = std::time::Instant::now();
+    let (status, _, body) = h.browse("hermes", "/after-warm", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "a warm wake is not a tick away: {:?}", started.elapsed());
+    assert_eq!((machine(&h), observed(&h).as_str()), (Some(Machine::Running), "serving"));
+    assert_eq!(h.daemon.node.ledger.lock().unwrap().holds(id), Some((2048 << 20) + (64 << 20)), "awake: its whole allocation");
+
+    // Cold on request: stopped, holding nothing; a request boots it.
+    let (status, _) = h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "cold"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    eventually("stopped", || machine(&h) == Some(Machine::Stopped) && observed(&h) == "cold").await;
+    assert_eq!(h.daemon.node.ledger.lock().unwrap().holds(id), None, "cold holds no memory");
+    let (status, _, _) = h.browse("hermes", "/after-cold", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(machine(&h), Some(Machine::Running));
+
+    // The wake API, a grantor's: asleep, then awake without a request.
+    h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "warm"}))).await;
+    eventually("paused again", || machine(&h) == Some(Machine::Paused)).await;
+    let (status, _) = h.call(&h.grantor, "POST", "/v1/computers/hermes/wake", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    eventually("woken by the API", || machine(&h) == Some(Machine::Running) && observed(&h) == "serving").await;
+    let stranger = Keys::generate();
+    h.grant(&stranger).await;
+    assert_eq!(h.call(&stranger, "POST", "/v1/computers/hermes/wake", None).await.0, StatusCode::NOT_FOUND);
+
+    // Idle: nothing for the idle time (the clock is the test's), warm.
+    h.world.lock().now += 31_000;
+    eventually("idle, then paused", || machine(&h) == Some(Machine::Paused)).await;
+
+    // A tunnel opened while awake: bytes sent after it slept wake it.
+    h.world.lock().now += 1_000;
+    h.call(&h.grantor, "POST", "/v1/computers/hermes/wake", None).await;
+    eventually("awake for the tunnel", || observed(&h) == "serving").await;
+    let host = format!("hermes.{DOMAIN}");
+    let tcp = tokio::net::TcpStream::connect(h.addr).await.unwrap();
+    let tls = h.connector.connect(rustls_pki_types::ServerName::try_from(host.clone()).unwrap(), tcp).await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    let req = Request::get("/ws").header("host", &host).header("cookie", &session).header("connection", "upgrade").header("upgrade", "echo").body(Full::new(Bytes::new())).unwrap();
+    let mut resp = send.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let mut io = hyper_util::rt::TokioIo::new(hyper::upgrade::on(&mut resp).await.unwrap());
+    h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "warm"}))).await;
+    eventually("paused under an open tunnel", || machine(&h) == Some(Machine::Paused)).await;
+    use tokio::io::AsyncWriteExt;
+    h.world.lock().now += 1_000;
+    io.write_all(b"typed").await.unwrap();
+    eventually("woken by the tunnel's bytes", || machine(&h) == Some(Machine::Running)).await;
+}
+
+fn commands_view(h: &Harness, name: &str) -> String {
+    let c = h.daemon.node.store.by_name(name).unwrap().unwrap();
+    let v = sandcastle_node::commands::view(&c, String::new());
+    serde_json::to_value(&v.observed).unwrap()["state"].as_str().unwrap().to_string()
 }

@@ -48,7 +48,7 @@ pub fn target(host: Option<&str>, domain: &str) -> Target {
     }
 }
 
-pub async fn dispatch<W: World>(d: &Daemon<W>, peer: SocketAddr, req: Request<Incoming>) -> Response<Body> {
+pub async fn dispatch<W: World>(d: &Arc<Daemon<W>>, peer: SocketAddr, req: Request<Incoming>) -> Response<Body> {
     let host = req.headers().get("host").and_then(|v| v.to_str().ok()).map(str::to_string);
     match target(host.as_deref(), &d.config.domain) {
         Target::Api => crate::api::handle(d, req).await,

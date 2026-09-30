@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sandcastle_core::model::{
-    ChainLink, Computer, ComputerId, CredentialShape, Desired, Failure, FaultKind, Fixed, Generation, Held, Millis, Restore, Ship, SnapshotKind, SnapshotName, Status, Step, Upload,
+    ChainLink, Computer, ComputerId, CredentialShape, Desired, Failure, FaultKind, Fixed, Generation, Held, Millis, Restore, Ship, SnapshotKind, SnapshotName, Status, Step, Tier, Upload,
 };
 use sandcastle_core::step::{Change, Shipped};
 use sandcastle_proto::{GrantSpec, Storage, UrlAuth};
@@ -51,7 +51,14 @@ pub enum StoreError {
     Corrupt(String),
     #[error("{0} is full")]
     Full(&'static str),
+    /// State an older (or newer) sandcastled wrote: a hard cut, never a
+    /// guess at what its columns meant.
+    #[error("the state is schema {found}, and this sandcastled reads schema {want}: `sandcastled reset` starts a test node over")]
+    Schema { found: i64, want: i64 },
 }
+
+/// The schema this code writes (`PRAGMA user_version`). 1: tiers.
+pub const SCHEMA_VERSION: i64 = 1;
 
 fn corrupt<T>(what: String) -> Result<T, StoreError> {
     Err(StoreError::Corrupt(what))
@@ -91,34 +98,38 @@ CREATE TABLE IF NOT EXISTS computers (
   launched_at INTEGER,
   served_at INTEGER,
   snapshot_seq INTEGER NOT NULL CHECK (snapshot_seq >= 1),
-  snapshot_due TEXT CHECK (snapshot_due IN ('auto', 'stop', 'rebase')),
+  snapshot_due TEXT CHECK (snapshot_due IN ('auto', 'stop', 'rebase', 'pause')),
   snapshot_at INTEGER,
   credentials_digest BLOB CHECK (credentials_digest IS NULL OR length(credentials_digest) = 32),
   credentials_withdrawn INTEGER NOT NULL CHECK (credentials_withdrawn IN (0, 1)),
   credentials_at INTEGER,
   restore_source TEXT CHECK (restore_source IS NULL OR length(restore_source) = 16),
   ship_head_seq INTEGER,
-  ship_head_kind TEXT CHECK (ship_head_kind IN ('auto', 'stop', 'rebase')),
+  ship_head_kind TEXT CHECK (ship_head_kind IN ('auto', 'stop', 'rebase', 'pause')),
   ship_since_whole INTEGER NOT NULL CHECK (ship_since_whole >= 0),
   upload_key TEXT,
   upload_id TEXT,
   upload_seq INTEGER,
-  upload_kind TEXT CHECK (upload_kind IN ('auto', 'stop', 'rebase')),
+  upload_kind TEXT CHECK (upload_kind IN ('auto', 'stop', 'rebase', 'pause')),
   upload_base_seq INTEGER,
-  upload_base_kind TEXT CHECK (upload_base_kind IN ('auto', 'stop', 'rebase')),
+  upload_base_kind TEXT CHECK (upload_base_kind IN ('auto', 'stop', 'rebase', 'pause')),
   upload_doomed INTEGER CHECK (upload_doomed IN (0, 1)),
   manifest_due INTEGER NOT NULL CHECK (manifest_due IN (0, 1)),
   ship_pending INTEGER NOT NULL CHECK (ship_pending IN (0, 1)),
   ship_failures INTEGER NOT NULL CHECK (ship_failures >= 0),
   ship_retry_at INTEGER,
-  status TEXT NOT NULL CHECK (status IN ('absent', 'starting', 'serving', 'stopped', 'failed')),
+  tier TEXT NOT NULL CHECK (tier IN ('awake', 'warm', 'cold')),
+  slept_at INTEGER,
+  active_at INTEGER NOT NULL CHECK (active_at >= 0),
+  status TEXT NOT NULL CHECK (status IN ('absent', 'starting', 'serving', 'warm', 'cold', 'stopped', 'failed')),
   status_reason TEXT CHECK (length(status_reason) <= 512),
   version INTEGER NOT NULL CHECK (version >= 1),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   CHECK ((ship_head_seq IS NULL) = (ship_head_kind IS NULL)),
   CHECK ((upload_key IS NULL) = (upload_id IS NULL) AND (upload_id IS NULL) = (upload_seq IS NULL)),
-  CHECK ((credentials_digest IS NULL) = (credentials_at IS NULL))
+  CHECK ((credentials_digest IS NULL) = (credentials_at IS NULL)),
+  CHECK ((tier = 'awake') = (slept_at IS NULL))
 );
 CREATE INDEX IF NOT EXISTS computers_owner ON computers (owner);
 -- What each generation makes: kept for the spec's and the good one.
@@ -129,7 +140,10 @@ CREATE TABLE IF NOT EXISTS generations (
   port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
   health_path TEXT NOT NULL,
   credentials_url TEXT,
-  PRIMARY KEY (computer_id, seq)
+  busy_path TEXT,
+  busy_field TEXT,
+  PRIMARY KEY (computer_id, seq),
+  CHECK ((busy_path IS NULL) = (busy_field IS NULL))
 );
 CREATE TABLE IF NOT EXISTS generation_args (
   computer_id TEXT NOT NULL,
@@ -186,9 +200,9 @@ CREATE TABLE IF NOT EXISTS restore_links (
   computer_id TEXT NOT NULL REFERENCES computers (id) ON DELETE CASCADE,
   position INTEGER NOT NULL CHECK (position >= 0),
   snapshot_seq INTEGER NOT NULL,
-  snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('auto', 'stop', 'rebase')),
+  snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('auto', 'stop', 'rebase', 'pause')),
   base_seq INTEGER,
-  base_kind TEXT CHECK (base_kind IN ('auto', 'stop', 'rebase')),
+  base_kind TEXT CHECK (base_kind IN ('auto', 'stop', 'rebase', 'pause')),
   object_key TEXT NOT NULL,
   PRIMARY KEY (computer_id, position)
 );
@@ -200,9 +214,9 @@ CREATE TABLE IF NOT EXISTS backups (
   computer_name TEXT NOT NULL,
   owner TEXT NOT NULL CHECK (length(owner) = 64),
   snapshot_seq INTEGER NOT NULL,
-  snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('auto', 'stop', 'rebase')),
+  snapshot_kind TEXT NOT NULL CHECK (snapshot_kind IN ('auto', 'stop', 'rebase', 'pause')),
   base_seq INTEGER,
-  base_kind TEXT CHECK (base_kind IN ('auto', 'stop', 'rebase')),
+  base_kind TEXT CHECK (base_kind IN ('auto', 'stop', 'rebase', 'pause')),
   data_gib INTEGER NOT NULL,
   data_path TEXT NOT NULL,
   bytes INTEGER NOT NULL CHECK (bytes >= 0),
@@ -340,7 +354,16 @@ impl Store {
         // FULL: what the API said it stored survives a power cut; the node
         // writes rarely, so the fsyncs cost little.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA)?;
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+        match (tables, found) {
+            (0, _) => {
+                conn.execute_batch(SCHEMA)?;
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            (_, v) if v == SCHEMA_VERSION => conn.execute_batch(SCHEMA)?,
+            (_, v) => return Err(StoreError::Schema { found: v, want: SCHEMA_VERSION }),
+        }
         let store = Store { conn: Mutex::new(conn) };
         // Every row is read and checked once at open: a node never starts
         // on state it cannot trust.
@@ -532,6 +555,9 @@ fn read_computer(conn: &Connection, id: ComputerId) -> Result<Option<Computer>, 
                 ship_pending: int("ship_pending")?,
                 ship_failures: int("ship_failures")?,
                 ship_retry_at: opt_int("ship_retry_at")?,
+                tier: text("tier")?,
+                slept_at: opt_int("slept_at")?,
+                active_at: int("active_at")?,
                 status: text("status")?,
                 status_reason: opt_text("status_reason")?,
                 version: int("version")?,
@@ -588,6 +614,9 @@ struct RawRow {
     ship_pending: i64,
     ship_failures: i64,
     ship_retry_at: Option<i64>,
+    tier: String,
+    slept_at: Option<i64>,
+    active_at: i64,
     status: String,
     status_reason: Option<String>,
     version: i64,
@@ -695,6 +724,9 @@ fn assemble(conn: &Connection, id: ComputerId, r: RawRow) -> Result<Computer, St
             failures: u32_of(r.ship_failures, "ship_failures")?,
             retry_at: millis(r.ship_retry_at, "ship_retry_at")?,
         },
+        tier: Tier::parse(&r.tier).ok_or_else(|| StoreError::Corrupt(format!("tier {:?}", r.tier)))?,
+        slept_at: millis(r.slept_at, "slept_at")?,
+        active_at: u(r.active_at, "active_at")?,
         status: Status::parse(&r.status).ok_or_else(|| StoreError::Corrupt(format!("status {:?}", r.status)))?,
         status_reason: r.status_reason,
         version: u(r.version, "version")?,
@@ -703,14 +735,20 @@ fn assemble(conn: &Connection, id: ComputerId, r: RawRow) -> Result<Computer, St
 }
 
 fn read_generation(conn: &Connection, id: ComputerId, seq: u32) -> Result<Option<Generation>, StoreError> {
-    let head: Option<(String, i64, String, Option<String>)> = conn
+    type Head = (String, i64, String, Option<String>, Option<String>, Option<String>);
+    let head: Option<Head> = conn
         .query_row(
-            "SELECT image, port, health_path, credentials_url FROM generations WHERE computer_id = ?1 AND seq = ?2",
+            "SELECT image, port, health_path, credentials_url, busy_path, busy_field FROM generations WHERE computer_id = ?1 AND seq = ?2",
             params![id.hex(), seq],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?;
-    let Some((image, port, health_path, credentials_url)) = head else { return Ok(None) };
+    let Some((image, port, health_path, credentials_url, busy_path, busy_field)) = head else { return Ok(None) };
+    let busy = match (busy_path, busy_field) {
+        (None, None) => None,
+        (Some(path), Some(field)) => Some(sandcastle_proto::Busy { path, field }),
+        _ => return corrupt(format!("{}: generation {seq} has half a busy probe", id.hex())),
+    };
     let mut stmt = conn.prepare("SELECT arg FROM generation_args WHERE computer_id = ?1 AND seq = ?2 ORDER BY position")?;
     let argv: Vec<String> = stmt.query_map(params![id.hex(), seq], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let mut stmt = conn.prepare("SELECT name, value FROM generation_env WHERE computer_id = ?1 AND seq = ?2")?;
@@ -732,6 +770,7 @@ fn read_generation(conn: &Connection, id: ComputerId, seq: u32) -> Result<Option
         env,
         credentials_url,
         init,
+        busy,
     }))
 }
 
@@ -783,7 +822,8 @@ fn write_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -> Result<(),
            ship_head_seq = ?21, ship_head_kind = ?22, ship_since_whole = ?23,
            upload_key = ?24, upload_id = ?25, upload_seq = ?26, upload_kind = ?27, upload_base_seq = ?28, upload_base_kind = ?29, upload_doomed = ?30,
            manifest_due = ?31, ship_pending = ?32, ship_failures = ?33, ship_retry_at = ?34,
-           status = ?35, status_reason = ?36, version = ?37, updated_at = ?38, url_auth = ?39
+           status = ?35, status_reason = ?36, version = ?37, updated_at = ?38, url_auth = ?39,
+           tier = ?40, slept_at = ?41, active_at = ?42
          WHERE id = ?1",
         params![
             c.id.hex(),
@@ -825,6 +865,9 @@ fn write_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -> Result<(),
             i(c.version)?,
             i(now)?,
             url_auth_str(c.url_auth),
+            c.tier.as_str(),
+            opt(c.slept_at)?,
+            i(c.active_at)?,
         ],
     )?;
     assert_eq!(n, 1, "the row being written exists");
@@ -854,8 +897,8 @@ fn write_generation(tx: &Transaction<'_>, id: ComputerId, g: &Generation) -> Res
         return Ok(());
     }
     tx.execute(
-        "INSERT INTO generations (computer_id, seq, image, port, health_path, credentials_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id.hex(), g.seq, g.image, g.port, g.health_path, g.credentials_url],
+        "INSERT INTO generations (computer_id, seq, image, port, health_path, credentials_url, busy_path, busy_field) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id.hex(), g.seq, g.image, g.port, g.health_path, g.credentials_url, g.busy.as_ref().map(|b| &b.path), g.busy.as_ref().map(|b| &b.field)],
     )?;
     for (position_index, arg) in g.argv.iter().enumerate() {
         tx.execute("INSERT INTO generation_args (computer_id, seq, position, arg) VALUES (?1, ?2, ?3, ?4)", params![id.hex(), g.seq, position(position_index), arg])?;
@@ -920,10 +963,12 @@ fn insert_backup(tx: &Transaction<'_>, c: &Computer, s: &Shipped) -> Result<(), 
 pub(crate) fn insert_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -> Result<(), StoreError> {
     sandcastle_core::check::computer(c);
     assert_eq!(c.version, 1);
+    assert_eq!(c.tier, Tier::Awake, "a new computer is awake");
     tx.execute(
         "INSERT INTO computers (id, name, owner, host_port, vcpus, memory_mib, storage, data_gib, data_path, url_auth, desired, spec_seq,
-           failures, snapshot_seq, credentials_withdrawn, ship_since_whole, manifest_due, ship_pending, ship_failures, status, version, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, 0, 0, 0, 0, 0, ?14, 1, ?15, ?15)",
+           failures, snapshot_seq, credentials_withdrawn, ship_since_whole, manifest_due, ship_pending, ship_failures, status, version, created_at, updated_at,
+           tier, active_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, 0, 0, 0, 0, 0, ?14, 1, ?15, ?15, 'awake', ?16)",
         params![
             c.id.hex(),
             c.name,
@@ -940,6 +985,7 @@ pub(crate) fn insert_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -
             i(c.snapshot_seq)?,
             c.status.as_str(),
             i(now)?,
+            i(c.active_at)?,
         ],
     )?;
     write_computer(tx, c, now)
@@ -1062,6 +1108,28 @@ mod tests {
     use sandcastle_core::model::SnapshotKind;
     use sandcastle_core::step::{Change, Shipped};
 
+    /// Goal: state an older sandcastled wrote (no schema version) is
+    /// refused with what to do, never read as if its columns meant ours;
+    /// a fresh file gets this schema, and opens again.
+    #[test]
+    fn state_of_another_schema_is_refused() {
+        let dir = std::env::temp_dir().join(format!("sandcastle-store-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.db");
+        let _ = std::fs::remove_file(&old);
+        Connection::open(&old).unwrap().execute_batch("CREATE TABLE computers (id TEXT PRIMARY KEY);").unwrap();
+        match Store::open(&old) {
+            Err(StoreError::Schema { found: 0, want: SCHEMA_VERSION }) => {}
+            Err(e) => panic!("another error: {e}"),
+            Ok(_) => panic!("an old schema opened"),
+        }
+        let fresh = dir.join("fresh.db");
+        let _ = std::fs::remove_file(&fresh);
+        drop(Store::open(&fresh).unwrap());
+        drop(Store::open(&fresh).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Goal: a computer past `BACKUPS_PER_COMPUTER_MAX` backups still
     /// records what it ships (the node would stop if it could not), and its
     /// manifest lists the newest (audit defect 2: the old node froze on the
@@ -1079,7 +1147,7 @@ mod tests {
             storage: sandcastle_proto::Storage::Data,
             data_gib: 1,
             data_path: "/data".into(),
-            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 8000, health_path: "/".into(), env: Default::default() },
+            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 8000, health_path: "/".into(), env: Default::default(), busy: None },
             url_auth: sandcastle_proto::UrlAuth::Public,
             credentials_url: None,
         };
@@ -1092,6 +1160,7 @@ mod tests {
             ships: true,
             reserve: sandcastle_core::budget::Reserve { memory: 1 << 30, disk: 1 << 30, engine_disk: 1 << 40 },
             costs: sandcastle_core::budget::Costs { machine_overhead: 0, snapshot_headroom_pct: 0, layer: 1 },
+            sleep: None,
             node: "n".into(),
         };
         crate::commands::put_computer(&store, &owner, "busy", &spec, None, id, 20_000..20_001, &policy, 1).unwrap();

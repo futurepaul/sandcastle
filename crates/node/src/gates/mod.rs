@@ -58,6 +58,11 @@ pub trait Engine: Send + Sync + 'static {
     fn quiesce(&self, id: ComputerId, stop: Option<&[String]>) -> impl Future<Output = GateResult<()>> + Send;
     /// Flushes the guest's writes to its disks.
     fn sync(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
+    /// Freezes the machine, its memory kept, once its guest has flushed
+    /// its writes; paused already is success.
+    fn pause(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
+    /// Thaws a paused machine; running already is success.
+    fn resume(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
 }
 
 /// A snapshot's stream, read to its end, then finished (a sender that
@@ -115,9 +120,11 @@ pub trait Source: Send + Sync + 'static {
     fn pubkey(&self) -> &str;
 }
 
-/// Whether a service answers its health path through its host port.
+/// Whether a service answers its health path through its host port, and
+/// whether it says it is working (`probe::busy_says`: no answer is busy).
 pub trait Prober: Send + Sync + 'static {
     fn probe(&self, port: u16, path: &str) -> impl Future<Output = bool> + Send;
+    fn busy(&self, port: u16, path: &str, field: &str) -> impl Future<Output = bool> + Send;
 }
 
 /// The one clock.
@@ -175,7 +182,7 @@ pub struct HostFacts {
 /// Measurements, for the budgets (docs/sandcastle-sleep.md): read-only,
 /// and never entering a guest.
 pub trait Meter: Send + Sync + 'static {
-    /// Every running machine the node made, measured now.
+    /// Every running or paused machine the node made, measured now.
     fn samples(&self) -> impl Future<Output = GateResult<HashMap<ComputerId, Sample>>> + Send;
     fn host(&self) -> impl Future<Output = GateResult<HostFacts>> + Send;
 }

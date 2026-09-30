@@ -105,6 +105,8 @@ pub struct Serve {
     #[command(flatten)]
     pub budget: BudgetArgs,
     #[command(flatten)]
+    pub sleep: SleepArgs,
+    #[command(flatten)]
     pub bucket: BucketArgs,
     /// Upload part size, MiB (S3's floor is 5).
     #[arg(long, default_value_t = 16)]
@@ -215,6 +217,51 @@ impl BudgetArgs {
     }
 }
 
+/// When computers sleep, and what counts as activity (docs/sandcastle-sleep.md,
+/// Tiers). The floors are tuned from the capacity report's measured rates.
+#[derive(clap::Args, Debug, Clone)]
+pub struct SleepArgs {
+    /// A serving computer with no activity for this long, and not busy, is
+    /// paused (warm), s; 0: computers never sleep.
+    #[arg(long, default_value_t = 30)]
+    pub idle_after_s: u64,
+    /// A warm computer is stopped (cold) after this long, s.
+    #[arg(long, default_value_t = 86_400)]
+    pub cold_after_s: u64,
+    /// A guest using more than this much of one vCPU between samples
+    /// (thousandths) is active.
+    #[arg(long, default_value_t = 50)]
+    pub activity_cpu_permille: u32,
+    /// A guest moving more network bytes a second than this between
+    /// samples is active.
+    #[arg(long, default_value_t = 4096)]
+    pub activity_net_bytes_per_s: u64,
+}
+
+impl SleepArgs {
+    pub fn check(&self) -> Result<(), String> {
+        const WEEK_S: u64 = 7 * 24 * 60 * 60;
+        if self.idle_after_s > WEEK_S {
+            return Err("--idle-after-s is at most a week".into());
+        }
+        if self.idle_after_s > 0 && (self.cold_after_s == 0 || self.cold_after_s > 52 * WEEK_S) {
+            return Err("--cold-after-s is 1 s to a year".into());
+        }
+        if self.activity_cpu_permille > 1000 * sandcastle_proto::VCPUS_MAX {
+            return Err("--activity-cpu-permille is at most a thousand for each vCPU a machine may have".into());
+        }
+        Ok(())
+    }
+
+    pub fn sleep(&self) -> Option<sandcastle_core::model::Sleep> {
+        (self.idle_after_s > 0).then(|| sandcastle_core::model::Sleep { idle_after_ms: self.idle_after_s * 1000, cold_after_ms: self.cold_after_s * 1000 })
+    }
+
+    pub fn floors(&self) -> sandcastle_node::activity::Floors {
+        sandcastle_node::activity::Floors { cpu_permille: self.activity_cpu_permille, net_bytes_per_s: self.activity_net_bytes_per_s }
+    }
+}
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct BucketArgs {
     /// The S3 bucket for backups; without it, snapshots stay on the host.
@@ -309,6 +356,7 @@ impl Serve {
             ships: self.bucket.backup_bucket.is_some(),
             reserve: self.budget.reserve(),
             costs: self.budget.costs(),
+            sleep: self.sleep.sleep(),
             node: self.engine.node_name.clone(),
         }
     }
@@ -318,6 +366,7 @@ impl Serve {
         self.engine.check()?;
         self.bucket.check()?;
         self.budget.check()?;
+        self.sleep.check()?;
         if self.grantors.is_empty() {
             return Err("at least one --grantor".into());
         }

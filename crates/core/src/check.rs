@@ -4,7 +4,7 @@
 //! trust.
 
 use crate::limits::{CHAIN_LINKS_MAX, GENERATION_SEQ_MAX, PRUNE_BATCH_MAX, REASON_BYTES_MAX};
-use crate::model::{Computer, Desired, Knowledge, Machine, Policy, Status};
+use crate::model::{Computer, Desired, Knowledge, Machine, Policy, Status, Tier};
 use crate::step::{Change, Effect, Next, Note};
 
 /// Everything a row must be, whatever its state.
@@ -42,6 +42,13 @@ pub fn computer(c: &Computer) {
     if c.status == Status::Serving {
         assert!(c.served_at.is_some(), "serving means it answered");
         assert!(c.applied_seq.is_some(), "serving means a machine");
+    }
+    assert_eq!(c.tier == Tier::Awake, c.slept_at.is_none(), "a computer asleep says since when, and only then");
+    if c.status == Status::Warm {
+        assert_ne!(c.tier, Tier::Awake, "warm means asleep");
+    }
+    if c.status == Status::Cold {
+        assert_eq!(c.tier, Tier::Cold, "cold means cold");
     }
     for reason in c.status_reason.iter().chain(c.failure.iter().map(|f| &f.reason)) {
         assert!(reason.len() <= REASON_BYTES_MAX);
@@ -88,12 +95,34 @@ fn restore_state(c: &Computer) {
 /// only ever asked for in the one state that allows them.
 pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
     let Next::Do(effect) = next else {
-        if let Next::Note(Note::Served { seq }) = next {
-            assert_eq!(k.probe, Some(true), "served means it answered, this batch");
-            assert_eq!(c.applied_seq, Some(*seq), "what answered is the machine's generation");
+        match next {
+            Next::Note(Note::Served { seq }) => {
+                assert_eq!(k.probe, Some(true), "served means it answered, this batch");
+                assert_eq!(c.applied_seq, Some(*seq), "what answered is the machine's generation");
+            }
+            Next::Note(Note::Sleep { tier, active_at }) => {
+                assert!(p.sleep.is_some(), "only a node that sleeps computers puts one to sleep");
+                assert_eq!(c.desired, Desired::Running, "only a computer meant to run sleeps");
+                assert!(*active_at >= c.active_at, "a sleep acts on the newest activity it knows");
+                match tier {
+                    Tier::Awake => panic!("a sleep is warm or cold"),
+                    Tier::Warm => assert_eq!(c.tier, Tier::Awake, "warm comes from awake"),
+                    Tier::Cold => assert_eq!(c.tier, Tier::Warm, "cold comes from warm (or a demotion)"),
+                }
+            }
+            Next::Note(Note::Wake { .. }) => {
+                assert_ne!(c.tier, Tier::Awake, "only a sleeping computer wakes");
+                let for_activity = k.activity.is_some_and(|s| s.in_flight || s.last.is_some_and(|at| at > c.active_at));
+                assert!(p.sleep.is_none() || for_activity, "a wake is for a request in flight, or activity newer than the sleep acted on");
+            }
+            Next::Note(Note::Demote) => panic!("a demotion is the node's, across computers, never a plan's"),
+            _ => {}
         }
         return;
     };
+    if matches!(effect, Effect::Quiesce { .. } | Effect::Sync | Effect::Rotate { .. } | Effect::Launch { .. }) {
+        assert_ne!(k.machine, Machine::Paused, "a paused machine takes no exec");
+    }
     match effect {
         Effect::DestroyDisk => {
             assert!(c.desired == Desired::Deleted || c.restore.is_some(), "a disk is destroyed only for a deletion or a restore starting over");
@@ -107,16 +136,31 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             }
         }
         Effect::Remove => {
-            assert_ne!(k.machine, Machine::Running, "a running machine is stopped first");
+            assert!(!matches!(k.machine, Machine::Running | Machine::Paused), "a running or paused machine is stopped first");
             assert!(c.desired == Desired::Deleted || c.restore.is_some());
         }
         Effect::Launch { .. } => assert!(c.target().0.init.is_none(), "a service its image's init runs is never launched by the node"),
         Effect::Stop { force } => {
-            let unquiesced = crate::plan::wedged(c) || crate::plan::stop_failed(c);
-            assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service or its stop failed");
-            assert_eq!(*force, crate::plan::stop_failed(c), "a machine is killed only after a graceful stop failed");
+            let unresumed = k.machine == Machine::Paused && crate::plan::resume_failed(c);
+            let unquiesced = crate::plan::wedged(c) || crate::plan::stop_failed(c) || unresumed;
+            assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service, its stop, or its resume failed");
+            assert_eq!(*force, crate::plan::stop_failed(c) || unresumed, "a machine is killed only after a graceful stop, or a resume, failed");
         }
-        Effect::Start { .. } => assert_eq!(k.room, Some(true), "a machine starts only with room in the reserve"),
+        Effect::Pause => {
+            assert_eq!((c.desired, c.tier, k.machine), (Desired::Running, Tier::Warm, Machine::Running), "only a running machine the node means warm is paused");
+            let seen = k.activity.expect("a pause follows a fresh look at its activity");
+            assert!(!seen.in_flight && seen.last.unwrap_or(0) <= c.active_at, "nothing happened since the sleep was decided");
+        }
+        Effect::Resume => {
+            assert_eq!(k.machine, Machine::Paused);
+            if c.desired == Desired::Running && c.tier == Tier::Awake {
+                assert_eq!(k.room, Some(true), "a woken machine resumes only with room for all it may use");
+            }
+        }
+        Effect::Start { .. } => {
+            assert_eq!(k.room, Some(true), "a machine starts only with room in the reserve");
+            assert_eq!(c.tier, Tier::Awake, "a machine is started for a computer awake");
+        }
         Effect::Create { seq, machine, credentials } => {
             assert_eq!(k.room, Some(true), "a machine is made only with room in the reserve");
             if let Some(boot) = &machine.init {
@@ -125,7 +169,9 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             }
             assert_eq!(c.desired, Desired::Running);
             assert_eq!(*seq, c.target().0.seq, "a machine is made from the target generation");
-            assert_ne!(k.machine, Machine::Running, "a running machine is stopped before it is replaced");
+            assert!(c.applied_seq.is_none() && c.machine_stop.is_none(), "the row forgets the machine it replaces first");
+            assert!(!matches!(k.machine, Machine::Running | Machine::Paused), "a running or paused machine is stopped before it is replaced");
+            assert_eq!(c.tier, Tier::Awake, "a machine is made for a computer awake");
             assert!(c.snapshot_due.is_none(), "an owed snapshot is taken before the machine is replaced");
             if k.machine != Machine::Absent && c.has_disk() {
                 let disk = k.disk.as_ref().expect("a replacement looks at the disk first");
@@ -173,6 +219,7 @@ pub fn change(before: &Computer, change: &Change) {
     assert_eq!(after.spec, before.spec, "only the owner changes the spec");
     assert_eq!(after.url_auth, before.url_auth);
     assert!(after.snapshot_seq >= before.snapshot_seq, "snapshot numbers only move forward");
+    assert!(after.active_at >= before.active_at, "activity acted on only moves forward");
     let head_seq = |c: &Computer| c.ship.head.map(|h| h.seq);
     assert!(head_seq(after) >= head_seq(before), "the shipped head only moves forward");
     if let Some(shipped) = &change.shipped {

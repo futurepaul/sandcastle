@@ -10,7 +10,7 @@ use sandcastle_proto::Credential;
 use crate::check;
 use crate::credentials;
 use crate::limits::{INCREMENTALS_MAX, PRUNE_BATCH_MAX};
-use crate::model::{Computer, CredentialShape, Desired, DiskFacts, FaultKind, Fetched, Generation, Knowledge, Machine, Millis, Policy, Restore, SnapshotKind, SnapshotName, Status, Step};
+use crate::model::{Computer, CredentialShape, Desired, DiskFacts, FaultKind, Fetched, Generation, Knowledge, Machine, Millis, Policy, Restore, Sleep, SnapshotKind, SnapshotName, Status, Step, Tier};
 use crate::step::{Boot, Effect, MachineSpec, Next, Note, Observe};
 
 pub fn plan(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
@@ -38,8 +38,13 @@ fn decide(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
 /// A clean stop: the service first, then the machine. A service whose
 /// quiesce failed last time (a wedged guest) goes down with its machine,
 /// and a machine whose stop failed (its quiesce was tried before it) is
-/// killed, so no stop or deletion waits on a guest or a VMM forever.
+/// killed, so no stop or deletion waits on a guest or a VMM forever. A
+/// paused machine takes neither: it is resumed first, or killed when it
+/// would not resume.
 fn halt(c: &Computer, k: &Knowledge) -> Next {
+    if k.machine == Machine::Paused {
+        return Next::Do(if resume_failed(c) { Effect::Stop { force: true } } else { Effect::Resume });
+    }
     if k.quiesced || wedged(c) || stop_failed(c) {
         Next::Do(Effect::Stop { force: stop_failed(c) })
     } else {
@@ -73,12 +78,18 @@ pub fn wedged(c: &Computer) -> bool {
     c.failure.as_ref().is_some_and(|f| f.step == Step::Quiesce)
 }
 
+/// The last resume failed: the paused machine is killed, and a computer
+/// meant to run boots afresh.
+pub fn resume_failed(c: &Computer) -> bool {
+    c.failure.as_ref().is_some_and(|f| f.step == Step::Resume)
+}
+
 fn delete(c: &Computer, k: &Knowledge) -> Next {
     if let Some(u) = &c.ship.upload {
         return Next::Do(Effect::AbortUpload { key: u.key.clone(), id: u.id.clone() });
     }
     match k.machine {
-        Machine::Running => halt(c, k),
+        Machine::Running | Machine::Paused => halt(c, k),
         Machine::Stopped | Machine::Other => Next::Do(Effect::Remove),
         Machine::Absent if !c.has_disk() => Next::Do(Effect::DeleteRow),
         Machine::Absent => match &k.disk {
@@ -90,7 +101,7 @@ fn delete(c: &Computer, k: &Knowledge) -> Next {
 }
 
 fn stopped(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
-    if k.machine == Machine::Running {
+    if matches!(k.machine, Machine::Running | Machine::Paused) {
         // The snapshot after a stop is owed before the stop, so a crash
         // between the two still takes it.
         if c.has_disk() && c.snapshot_due.is_none() {
@@ -112,9 +123,21 @@ fn running(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     if let Some(r) = &c.restore {
         return restore(c, r, k);
     }
+    match (c.tier, &p.sleep) {
+        (Tier::Awake, _) => awake(c, k, p, now),
+        // A node that no longer puts computers to sleep wakes those that
+        // slept.
+        (_, None) => Next::Note(Note::Wake { active_at: now }),
+        (Tier::Warm, Some(sleep)) => warm(c, k, p, sleep, now),
+        (Tier::Cold, Some(_)) => cold(c, k, p, now),
+    }
+}
+
+fn awake(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     let (target, _) = c.target();
     let current = c.applied_seq == Some(target.seq);
     match (k.machine, current) {
+        (Machine::Paused, _) => paused(c, k, p, now),
         (Machine::Running, true) => serving(c, target, k, p, now),
         // A rebase: the new generation's credentials first, so a source
         // that is down leaves the old machine serving; then a clean stop
@@ -159,6 +182,9 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
     if let Some(n) = room(c, k, p) {
         return n;
     }
+    if c.applied_seq.is_some() || c.machine_stop.is_some() {
+        return Next::Note(Note::Replace);
+    }
     let machine = MachineSpec {
         image: target.image.clone(),
         vcpus: c.fixed.vcpus,
@@ -196,6 +222,116 @@ fn start(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         return n;
     }
     Next::Do(Effect::Start { credentials })
+}
+
+/// A paused machine the node wants awake (it was woken, or a pause's reply
+/// was lost): resumed with room for all it may use, killed and booted
+/// afresh when it would not resume, or asleep again when it went idle
+/// while it waited for room.
+fn paused(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
+    if resume_failed(c) {
+        return Next::Do(Effect::Stop { force: true });
+    }
+    if let Some(sleep) = &p.sleep {
+        match idle(c, k, sleep, now) {
+            Err(look) => return look,
+            Ok(Some(last)) => return Next::Note(Note::Sleep { tier: Tier::Warm, active_at: last }),
+            Ok(None) => {}
+        }
+    }
+    if let Some(n) = room(c, k, p) {
+        return n;
+    }
+    Next::Do(Effect::Resume)
+}
+
+/// Whether nothing happened for the idle time: `Err` to look at its
+/// activity first; `Ok(Some(last))`, idle since `last`; `Ok(None)`, active
+/// (a request in flight is always active).
+fn idle(c: &Computer, k: &Knowledge, sleep: &Sleep, now: Millis) -> Result<Option<Millis>, Next> {
+    let Some(seen) = k.activity else { return Err(Next::Observe(Observe::Activity)) };
+    if seen.in_flight {
+        return Ok(None);
+    }
+    let last = seen.last.unwrap_or(0).max(c.active_at);
+    Ok((now >= last.saturating_add(sleep.idle_after_ms)).then_some(last))
+}
+
+/// An idle serving computer goes warm, unless its service says it is
+/// working (then the node counts that as activity, and asks again an idle
+/// time later).
+fn sleepy(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Millis) -> Option<Next> {
+    let sleep = p.sleep.as_ref()?;
+    let last = match idle(c, k, sleep, now) {
+        Err(look) => return Some(look),
+        Ok(None) => return None,
+        Ok(Some(last)) => last,
+    };
+    if let Some(b) = &target.busy {
+        match k.busy {
+            None => return Some(Next::Observe(Observe::Busy { port: c.host_port, path: b.path.clone(), field: b.field.clone() })),
+            Some(true) => return None,
+            Some(false) => {}
+        }
+    }
+    Some(Next::Note(Note::Sleep { tier: Tier::Warm, active_at: last }))
+}
+
+/// A request in flight, or activity newer than what it slept after, wakes
+/// it.
+fn woken(c: &Computer, k: &Knowledge, now: Millis) -> Option<Next> {
+    let Some(seen) = k.activity else { return Some(Next::Observe(Observe::Activity)) };
+    let newer = seen.last.is_some_and(|at| at > c.active_at);
+    (seen.in_flight || newer).then(|| Next::Note(Note::Wake { active_at: seen.last.unwrap_or(0).max(now) }))
+}
+
+/// Warm: its machine paused. The pause follows the decision only after a
+/// fresh look at its activity (the note forgets the last one), so a
+/// request that arrived meanwhile wakes it rather than meeting a frozen
+/// machine.
+fn warm(c: &Computer, k: &Knowledge, p: &Policy, sleep: &Sleep, now: Millis) -> Next {
+    if let Some(n) = woken(c, k, now) {
+        return n;
+    }
+    let slept_at = c.slept_at.expect("asleep since (check::computer)");
+    let cold_at = slept_at.saturating_add(sleep.cold_after_ms);
+    if now >= cold_at {
+        return Next::Note(Note::Sleep { tier: Tier::Cold, active_at: c.active_at });
+    }
+    match k.machine {
+        // The snapshot of what it wrote is owed before the pause, so a
+        // crash between the two still takes it.
+        Machine::Running if c.has_disk() && c.snapshot_due.is_none() => Next::Note(Note::Owe { kind: SnapshotKind::Pause }),
+        Machine::Running => Next::Do(Effect::Pause),
+        Machine::Paused if c.status != Status::Warm => Next::Note(Note::Status { status: Status::Warm, reason: None }),
+        // What it wrote before it paused is snapshotted once (a frozen
+        // guest writes nothing more); its disk's duties go on while it
+        // sleeps; a paused machine takes no rotation.
+        Machine::Paused => owed_snapshot(c, k).or_else(|| duties(c, k, p, now)).unwrap_or(Next::Rest(Some(cold_at))),
+        // Its machine went down while it slept: it is cold.
+        Machine::Stopped | Machine::Absent | Machine::Other => Next::Note(Note::Sleep { tier: Tier::Cold, active_at: c.active_at }),
+    }
+}
+
+/// Cold: its machine stopped cleanly (a paused one resumed first), the
+/// snapshot after a stop taken, its disk's duties going on.
+fn cold(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
+    if let Some(n) = woken(c, k, now) {
+        return n;
+    }
+    match k.machine {
+        Machine::Running if c.has_disk() && c.snapshot_due.is_none() => Next::Note(Note::Owe { kind: SnapshotKind::Stop }),
+        Machine::Running | Machine::Paused => halt(c, k),
+        Machine::Stopped | Machine::Absent | Machine::Other => {
+            if let Some(n) = owed_snapshot(c, k) {
+                return n;
+            }
+            if c.status != Status::Cold {
+                return Next::Note(Note::Status { status: Status::Cold, reason: None });
+            }
+            duties(c, k, p, now).unwrap_or(Next::Rest(None))
+        }
+    }
 }
 
 /// What a computer's status says while the node's memory reserve has no
@@ -247,7 +383,7 @@ fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Mi
         if c.status != Status::Serving || c.served_at.is_none() {
             return Next::Note(Note::Served { seq: target.seq });
         }
-        return serving_duties(c, target, k, p, now).unwrap_or(Next::Rest(None));
+        return serving_duties(c, target, k, p, now).or_else(|| sleepy(c, target, k, p, now)).unwrap_or(Next::Rest(None));
     }
     let served_since_launch = c.served_at.is_some_and(|s| s >= launched);
     if served_since_launch && target.init.is_some() {
@@ -393,7 +529,7 @@ fn restore(c: &Computer, r: &Restore, k: &Knowledge) -> Next {
 
 fn halt_or_remove(c: &Computer, k: &Knowledge) -> Next {
     match k.machine {
-        Machine::Running => halt(c, k),
+        Machine::Running | Machine::Paused => halt(c, k),
         _ => Next::Do(Effect::Remove),
     }
 }

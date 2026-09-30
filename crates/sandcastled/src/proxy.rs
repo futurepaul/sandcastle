@@ -4,19 +4,30 @@
 //! behind it (Hermes' own login) is the second gate. The session cookie is
 //! the router's alone and never reaches the service, and nothing a client
 //! says about where it came from (`Forwarded`, `X-Forwarded-*`) does.
+//!
+//! A request is activity from when it arrives until its answer is sent
+//! (docs/sandcastle-sleep.md, Tiers). One for a sleeping computer is held,
+//! its computer's batch nudged, and forwarded once it serves: the request
+//! counts before the row is read, so a sleep decided meanwhile sees it
+//! and wakes rather than pausing under it.
 
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode};
-use sandcastle_core::model::{Computer, Desired};
+use sandcastle_core::model::{Computer, ComputerId, Desired, Status, Tier};
 use sandcastle_node::gates::World;
 use sandcastle_proto::UrlAuth;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::daemon::{token_hash, Daemon};
+use crate::frames::Frames;
 use crate::http::{full, text, Body};
 
 pub const COOKIE: &str = "__Host-sandcastle";
@@ -29,6 +40,11 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const ANSWER_DEADLINE: Duration = Duration::from_secs(120);
 /// The longest an upgraded connection (a WebSocket) lives.
 const TUNNEL_LIFETIME_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a request waits for its computer to wake and serve: a warm
+/// one takes milliseconds, a cold one a boot, one waiting for room longer.
+pub const WAKE_DEADLINE: Duration = Duration::from_secs(60);
+/// A tunnel looks at whether its computer sleeps at most this often.
+const TUNNEL_LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// Headers that describe one hop, not the message (RFC 9110 §7.6.1), so a
 /// proxy never forwards them. `upgrade` and `connection` come back for an
@@ -37,7 +53,7 @@ const HOP_BY_HOP: [&str; 8] = ["connection", "keep-alive", "proxy-authenticate",
 
 type Resp = Response<Body>;
 
-pub async fn handle<W: World>(d: &Daemon<W>, name: &str, peer: SocketAddr, req: Request<Incoming>) -> Resp {
+pub async fn handle<W: World>(d: &Arc<Daemon<W>>, name: &str, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     let computer = match d.node.store.by_name(name) {
         Ok(Some(c)) if c.desired != Desired::Deleted => c,
         Ok(_) => return text(StatusCode::NOT_FOUND, "No such computer.\n"),
@@ -61,7 +77,96 @@ pub async fn handle<W: World>(d: &Daemon<W>, name: &str, peer: SocketAddr, req: 
             return text(StatusCode::UNAUTHORIZED, "This computer is private. Open it from its owner's link.\n");
         }
     }
-    forward(d, computer.host_port, peer, req).await
+    // Activity from here until the answer is sent, counted before the row
+    // is read again.
+    let flight = InFlight::begin(d, computer.id);
+    let computer = match serving(d, computer.id).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    forward(d, &computer, peer, req, flight).await
+}
+
+/// Whether a request goes to its computer now: one meant to run goes once
+/// it is awake and serving (or failed: then it answers or not); one
+/// stopped goes as it is.
+fn goes_now(c: &Computer) -> bool {
+    c.desired != Desired::Running || (c.tier == Tier::Awake && matches!(c.status, Status::Serving | Status::Failed))
+}
+
+/// The computer, once a request may go to it: a sleeping or starting one
+/// is woken (its batch nudged) and waited for, each change to the node's
+/// rows looked at, until `WAKE_DEADLINE`.
+async fn serving<W: World>(d: &Daemon<W>, id: ComputerId) -> Result<Computer, Box<Resp>> {
+    let mut changed = d.node.changed.subscribe();
+    let deadline = tokio::time::Instant::now() + WAKE_DEADLINE;
+    let mut nudged = false;
+    // Bounded by the deadline.
+    loop {
+        let c = match d.node.store.load(id) {
+            Ok(Some(c)) if c.desired != Desired::Deleted => c,
+            Ok(_) => return Err(Box::new(text(StatusCode::NOT_FOUND, "No such computer.\n"))),
+            Err(e) => {
+                eprintln!("proxy: store: {e}");
+                return Err(Box::new(text(StatusCode::INTERNAL_SERVER_ERROR, "The node could not read its state.\n")));
+            }
+        };
+        if goes_now(&c) {
+            return Ok(c);
+        }
+        if !nudged {
+            d.node.nudges.nudge(id);
+            nudged = true;
+        }
+        match tokio::time::timeout_at(deadline, changed.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(Box::new(text(StatusCode::SERVICE_UNAVAILABLE, "The node is stopping.\n"))),
+            Err(_) => return Err(Box::new(text(StatusCode::SERVICE_UNAVAILABLE, "This computer is still waking up. Try again in a moment.\n"))),
+        }
+    }
+}
+
+/// A request in flight: its computer is active until this drops (its
+/// answer sent, or its client gone).
+struct InFlight<W: World> {
+    d: Arc<Daemon<W>>,
+    id: ComputerId,
+}
+
+impl<W: World> InFlight<W> {
+    fn begin(d: &Arc<Daemon<W>>, id: ComputerId) -> InFlight<W> {
+        d.node.activity.begin(id, d.now());
+        InFlight { d: d.clone(), id }
+    }
+}
+
+impl<W: World> Drop for InFlight<W> {
+    fn drop(&mut self) {
+        self.d.node.activity.end(self.id, self.d.now());
+    }
+}
+
+/// An answer's body that keeps its request in flight until it is sent.
+struct Tracked<W: World> {
+    body: Body,
+    _flight: InFlight<W>,
+}
+
+impl<W: World> hyper::body::Body for Tracked<W> {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 fn redeem<W: World>(d: &Daemon<W>, computer: &Computer, req: &Request<Incoming>) -> Resp {
@@ -169,8 +274,10 @@ pub fn forwarded_headers(from: &HeaderMap, peer: SocketAddr, upgrade: bool) -> H
     headers
 }
 
-async fn forward<W: World>(d: &Daemon<W>, host_port: u16, peer: SocketAddr, mut req: Request<Incoming>) -> Resp {
+async fn forward<W: World>(d: &Arc<Daemon<W>>, computer: &Computer, peer: SocketAddr, mut req: Request<Incoming>, flight: InFlight<W>) -> Resp {
+    let host_port = computer.host_port;
     let upgrade = is_upgrade(req.headers());
+    let websocket = req.headers().get("upgrade").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     // A tunnel outlives its connection's slot, so it takes one of its own,
     // before anything reaches the service.
     let tunnel_slot = if upgrade {
@@ -209,7 +316,7 @@ async fn forward<W: World>(d: &Daemon<W>, host_port: u16, peer: SocketAddr, mut 
             return text(StatusCode::BAD_GATEWAY, "The computer's service switched protocols unasked.\n");
         };
         let service_upgrade = hyper::upgrade::on(&mut resp);
-        tokio::spawn(tunnel(client_upgrade, service_upgrade, slot));
+        tokio::spawn(tunnel(d.clone(), computer.id, websocket, client_upgrade, service_upgrade, slot));
         let mut back = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
         let headers = back.headers_mut().expect("a fresh builder has headers");
         for (k, v) in resp.headers() {
@@ -225,17 +332,53 @@ async fn forward<W: World>(d: &Daemon<W>, host_port: u16, peer: SocketAddr, mut 
             headers.append(k.clone(), v.clone());
         }
     }
-    back.body(body.boxed()).expect("copied parts build a response")
+    back.body(Tracked { body: body.boxed(), _flight: flight }.boxed()).expect("copied parts build a response")
 }
 
 /// Carries an upgraded connection both ways, holding its slot, for at most
-/// `TUNNEL_LIFETIME_MAX`.
-async fn tunnel(client: hyper::upgrade::OnUpgrade, service: hyper::upgrade::OnUpgrade, slot: tokio::sync::OwnedSemaphorePermit) {
+/// `TUNNEL_LIFETIME_MAX`. What the client sends is activity when it is its
+/// own (`Frames`: a WebSocket's data frames; any upgrade's bytes
+/// otherwise), and wakes a computer that slept with the tunnel open (its
+/// bytes wait for the resume); an open, quiet tunnel is not activity.
+async fn tunnel<W: World>(
+    d: Arc<Daemon<W>>,
+    id: ComputerId,
+    websocket: bool,
+    client: hyper::upgrade::OnUpgrade,
+    service: hyper::upgrade::OnUpgrade,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
     let _slot = slot;
     let (Ok(client), Ok(service)) = (client.await, service.await) else { return };
-    let mut client = hyper_util::rt::TokioIo::new(client);
-    let mut service = hyper_util::rt::TokioIo::new(service);
-    let _ = tokio::time::timeout(TUNNEL_LIFETIME_MAX, tokio::io::copy_bidirectional(&mut client, &mut service)).await;
+    let (mut client_read, mut client_write) = tokio::io::split(hyper_util::rt::TokioIo::new(client));
+    let (mut service_read, mut service_write) = tokio::io::split(hyper_util::rt::TokioIo::new(service));
+    let up = async {
+        let mut frames = Frames::default();
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut looked: Option<tokio::time::Instant> = None;
+        // Bounded by the stream, and by the tunnel's lifetime.
+        loop {
+            let n = client_read.read(&mut buf).await?;
+            if n == 0 {
+                return service_write.shutdown().await;
+            }
+            if !websocket || frames.feed(&buf[..n]) {
+                d.node.activity.touch(id, d.now());
+                if looked.is_none_or(|at| at.elapsed() >= TUNNEL_LOOK_EVERY) {
+                    looked = Some(tokio::time::Instant::now());
+                    if d.node.store.load(id).ok().flatten().is_some_and(|c| c.tier != Tier::Awake) {
+                        d.node.nudges.nudge(id);
+                    }
+                }
+            }
+            service_write.write_all(&buf[..n]).await?;
+        }
+    };
+    let down = async {
+        tokio::io::copy(&mut service_read, &mut client_write).await?;
+        client_write.shutdown().await
+    };
+    let _ = tokio::time::timeout(TUNNEL_LIFETIME_MAX, async { tokio::try_join!(up, down) }).await;
 }
 
 #[cfg(test)]
