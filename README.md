@@ -186,6 +186,48 @@ The router is the node's one listener: TLS on 443, then by Host.
   - The service's own login (Hermes') is the second gate.
 - WebSockets pass through; each holds a connection slot of its own, for at most a day.
 
+## Budgets
+
+A node keeps inside a reserve its operator chose, so it never runs the
+host out of memory or disk (`../docs/sandcastle-sleep.md`):
+
+- **Memory.** A machine that may run commits its whole allocation plus
+  the engine's overhead (`--machine-overhead-mib`, 64) in a ledger that
+  never passes `--reserve-memory-gib`. The core asks for room before it
+  makes or starts a machine; without room a computer waits (its status
+  says so), with no fault and no backoff. A rebase or a restart keeps its
+  room; a stop for good releases it. A restarted node adopts the machines
+  it finds running. The kernel holds the same line: the node refuses to
+  start unless its unit's `MemoryMax=` (which caps its machines too,
+  under `KillMode=process`) is at least the reserve
+  (`--allow-uncapped-memory` for development).
+- **Disk.** A computer's disk is a ZFS volume with its size reserved (not
+  sparse). A computer is made only if its disk and its snapshots'
+  headroom (`--snapshot-headroom-pct`, 25) fit `--reserve-disk-gib`
+  beside every other's; a ZFS quota on the parent holds the same line.
+- **The engine's disk.** Each machine is made with a writable layer of
+  `--layer-gib` (4, msb's default; `msb --root-disk`), and a computer is
+  made only if every layer fits `--reserve-engine-disk-gib`.
+
+**Measured, and tuned from it.** The node samples every machine every
+10 s (`msb metrics`: resident memory, guest memory, CPU, network, its
+layer). `GET /v1/node` (grantors; `sandcastle node --memory-mib
+--data-gib`) reports the reserve and costs, what is committed and what
+is measured, each machine's memory (p50, p95, max over an hour) and
+layer, what more fits of a size, and warnings when the host no longer
+holds the reserve: no `MemoryMax=` or one below it, other processes'
+memory, no ZFS quota or one below it, a pool or engine disk too small.
+
+**Choosing the reserve.** `sandcastled setup --zfs-parent … --msb-home
+…` reads the host, asks how much of it computers may have (suggesting
+some), and prints what that holds for a computer size (running at once,
+paused, and in all, and what bounds it) and the quota and unit settings
+that make ZFS and the kernel hold it. It changes nothing. On
+finite-lat-6 (124 GiB, a 1.7 TB pool), for 4 GiB / 10 GiB Hermes
+computers: 27 running at once, about 234 paused, 71 in all with 4 GiB
+layers (bound by the engine's disk; 120 with 1 GiB layers, bound by
+disk).
+
 ## Backups
 
 With `--backup-bucket`, each computer's batch ships its snapshots off the host, oldest first, as duties after its lifecycle (so a prune never races a ship):
@@ -247,7 +289,9 @@ ExecStart=/home/ubuntu/sandcastle/target/release/sandcastled serve --state-dir /
   --guest-deny <the node's IPv4> --guest-deny <the node's IPv6 /64> --zfs-parent tank/sandcastle \
   --node-name lat-6 --backup-bucket sandcastle-backups --backup-credentials /etc/sandcastle/backups.env \
   --backup-key-file /etc/sandcastle/backup.key \
-  --node-key-file /etc/sandcastle/node.key --credentials-origin https://fragment.club
+  --node-key-file /etc/sandcastle/node.key --credentials-origin https://fragment.club \
+  --reserve-memory-gib 112 --reserve-disk-gib 1500 --reserve-engine-disk-gib 300
+MemoryMax=113G
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
@@ -315,7 +359,7 @@ Two flags cover a node without public DNS or a public certificate:
 ## Checks
 
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace --all-features`: 87 tests, in CI (the
+`cargo test --workspace --all-features`: 103 tests, in CI (the
 `sandcastle` job).
 
 - **The core** (`crates/core/tests/paths.rs`): each path a computer
