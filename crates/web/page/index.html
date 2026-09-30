@@ -92,7 +92,9 @@
         await s.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
         const events = [];
         for (;;) {
-          const m = JSON.parse(await s.next());
+          const next = await s.next();
+          if (next === undefined) throw new Error(`the socket closed before ${method} was answered`);
+          const m = JSON.parse(next);
           if (m.id === id) return [m.result, events];
           events.push(m);
         }
@@ -101,7 +103,13 @@
       t = now();
       const [, events] = await call(2, "prompt.submit", { session_id: made.session_id, text: "Reply with exactly: from the browser by its key" });
       let text = "";
-      for (let m = events.shift(); ; m = events.shift() ?? JSON.parse(await s.next())) {
+      for (;;) {
+        let m = events.shift();
+        if (m === undefined) {
+          const next = await s.next();
+          if (next === undefined) throw new Error("the socket closed mid-turn");
+          m = JSON.parse(next);
+        }
         const p = m.params ?? {};
         if (p.session_id !== made.session_id) continue;
         if (p.type === "message.delta") {
