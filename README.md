@@ -88,6 +88,16 @@ Each field in brief:
   - `ephemeral`: nothing survives.
   - `pet`: the whole machine is durable. Refused until built.
 - **`service`** is the one process the node launches on every boot. The node keeps its definition, so nothing in the guest can change or revive it.
+- **`service.init`** (`{argv, stop}`, with `argv` empty) runs the service under the image's own init instead: the engine hands it PID 1 (`msb --init`), and it starts and supervises what the image means to run; the node launches nothing, still probes health, restarts a machine whose service stays silent past the grace, and stops it with `stop` (the machine then powers off by itself). The service's `env` reaches the init at boot, valued in msb's environment, never its command line. Hermes runs this way, as its image means to, with its gateway (and cron) under s6:
+
+  ```json
+  "service": {
+    "argv": [],
+    "init": {"argv": ["/init", "/opt/hermes/docker/main-wrapper.sh", "gateway", "run"], "stop": ["/run/s6/basedir/bin/halt"]},
+    "port": 9119, "health_path": "/api/auth/providers",
+    "env": {"HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_PORT": "9119", "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "…", "…": "…"}
+  }
+  ```
 - **`env`** holds the service's own settings. It reaches the guest through an exec's stdin into a root-only file, never a command line.
 - **Outbound credentials** come from `credentials_url`, never `env` (below).
 
