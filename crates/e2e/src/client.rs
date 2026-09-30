@@ -86,6 +86,39 @@ impl Client {
         tokio::time::timeout(CALL_DEADLINE, attempt).await.map_err(|_| format!("{method} {host}{path}: no answer in {} s", CALL_DEADLINE.as_secs()))?
     }
 
+    /// A WebSocket to `host` at `path` offering `protocols`, on a fresh
+    /// connection: the socket and the protocol the service chose, or its
+    /// status when it did not switch.
+    pub async fn websocket(&self, host: &str, path: &str, protocols: &[&str]) -> Result<Result<(crate::ws::Ws, Option<String>), u16>, String> {
+        let attempt = async {
+            let tls_name = self.tls_name(host);
+            let tcp = tokio::net::TcpStream::connect((tls_name.as_str(), 443)).await.map_err(|e| format!("connecting to {tls_name}: {e}"))?;
+            let name = rustls_pki_types::ServerName::try_from(tls_name.clone()).map_err(|e| e.to_string())?;
+            let tls = self.tls.connect(name, tcp).await.map_err(|e| format!("TLS to {host}: {e}"))?;
+            let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                let _ = conn.with_upgrades().await;
+            });
+            let req = Request::get(path)
+                .header("host", host)
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", crate::ws::key())
+                .header("sec-websocket-protocol", protocols.join(", "))
+                .body(Full::new(Bytes::new()))
+                .map_err(|e| e.to_string())?;
+            let mut resp = send.send_request(req).await.map_err(|e| format!("GET {host}{path}: {e}"))?;
+            if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok(Err(resp.status().as_u16()));
+            }
+            let chosen = resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let io = hyper::upgrade::on(&mut resp).await.map_err(|e| format!("upgrading: {e}"))?;
+            Ok(Ok((crate::ws::Ws::new(io), chosen)))
+        };
+        tokio::time::timeout(CALL_DEADLINE, attempt).await.map_err(|_| format!("websocket {host}{path}: no answer in {} s", CALL_DEADLINE.as_secs()))?
+    }
+
     pub fn header(&self, keys: &Keys, method: &str, path: &str, body: &[u8]) -> String {
         keys.header(method, &format!("https://{}{path}", self.api_host()), body, now_s())
     }

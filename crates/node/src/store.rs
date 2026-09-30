@@ -153,6 +153,13 @@ CREATE TABLE IF NOT EXISTS generation_args (
   PRIMARY KEY (computer_id, seq, position),
   FOREIGN KEY (computer_id, seq) REFERENCES generations (computer_id, seq) ON DELETE CASCADE
 );
+-- Browser origins the router admits cross-origin, in the owner's order.
+CREATE TABLE IF NOT EXISTS cors_origins (
+  computer_id TEXT NOT NULL REFERENCES computers (id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  origin TEXT NOT NULL CHECK (length(origin) <= 256),
+  PRIMARY KEY (computer_id, position)
+);
 -- How to stop the machine the node made, when its image's init runs its
 -- service (the row keeps it: the spec may have moved on).
 CREATE TABLE IF NOT EXISTS machine_stop (
@@ -694,6 +701,11 @@ fn assemble(conn: &Connection, id: ComputerId, r: RawRow) -> Result<Computer, St
             data_path: r.data_path,
         },
         url_auth,
+        cors_origins: {
+            let mut stmt = conn.prepare("SELECT origin FROM cors_origins WHERE computer_id = ?1 ORDER BY position")?;
+            let origins: Vec<String> = stmt.query_map(params![id.hex()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            origins
+        },
         desired: desired_of(&r.desired)?,
         spec,
         good,
@@ -882,6 +894,10 @@ fn write_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -> Result<(),
     )?;
     write_shape(tx, c)?;
     write_chain(tx, c)?;
+    tx.execute("DELETE FROM cors_origins WHERE computer_id = ?1", params![c.id.hex()])?;
+    for (index, origin) in c.cors_origins.iter().enumerate() {
+        tx.execute("INSERT INTO cors_origins (computer_id, position, origin) VALUES (?1, ?2, ?3)", params![c.id.hex(), position(index), origin])?;
+    }
     tx.execute("DELETE FROM machine_stop WHERE computer_id = ?1", params![c.id.hex()])?;
     for (index, arg) in c.machine_stop.iter().flatten().enumerate() {
         tx.execute("INSERT INTO machine_stop (computer_id, position, arg) VALUES (?1, ?2, ?3)", params![c.id.hex(), position(index), arg])?;
@@ -1150,6 +1166,7 @@ mod tests {
             service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 8000, health_path: "/".into(), env: Default::default(), busy: None },
             url_auth: sandcastle_proto::UrlAuth::Public,
             credentials_url: None,
+            cors_origins: vec![],
         };
         let id = ComputerId::from_bytes([7; 8]);
         let policy = sandcastle_core::model::Policy {

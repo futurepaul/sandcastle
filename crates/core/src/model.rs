@@ -439,6 +439,9 @@ pub struct Computer {
     pub host_port: u16,
     pub fixed: Fixed,
     pub url_auth: UrlAuth,
+    /// Browser origins the router admits cross-origin (the owner's, like
+    /// `url_auth`; no machine depends on it).
+    pub cors_origins: Vec<String>,
     pub desired: Desired,
     /// The generation asked for.
     pub spec: Generation,

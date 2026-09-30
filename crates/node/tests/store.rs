@@ -36,6 +36,7 @@ fn spec() -> ComputerSpec {
         service: Service { argv: vec!["/bin/serve".into(), "--port".into(), "9119".into()], init: None, port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH_PASSWORD".into(), "it's secret".into())]), busy: Some(sandcastle_proto::Busy { path: "/api/status".into(), field: "active_agents".into() }) },
         url_auth: UrlAuth::Owner,
         credentials_url: None,
+        cors_origins: vec![],
     }
 }
 

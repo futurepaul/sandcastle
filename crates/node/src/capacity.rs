@@ -337,6 +337,7 @@ mod tests {
             service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 80, health_path: "/".into(), env: Default::default(), busy: None },
             url_auth: sandcastle_proto::UrlAuth::Owner,
             credentials_url: None,
+            cors_origins: vec![],
         };
         crate::commands::put_computer(&store, &owner, "one", &spec, None, ComputerId::from_bytes([1; 8]), 20_000..20_001, p, 1).unwrap().0
     }

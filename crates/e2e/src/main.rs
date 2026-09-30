@@ -29,6 +29,7 @@
 
 mod client;
 mod host;
+mod ws;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -631,6 +632,8 @@ async fn hermes(r: &mut Run) -> Step {
     spec["service"]["init"] = json!({"argv": ["/init", "/opt/hermes/docker/main-wrapper.sh", "gateway", "run"], "stop": ["/run/s6/basedir/bin/halt"]});
     spec["service"]["env"]["HERMES_DASHBOARD"] = json!("1");
     spec["service"]["env"]["HERMES_DASHBOARD_PORT"] = json!("9119");
+    // Its gateway's turns (cron, agents) keep it awake.
+    spec["service"]["busy"] = json!({"path": "/api/status", "field": "active_agents"});
     // Its real TLS name, as a person's browser would use.
     let name = "hermes".to_string();
     let (status, v) = r.put_as(Owner::Hermes, &name, &spec, "").await?;
@@ -710,7 +713,156 @@ async fn hermes(r: &mut Run) -> Step {
     r.slept(&name, "cold", "Stopped").await?;
     let t = Instant::now();
     let a = r.client.send(&host, "GET", &health, &[("cookie", &cookie)], vec![]).await?;
-    r.ensure(S, "a request wakes a cold Hermes", a.status < 500, format!("{} in {} ms", a.status, t.elapsed().as_millis()))
+    r.ensure(S, "a request wakes a cold Hermes", a.status < 500, format!("{} in {} ms", a.status, t.elapsed().as_millis()))?;
+    hermes_chat(r, &name, &id, &spec).await
+}
+
+/// The page a platform serves its person's Hermes chat from (docs/hermes-chat.md).
+const CHAT_ORIGIN: &str = "https://e2e--sandcastle.fragment.boats";
+
+/// One JSON-RPC call over Hermes' `/api/ws`: its result, and the events
+/// that came first.
+async fn rpc(ws: &mut ws::Ws, id: u64, method: &str, params: Value) -> Result<(Value, Vec<Value>), String> {
+    ws.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()).await?;
+    let mut events = Vec::new();
+    // Bounded by the deadline of each receive and by the events a call brings.
+    for _ in 0..10_000 {
+        let text = ws.recv(Duration::from_secs(120)).await?.ok_or_else(|| format!("{method}: the socket closed"))?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("{method}: not JSON: {e}"))?;
+        if v["id"] == json!(id) {
+            if let Some(e) = v.get("error") {
+                return Err(format!("{method}: {e}"));
+            }
+            return Ok((v["result"].clone(), events));
+        }
+        events.push(v);
+    }
+    Err(format!("{method}: no answer among 10,000 messages"))
+}
+
+/// Events until the turn of `session` completes: its text and status.
+async fn turn(ws: &mut ws::Ws, session: &str, mut seen: Vec<Value>, within: Duration) -> Result<(String, String, Duration), String> {
+    let start = Instant::now();
+    let mut text = String::new();
+    let mut first: Option<Duration> = None;
+    // Bounded by `within`.
+    loop {
+        for v in seen.drain(..) {
+            let p = &v["params"];
+            if v["method"] != "event" || p["session_id"] != session {
+                continue;
+            }
+            match p["type"].as_str() {
+                Some("message.delta") => {
+                    first.get_or_insert(start.elapsed());
+                    text.push_str(p["payload"]["text"].as_str().unwrap_or(""));
+                }
+                Some("message.complete") => {
+                    let full = p["payload"]["text"].as_str().map(str::to_string).unwrap_or(text);
+                    return Ok((full, p["payload"]["status"].as_str().unwrap_or("").to_string(), first.unwrap_or(start.elapsed())));
+                }
+                _ => {}
+            }
+        }
+        let left = within.checked_sub(start.elapsed()).ok_or("the turn did not complete in time")?;
+        let msg = ws.recv(left).await?.ok_or("the socket closed mid-turn")?;
+        seen.push(serde_json::from_str(&msg).map_err(|e| format!("not JSON: {e}"))?);
+    }
+}
+
+/// A person's chat with their Hermes the way Finite's dashboard has one
+/// (docs/hermes-chat.md): its URL public, its own login the gate, the
+/// platform's page on another site reading it through the router's CORS,
+/// a turn over `/api/ws` with a single-use ticket, history over REST, a
+/// page's heartbeat holding it awake mid-turn, and a warm wake by the next
+/// message on the same socket.
+async fn hermes_chat(r: &mut Run, name: &str, id: &str, spec: &Value) -> Step {
+    const S: &str = "hermes";
+    let host = format!("{name}.{}", r.client.domain);
+    let before = r.host.machine(id).await?.map(|m| m.created_at);
+    let mut public = spec.clone();
+    public["url_auth"] = json!("public");
+    public["cors_origins"] = json!([CHAT_ORIGIN]);
+    let (status, v) = r.put_as(Owner::Hermes, name, &public, "").await?;
+    r.ensure(S, "its URL made public, its origins named", status == 200, format!("{status} {}", v["code"]))?;
+    r.until(name, Duration::from_secs(60), |s, v| s == 200 && v["pending"] == false).await?;
+    let after = r.host.machine(id).await?.map(|m| m.created_at);
+    r.ensure(S, "without a new machine", before == after, format!("{before:?} {after:?}"))?;
+
+    let a = r.client.send(&host, "GET", "/api/sessions", &[("origin", CHAT_ORIGIN)], vec![]).await?;
+    r.ensure(S, "without a login, Hermes' own gate refuses", a.status == 401, format!("{}", a.status))?;
+    let env = &spec["service"]["env"];
+    let login = json!({"provider": "basic", "username": env["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"], "password": env["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]});
+    let a = r.client.send(&host, "POST", "/auth/password-login", &[("content-type", "application/json")], serde_json::to_vec(&login).expect("json")).await?;
+    let token = a
+        .headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|c| c.split(';').next()?.split_once('='))
+        .find(|(k, _)| k.ends_with("hermes_session_at"))
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    r.ensure(S, "a native login gives a session (the platform's side)", a.status == 200 && !token.is_empty(), format!("{}", a.status))?;
+    let bearer = format!("Bearer {token}");
+
+    let a = r.client.send(&host, "OPTIONS", "/api/sessions", &[("origin", CHAT_ORIGIN), ("access-control-request-method", "GET"), ("access-control-request-headers", "authorization")], vec![]).await?;
+    let allow = a.headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    r.ensure(S, "the page's preflight is answered for its origin", a.status == 204 && allow == CHAT_ORIGIN, format!("{} {allow}", a.status))?;
+    let a = r.client.send(&host, "GET", "/api/sessions", &[("origin", CHAT_ORIGIN), ("authorization", &bearer)], vec![]).await?;
+    let allow = a.headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    r.ensure(S, "the page lists its chats with the session as a bearer", a.status == 200 && allow == CHAT_ORIGIN && a.json()["sessions"].is_array(), format!("{} {allow}", a.status))?;
+
+    let a = r.client.send(&host, "POST", "/api/auth/ws-ticket", &[("origin", CHAT_ORIGIN), ("authorization", &bearer)], vec![]).await?;
+    let ticket = a.json()["ticket"].as_str().unwrap_or("").to_string();
+    r.ensure(S, "a single-use socket ticket", a.status == 200 && !ticket.is_empty(), format!("{}", a.status))?;
+    let offered = format!("hermes-gateway-ticket.{ticket}");
+    let (mut ws, chosen) = match r.client.websocket(&host, "/api/ws", &["hermes-gateway-v1", &offered]).await? {
+        Ok(x) => x,
+        Err(status) => return r.ensure(S, "the chat socket opens with the ticket", false, format!("{status}")),
+    };
+    r.ensure(S, "the chat socket opens with the ticket", chosen.as_deref() == Some("hermes-gateway-v1"), format!("{chosen:?}"))?;
+    let reused = r.client.websocket(&host, "/api/ws", &["hermes-gateway-v1", &offered]).await?;
+    r.ensure(S, "and the ticket works once", !matches!(reused, Ok((_, Some(_)))), (if reused.is_ok() { "opened" } else { "refused" }).to_string())?;
+
+    let ready = ws.recv(Duration::from_secs(30)).await?.unwrap_or_default();
+    r.ensure(S, "Hermes says the gateway is ready", ready.contains("gateway.ready"), ready.chars().take(120).collect::<String>())?;
+    let (created, _) = rpc(&mut ws, 1, "session.create", json!({"title": "sandcastle e2e"})).await?;
+    let live = created["session_id"].as_str().unwrap_or("").to_string();
+    let stored = created["stored_session_id"].as_str().unwrap_or("").to_string();
+    r.ensure(S, "a new chat", !live.is_empty() && !stored.is_empty(), created.to_string().chars().take(200).collect::<String>())?;
+    let t = Instant::now();
+    let (_, events) = rpc(&mut ws, 2, "prompt.submit", json!({"session_id": live, "text": "Reply with exactly: sandcastle chat"})).await?;
+    let (text, status, first) = turn(&mut ws, &live, events, Duration::from_secs(120)).await?;
+    r.ensure(S, "a turn's reply streams from the model through the swap", text.to_lowercase().contains("sandcastle chat") && status != "error", format!("first words in {} ms, whole in {} ms: {:?} ({status})", first.as_millis(), t.elapsed().as_millis(), text.chars().take(80).collect::<String>()))?;
+    let a = r.client.send(&host, "GET", &format!("/api/sessions/{stored}/messages"), &[("origin", CHAT_ORIGIN), ("authorization", &bearer)], vec![]).await?;
+    let kept = a.json()["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "assistant" && x["content"].as_str().is_some_and(|c| c.to_lowercase().contains("sandcastle chat"))));
+    r.ensure(S, "the chat's history holds the turn", a.status == 200 && kept, format!("{}", a.status))?;
+
+    // A page with a turn in flight sends a ping every 15 s: data frames,
+    // which the router counts; it stays awake past the idle time.
+    let start = Instant::now();
+    let mut n = 10;
+    while start.elapsed() < Duration::from_secs(50) {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        n += 1;
+        rpc(&mut ws, n, "gateway.ping", json!({})).await?;
+    }
+    let machine = r.host.machine(id).await?;
+    r.ensure(S, "a page's heartbeat keeps it awake past the idle time", machine.as_ref().is_some_and(|m| m.status == "Running"), format!("{machine:?} after {}", secs(start.elapsed())))?;
+    // Quiet, it sleeps with the socket open; the next message wakes it.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(90) && !r.host.machine(id).await?.is_some_and(|m| m.status == "Paused") {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let machine = r.host.machine(id).await?;
+    r.ensure(S, "quiet, it goes warm under its open socket", machine.as_ref().is_some_and(|m| m.status == "Paused"), secs(start.elapsed()))?;
+    let t = Instant::now();
+    let (_, events) = rpc(&mut ws, 100, "prompt.submit", json!({"session_id": live, "text": "Reply with exactly: awake again"})).await?;
+    let (text, status, first) = turn(&mut ws, &live, events, Duration::from_secs(120)).await?;
+    r.ensure(S, "the next message wakes it and is answered", text.to_lowercase().contains("awake again") && status != "error", format!("first words in {} ms, whole in {} ms", first.as_millis(), t.elapsed().as_millis()))?;
+    ws.close().await;
+    Ok(())
 }
 
 async fn sleep(r: &mut Run) -> Step {

@@ -62,6 +62,55 @@ pub async fn handle<W: World>(d: &Arc<Daemon<W>>, name: &str, peer: SocketAddr, 
             return text(StatusCode::INTERNAL_SERVER_ERROR, "The node could not read its state.\n");
         }
     };
+    let origin = allowed_origin(&computer, req.headers());
+    let preflight = req.method() == hyper::Method::OPTIONS && req.headers().contains_key("access-control-request-method");
+    if preflight && !computer.cors_origins.is_empty() {
+        return with_cors(answer_preflight(origin.is_some()), &computer, origin.as_ref());
+    }
+    let resp = admit(d, computer.clone(), peer, req).await;
+    with_cors(resp, &computer, origin.as_ref())
+}
+
+/// The request's `Origin`, when the computer admits it cross-origin.
+fn allowed_origin(c: &Computer, headers: &HeaderMap) -> Option<HeaderValue> {
+    let origin = headers.get("origin")?;
+    let text = origin.to_str().ok()?;
+    c.cors_origins.iter().any(|o| o == text).then(|| origin.clone())
+}
+
+/// A preflight from an origin the computer admits: what it may send (the
+/// service's own login is the gate, so credentials go as a bearer).
+fn answer_preflight(allowed: bool) -> Resp {
+    if !allowed {
+        return text(StatusCode::FORBIDDEN, "This origin may not read this computer.\n");
+    }
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("access-control-allow-methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
+        .header("access-control-allow-headers", "Authorization, Content-Type")
+        .header("access-control-max-age", "300")
+        .body(full(""))
+        .expect("a static response builds")
+}
+
+/// For a computer with `cors_origins`, the router's CORS policy replaces
+/// the service's (which may allow only itself; `forward` drops its
+/// headers): every answer varies by `Origin`, and an admitted origin may
+/// read it. Unchanged otherwise.
+fn with_cors(mut resp: Resp, c: &Computer, origin: Option<&HeaderValue>) -> Resp {
+    if c.cors_origins.is_empty() {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    headers.append("vary", HeaderValue::from_static("Origin"));
+    if let Some(o) = origin {
+        headers.insert("access-control-allow-origin", o.clone());
+    }
+    resp
+}
+
+/// The owner's gate and the redeem path, then the service.
+async fn admit<W: World>(d: &Arc<Daemon<W>>, computer: Computer, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     if req.uri().path() == REDEEM_PATH {
         return redeem(d, &computer, &req);
     }
@@ -327,8 +376,10 @@ async fn forward<W: World>(d: &Arc<Daemon<W>>, computer: &Computer, peer: Socket
     let (parts, body) = resp.into_parts();
     let mut back = Response::builder().status(parts.status);
     let headers = back.headers_mut().expect("a fresh builder has headers");
+    // The router's CORS policy replaces the service's (`with_cors`).
+    let ours = !computer.cors_origins.is_empty();
     for (k, v) in parts.headers.iter() {
-        if !HOP_BY_HOP.contains(&k.as_str()) {
+        if !HOP_BY_HOP.contains(&k.as_str()) && !(ours && k.as_str().starts_with("access-control-")) {
             headers.append(k.clone(), v.clone());
         }
     }

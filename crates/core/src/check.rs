@@ -12,6 +12,7 @@ pub fn computer(c: &Computer) {
     assert!(sandcastle_proto::validate_name(&c.name).is_ok(), "a stored name is valid");
     assert!(sandcastle_proto::validate_pubkey(&c.owner).is_ok(), "a stored owner is a key");
     assert!(c.host_port > 0);
+    assert!(c.cors_origins.len() <= sandcastle_proto::CORS_ORIGINS_MAX && c.cors_origins.iter().all(|o| sandcastle_proto::valid_origin(o)), "stored origins are valid");
     assert!(c.spec.seq >= 1);
     assert!(c.spec.seq <= GENERATION_SEQ_MAX);
     if let Some(good) = &c.good {
@@ -218,6 +219,7 @@ pub fn change(before: &Computer, change: &Change) {
     assert_eq!(after.desired, before.desired, "only the owner changes what is desired");
     assert_eq!(after.spec, before.spec, "only the owner changes the spec");
     assert_eq!(after.url_auth, before.url_auth);
+    assert_eq!(after.cors_origins, before.cors_origins, "only the owner changes who may read it");
     assert!(after.snapshot_seq >= before.snapshot_seq, "snapshot numbers only move forward");
     assert!(after.active_at >= before.active_at, "activity acted on only moves forward");
     let head_seq = |c: &Computer| c.ship.head.map(|h| h.seq);

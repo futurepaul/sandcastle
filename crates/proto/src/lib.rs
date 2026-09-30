@@ -29,6 +29,9 @@ pub const COMPUTERS_PER_GRANT_MAX: u32 = 1000;
 /// A ticket opens a computer's URL once, soon after it is minted.
 pub const TICKET_TTL_S: i64 = 60;
 pub const URL_BYTES_MAX: usize = 512;
+/// Origins one computer admits cross-origin, and one's length.
+pub const CORS_ORIGINS_MAX: usize = 8;
+pub const ORIGIN_BYTES_MAX: usize = 256;
 /// A credential source's answer: its credentials, each value's size, each
 /// one's hosts, and the whole body as read.
 pub const CREDENTIALS_MAX: usize = 16;
@@ -131,6 +134,15 @@ pub struct ComputerSpec {
     /// The node fetches only from the origins its operator lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_url: Option<String>,
+    /// Browser origins (`https://host[:port]`, exact) that may read the
+    /// computer's answers from their own pages: the router answers their
+    /// preflights and sets `Access-Control-Allow-Origin` for them, and
+    /// drops the service's own CORS headers. For a service with its own
+    /// login behind a public URL, whose platform hands a browser a session
+    /// (a Hermes chat on another site). Empty: the service's headers as
+    /// they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors_origins: Vec<String>,
 }
 
 /// What a caller wants a computer to be doing.
@@ -578,6 +590,19 @@ fn validate_url(url: &str, what: &str) -> Result<(), Invalid> {
     }
 }
 
+/// An exact browser origin: `https://` and a lowercase DNS name, an
+/// optional port, and nothing else (no path, no trailing slash), as a
+/// browser sends it in `Origin`.
+pub fn valid_origin(origin: &str) -> bool {
+    let Some(rest) = origin.strip_prefix("https://") else { return false };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && !p.starts_with('0') && p.bytes().all(|c| c.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n <= 65_535));
+    origin.len() <= ORIGIN_BYTES_MAX && !host.starts_with("*.") && valid_host(host) && port_ok
+}
+
 /// A DNS name, or `*.` and one: lowercase letters, digits, '-' and '.'.
 fn valid_host(host: &str) -> bool {
     let name = host.strip_prefix("*.").unwrap_or(host);
@@ -728,6 +753,17 @@ impl ComputerSpec {
         if let Some(url) = &self.credentials_url {
             validate_url(url, "credentials_url")?;
         }
+        if self.cors_origins.len() > CORS_ORIGINS_MAX {
+            return invalid(format!("cors_origins holds at most {CORS_ORIGINS_MAX} origins"));
+        }
+        for (n, o) in self.cors_origins.iter().enumerate() {
+            if !valid_origin(o) {
+                return invalid(format!("cors_origins {o:?} is an https origin (https://host[:port], lowercase, no path) of at most {ORIGIN_BYTES_MAX} bytes"));
+            }
+            if self.cors_origins[..n].contains(o) {
+                return invalid(format!("cors_origins names {o} twice"));
+            }
+        }
         Ok(())
     }
 
@@ -791,7 +827,21 @@ mod tests {
             },
             url_auth: UrlAuth::Owner,
             credentials_url: None,
+            cors_origins: vec![],
         }
+    }
+
+    #[test]
+    fn origins() {
+        for ok in ["https://app--alice.fragment.boats", "https://a.example:8443", "https://localhost.example"] {
+            assert!(valid_origin(ok), "{ok}");
+        }
+        for bad in ["https://a.example/", "https://a.example:0", "https://a.example:70000", "https://a.example:", "https://", "a.example", "https://a.example?x", "https://a", "https://a.example:08"] {
+            assert!(!valid_origin(bad), "{bad}");
+        }
+        let mut s = hermes();
+        s.cors_origins = vec!["https://app--alice.fragment.boats".into()];
+        assert_eq!(s.validate(), Ok(()));
     }
 
     #[test]
@@ -843,6 +893,12 @@ mod tests {
             ("credentials url with a space", Box::new(|s| s.credentials_url = Some("https://platform.example/a b".into()))),
             ("bare scheme", Box::new(|s| s.credentials_url = Some("https://".into()))),
             ("long credentials url", Box::new(|s| s.credentials_url = Some(format!("https://a.example/{}", "x".repeat(URL_BYTES_MAX))))),
+            ("a cors origin with a path", Box::new(|s| s.cors_origins = vec!["https://app.example/".into()])),
+            ("a plain http cors origin", Box::new(|s| s.cors_origins = vec!["http://app.example".into()])),
+            ("a wildcard cors origin", Box::new(|s| s.cors_origins = vec!["https://*.example".into()])),
+            ("an uppercase cors origin", Box::new(|s| s.cors_origins = vec!["https://App.example".into()])),
+            ("a cors origin twice", Box::new(|s| s.cors_origins = vec!["https://a.example".into(), "https://a.example".into()])),
+            ("too many cors origins", Box::new(|s| s.cors_origins = (0..=CORS_ORIGINS_MAX).map(|n| format!("https://a{n}.example")).collect())),
         ];
         for (what, change) in cases {
             let mut s = hermes();

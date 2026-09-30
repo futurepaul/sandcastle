@@ -187,6 +187,7 @@ impl Sim {
             },
             url_auth: UrlAuth::Owner,
             credentials_url: self.rng.chance(400).then(|| CREDENTIALS_URL.to_string()),
+            cors_origins: if self.rng.chance(300) { vec!["https://app.example".into()] } else { vec![] },
         }
     }
 

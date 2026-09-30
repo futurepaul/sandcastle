@@ -210,6 +210,7 @@ fn spec(url_auth: UrlAuth) -> ComputerSpec {
         },
         url_auth,
         credentials_url: None,
+        cors_origins: vec![],
     }
 }
 
@@ -243,7 +244,8 @@ async fn service(port: u16) -> tokio::task::JoinHandle<()> {
                     let seen: serde_json::Map<String, serde_json::Value> =
                         req.headers().iter().map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_str().unwrap_or("").to_string()))).collect();
                     let body = serde_json::json!({"path": req.uri().path(), "headers": seen});
-                    Ok(hyper::Response::new(Full::new(Bytes::from(body.to_string()))))
+                    // Like Hermes: CORS for itself only.
+                    Ok(hyper::Response::builder().header("access-control-allow-origin", "http://localhost").header("access-control-allow-credentials", "true").body(Full::new(Bytes::from(body.to_string()))).unwrap())
                 });
                 let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).with_upgrades().await;
             });
@@ -618,4 +620,54 @@ fn commands_view(h: &Harness, name: &str) -> String {
     let c = h.daemon.node.store.by_name(name).unwrap().unwrap();
     let v = sandcastle_node::commands::view(&c, String::new());
     serde_json::to_value(&v.observed).unwrap()["state"].as_str().unwrap().to_string()
+}
+
+/// Goal: a public computer that names browser origins answers their
+/// preflights, lets them (and only them) read its answers, and drops the
+/// service's own CORS headers (Hermes allows only localhost); a computer
+/// that names none passes the service's headers through as they are.
+#[tokio::test]
+async fn cors_origins_replace_the_services_policy() {
+    let h = Harness::start("cors").await;
+    let alice = Keys::generate();
+    h.grant(&alice).await;
+    let mut s = spec(UrlAuth::Public);
+    s.cors_origins = vec!["https://app.example".into()];
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&s)).await.0, StatusCode::CREATED);
+    h.converge("serving", |h| h.serving("hermes")).await;
+    let port = h.daemon.node.store.by_name("hermes").unwrap().unwrap().host_port;
+    let _service = service(port).await;
+    let host = format!("hermes.{DOMAIN}");
+    let ask = |method: &str, origin: &str, preflight: bool| {
+        let mut r = Request::builder().method(method).uri("/api/sessions").header("host", &host).header("origin", origin);
+        if preflight {
+            r = r.header("access-control-request-method", "GET").header("access-control-request-headers", "authorization");
+        }
+        r.body(Full::new(Bytes::new())).unwrap()
+    };
+
+    let (status, headers, _) = h.send(&host, ask("OPTIONS", "https://app.example", true)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "https://app.example");
+    assert!(headers.get("access-control-allow-headers").unwrap().to_str().unwrap().contains("Authorization"));
+    let (status, headers, _) = h.send(&host, ask("OPTIONS", "https://evil.example", true)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.get("access-control-allow-origin").is_none());
+
+    let (status, headers, _) = h.send(&host, ask("GET", "https://app.example", false)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "https://app.example", "the router's, not the service's");
+    assert!(headers.get("access-control-allow-credentials").is_none(), "the service's own CORS headers are dropped");
+    assert!(headers.get_all("vary").iter().any(|v| v == "Origin"));
+    let (status, headers, _) = h.send(&host, ask("GET", "https://evil.example", false)).await;
+    assert_eq!(status, StatusCode::OK, "the browser, not the router, keeps a stranger from reading");
+    assert!(headers.get("access-control-allow-origin").is_none());
+
+    // Without origins, the service's policy stands.
+    s.cors_origins = vec![];
+    assert_eq!(h.call(&alice, "PUT", "/v1/computers/hermes", json(&s)).await.0, StatusCode::OK);
+    let (_, headers, _) = h.send(&host, ask("GET", "https://app.example", false)).await;
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "http://localhost");
+    let (_, view) = h.call(&alice, "GET", "/v1/computers/hermes", None).await;
+    assert_eq!(view["pending"], false, "origins are not a new machine");
 }

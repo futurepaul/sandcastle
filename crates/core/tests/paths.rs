@@ -49,6 +49,7 @@ fn computer() -> Computer {
         host_port: 20000,
         fixed: Fixed { vcpus: 2, memory_mib: 2048, storage: Storage::Data, data_gib: 5, data_path: "/data".into() },
         url_auth: UrlAuth::Owner,
+        cors_origins: vec![],
         desired: Desired::Running,
         spec: generation(1, "img:1"),
         good: None,

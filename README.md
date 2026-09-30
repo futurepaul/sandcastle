@@ -103,6 +103,7 @@ Each field in brief:
 - **`env`** holds the service's own settings. It reaches the guest through an exec's stdin into a root-only file, never a command line.
 - **`service.busy`** (`{path, field}`) is how the node asks the service whether it is working before it puts the computer to sleep: a GET of `path` through its port, busy when the JSON's top-level `field` is true or above zero, and when the answer says nothing (no answer, not JSON, no such field). Hermes: `{"path": "/api/status", "field": "active_agents"}`.
 - **Outbound credentials** come from `credentials_url`, never `env` (below).
+- **`cors_origins`** (exact `https://host[:port]` origins, at most 8) lets pages on those origins read the computer's answers. The router answers their preflights (`Authorization` and `Content-Type` allowed), sets `Access-Control-Allow-Origin` for them with `Vary: Origin`, and drops the service's own CORS headers. It is meant for a service with its own login behind a `public` URL, whose platform hands a browser a session: a Hermes chat on another site, the way Finite's dashboard has one (`../docs/hermes-chat.md`). Changing it makes no new machine.
 
 ## Credentials
 

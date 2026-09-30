@@ -188,6 +188,7 @@ pub fn spec_of(c: &Computer) -> ComputerSpec {
         },
         url_auth: c.url_auth,
         credentials_url: c.spec.credentials_url.clone(),
+        cors_origins: c.cors_origins.clone(),
     }
 }
 
@@ -273,6 +274,7 @@ fn create(
         host_port,
         fixed: fixed_of(spec),
         url_auth: spec.url_auth,
+        cors_origins: spec.cors_origins.clone(),
         desired: Desired::Running,
         spec: generation_of(spec, 1),
         good: None,
@@ -366,6 +368,7 @@ fn converge(tx: &rusqlite::Transaction<'_>, signer: &str, current: &Computer, sp
     }
     let mut next = current.clone();
     next.url_auth = spec.url_auth;
+    next.cors_origins = spec.cors_origins.clone();
     let wanted = generation_of(spec, current.spec.seq);
     if !wanted.same_machine(&current.spec) {
         let seq = current.spec.seq.checked_add(1).filter(|s| *s <= sandcastle_core::limits::GENERATION_SEQ_MAX).ok_or(CommandError::Invalid("this computer has had too many generations".into()))?;
