@@ -378,6 +378,8 @@ pub struct MeasuredView {
     pub resident_mib_p50: u64,
     pub resident_mib_p95: u64,
     pub resident_mib_max: u64,
+    /// What its writable layer takes of the engine's disk now.
+    pub layer_mib: u64,
     pub samples: u32,
 }
 

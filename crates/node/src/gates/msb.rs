@@ -178,6 +178,10 @@ impl Msb {
             format!("127.0.0.1:{}:{}", spec.host_port, spec.guest_port),
             "--net-rule".into(),
             self.net_rule(),
+            // The writable layer's size, which the node's engine-disk
+            // reserve counts per machine.
+            "--root-disk".into(),
+            format!("{}G", spec.layer_gib),
         ];
         match (disk, &spec.disk_mount) {
             (Some(device), Some(mount)) => {
@@ -422,11 +426,12 @@ mod tests {
     fn create_arguments_hold_no_owner_syntax() {
         let msb = Msb::new("msb".into(), "/home/sc".into(), vec![]);
         let id = ComputerId::from_bytes([0xab; 8]);
-        let spec = MachineSpec { image: "alpine:3".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: Some("/data".into()) };
+        let spec = MachineSpec { image: "alpine:3".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: Some("/data".into()), layer_gib: 2 };
         let args = msb.create_args(id, &spec, Some(std::path::Path::new("/dev/zvol/tank/sc/abababababababab")), Some(std::path::Path::new("/home/sc/.s.json")));
         assert_eq!(args.last().map(String::as_str), Some("alpine:3"));
         assert!(args.windows(2).any(|w| w[0] == "--mount-disk" && w[1] == "/dev/zvol/tank/sc/abababababababab:/data:format=raw,fstype=ext4"));
         assert!(args.windows(2).any(|w| w[0] == "--name" && w[1] == "sc-abababababababab"));
+        assert!(args.windows(2).any(|w| w[0] == "--root-disk" && w[1] == "2G"), "the layer's size is the engine's to enforce");
     }
 
     #[test]
@@ -496,7 +501,7 @@ mod tests {
         let msb = Msb::new(program, dir.clone(), vec![]);
         let id = ComputerId::from_bytes([0xab; 8]);
         let c = cred("OPENROUTER_API_KEY", "sk-or-v1-in-the-env", Some("sk-or-v1-sandcastle-placeholder"));
-        let spec = MachineSpec { image: "alpine".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: None };
+        let spec = MachineSpec { image: "alpine".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: None, layer_gib: 4 };
         msb.create(id, &spec, None, std::slice::from_ref(&c)).await.unwrap();
         msb.rotate(id, std::slice::from_ref(&c)).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();

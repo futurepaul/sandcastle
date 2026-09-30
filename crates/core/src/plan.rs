@@ -154,6 +154,7 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         host_port: c.host_port,
         guest_port: target.port,
         disk_mount: c.has_disk().then(|| c.fixed.data_path.clone()),
+        layer_gib: u32::try_from(p.costs.layer.div_ceil(crate::budget::GIB)).expect("a layer is at most 1024 GiB (checked by the config)"),
     };
     Next::Do(Effect::Create { seq: target.seq, machine, credentials })
 }

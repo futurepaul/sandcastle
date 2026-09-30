@@ -45,6 +45,9 @@ pub struct MachineSpec {
     pub guest_port: u16,
     /// Where the durable disk mounts in the guest, for data storage.
     pub disk_mount: Option<String>,
+    /// The engine disk its writable layer may take, GiB: the budget's
+    /// `Costs::layer`, enforced by the engine.
+    pub layer_gib: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

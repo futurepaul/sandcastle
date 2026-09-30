@@ -28,19 +28,21 @@ pub struct Measures {
 struct Measured {
     at: Millis,
     limit: u64,
+    layer: u64,
     resident: VecDeque<u64>,
 }
 
 impl Measures {
     pub fn record(&mut self, now: Millis, samples: &std::collections::HashMap<ComputerId, Sample>) {
         for (id, s) in samples {
-            let m = self.machines.entry(*id).or_insert_with(|| Measured { at: now, limit: s.limit, resident: VecDeque::with_capacity(SAMPLES_KEPT) });
+            let m = self.machines.entry(*id).or_insert_with(|| Measured { at: now, limit: s.limit, layer: s.layer, resident: VecDeque::with_capacity(SAMPLES_KEPT) });
             if m.resident.len() == SAMPLES_KEPT {
                 m.resident.pop_front();
             }
             m.resident.push_back(s.resident);
             m.at = now;
             m.limit = s.limit;
+            m.layer = s.layer;
         }
         self.machines.retain(|_, m| now.saturating_sub(m.at) < FORGET_AFTER_MS);
         self.latest = samples.clone();
@@ -66,6 +68,7 @@ impl Measures {
                     resident_mib_p50: Self::quantile(&sorted, 50) / MIB,
                     resident_mib_p95: Self::quantile(&sorted, 95) / MIB,
                     resident_mib_max: sorted[sorted.len() - 1] / MIB,
+                    layer_mib: m.layer / MIB,
                     samples: u32::try_from(sorted.len()).expect("at most SAMPLES_KEPT"),
                 }
             })

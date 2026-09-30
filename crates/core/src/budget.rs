@@ -47,6 +47,7 @@ pub const SNAPSHOT_HEADROOM_PCT_MAX: u32 = 400;
 impl Costs {
     pub fn check(&self) {
         assert!(self.snapshot_headroom_pct <= SNAPSHOT_HEADROOM_PCT_MAX);
+        assert!(self.layer >= GIB && self.layer.is_multiple_of(GIB), "the engine sizes a layer in whole GiB");
     }
 }
 
