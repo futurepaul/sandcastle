@@ -24,6 +24,9 @@ pub fn computer(c: &Computer) {
     if let Some(applied) = c.applied_seq {
         assert!(applied <= c.spec.seq, "no machine is made from a generation that does not exist yet");
     }
+    if c.machine_stop.is_some() {
+        assert!(c.applied_seq.is_some(), "a machine's stop is kept only while the node's machine exists");
+    }
     if c.failures == 0 {
         assert!(c.retry_at.is_none(), "no retry is scheduled without a failure");
     } else {
@@ -107,6 +110,7 @@ pub fn next(c: &Computer, k: &Knowledge, p: &Policy, next: &Next) {
             assert_ne!(k.machine, Machine::Running, "a running machine is stopped first");
             assert!(c.desired == Desired::Deleted || c.restore.is_some());
         }
+        Effect::Launch { .. } => assert!(c.target().0.init.is_none(), "a service its image's init runs is never launched by the node"),
         Effect::Stop { force } => {
             let unquiesced = crate::plan::wedged(c) || crate::plan::stop_failed(c);
             assert!(k.quiesced || unquiesced, "a machine stops after its service, or after its service or its stop failed");

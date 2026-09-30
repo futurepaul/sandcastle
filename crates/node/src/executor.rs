@@ -252,7 +252,7 @@ impl<W: World> Node<W> {
         let engine = self.world.engine();
         let disks = self.world.disks();
         match effect {
-            Effect::Quiesce => done(engine.quiesce(c.id).await),
+            Effect::Quiesce { stop } => done(engine.quiesce(c.id, stop.as_deref()).await),
             Effect::Sync => done(engine.sync(c.id).await),
             Effect::Stop { force } => done(engine.stop(c.id, *force).await),
             Effect::Snapshot { name } => done(disks.snapshot(c.id, *name).await),

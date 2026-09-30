@@ -199,7 +199,7 @@ fn spec(url_auth: UrlAuth) -> ComputerSpec {
         data_gib: 5,
         data_path: "/opt/data".into(),
         service: Service {
-            argv: vec!["/usr/bin/serve".into(), "--port".into(), "9119".into()],
+            argv: vec!["/usr/bin/serve".into(), "--port".into(), "9119".into()], init: None,
             port: 9119,
             health_path: "/health".into(),
             env: [("DASH_PASSWORD".to_string(), "it's secret".to_string())].into(),

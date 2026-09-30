@@ -139,6 +139,25 @@ CREATE TABLE IF NOT EXISTS generation_args (
   PRIMARY KEY (computer_id, seq, position),
   FOREIGN KEY (computer_id, seq) REFERENCES generations (computer_id, seq) ON DELETE CASCADE
 );
+-- How to stop the machine the node made, when its image's init runs its
+-- service (the row keeps it: the spec may have moved on).
+CREATE TABLE IF NOT EXISTS machine_stop (
+  computer_id TEXT NOT NULL REFERENCES computers (id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  arg TEXT NOT NULL,
+  PRIMARY KEY (computer_id, position)
+);
+-- A generation whose image's init runs its service: the init's argv
+-- (role 'init') and the command that stops the guest (role 'stop').
+CREATE TABLE IF NOT EXISTS generation_init (
+  computer_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('init', 'stop')),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  arg TEXT NOT NULL,
+  PRIMARY KEY (computer_id, seq, role, position),
+  FOREIGN KEY (computer_id, seq) REFERENCES generations (computer_id, seq) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS generation_env (
   computer_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
@@ -650,6 +669,11 @@ fn assemble(conn: &Connection, id: ComputerId, r: RawRow) -> Result<Computer, St
         spec,
         good,
         applied_seq: seq32(r.applied_seq, "applied_seq")?,
+        machine_stop: {
+            let mut stmt = conn.prepare("SELECT arg FROM machine_stop WHERE computer_id = ?1 ORDER BY position")?;
+            let args: Vec<String> = stmt.query_map(params![id.hex()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            (!args.is_empty()).then_some(args)
+        },
         failed_seq: seq32(r.failed_seq, "failed_seq")?,
         failure,
         failures: u32_of(r.failures, "failures")?,
@@ -691,6 +715,14 @@ fn read_generation(conn: &Connection, id: ComputerId, seq: u32) -> Result<Option
     let argv: Vec<String> = stmt.query_map(params![id.hex(), seq], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let mut stmt = conn.prepare("SELECT name, value FROM generation_env WHERE computer_id = ?1 AND seq = ?2")?;
     let env: BTreeMap<String, String> = stmt.query_map(params![id.hex(), seq], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut stmt = conn.prepare("SELECT arg FROM generation_init WHERE computer_id = ?1 AND seq = ?2 AND role = ?3 ORDER BY position")?;
+    let init_argv: Vec<String> = stmt.query_map(params![id.hex(), seq, "init"], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let stop: Vec<String> = stmt.query_map(params![id.hex(), seq, "stop"], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let init = match (init_argv.is_empty(), stop.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some(sandcastle_proto::Init { argv: init_argv, stop }),
+        _ => return Err(StoreError::Corrupt(format!("{}: generation {seq} has an init without its stop, or a stop without its init", id.hex()))),
+    };
     Ok(Some(Generation {
         seq,
         image,
@@ -699,6 +731,7 @@ fn read_generation(conn: &Connection, id: ComputerId, seq: u32) -> Result<Option
         health_path,
         env,
         credentials_url,
+        init,
     }))
 }
 
@@ -806,6 +839,10 @@ fn write_computer(tx: &Transaction<'_>, c: &Computer, now: Millis) -> Result<(),
     )?;
     write_shape(tx, c)?;
     write_chain(tx, c)?;
+    tx.execute("DELETE FROM machine_stop WHERE computer_id = ?1", params![c.id.hex()])?;
+    for (index, arg) in c.machine_stop.iter().flatten().enumerate() {
+        tx.execute("INSERT INTO machine_stop (computer_id, position, arg) VALUES (?1, ?2, ?3)", params![c.id.hex(), position(index), arg])?;
+    }
     Ok(())
 }
 
@@ -825,6 +862,14 @@ fn write_generation(tx: &Transaction<'_>, id: ComputerId, g: &Generation) -> Res
     }
     for (name, value) in &g.env {
         tx.execute("INSERT INTO generation_env (computer_id, seq, name, value) VALUES (?1, ?2, ?3, ?4)", params![id.hex(), g.seq, name, value])?;
+    }
+    for (role, args) in g.init.iter().flat_map(|i| [("init", &i.argv), ("stop", &i.stop)]) {
+        for (position_index, arg) in args.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO generation_init (computer_id, seq, role, position, arg) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id.hex(), g.seq, role, position(position_index), arg],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1034,7 +1079,7 @@ mod tests {
             storage: sandcastle_proto::Storage::Data,
             data_gib: 1,
             data_path: "/data".into(),
-            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], port: 8000, health_path: "/".into(), env: Default::default() },
+            service: sandcastle_proto::Service { argv: vec!["/bin/serve".into()], init: None, port: 8000, health_path: "/".into(), env: Default::default() },
             url_auth: sandcastle_proto::UrlAuth::Public,
             credentials_url: None,
         };

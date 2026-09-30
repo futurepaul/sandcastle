@@ -59,6 +59,8 @@ pub struct SimMachine {
     /// The machine will not power off: a graceful stop times out until
     /// one kills it.
     pub hung: bool,
+    /// Its image's init runs the service: it starts with each boot.
+    pub init: bool,
     pub credentials: Vec<Credential>,
 }
 
@@ -247,6 +249,13 @@ impl gates::Engine for World {
             if disk.is_some() && !s.disks.contains_key(&id) {
                 return Err(fault(GateError::Failed, "the disk to attach does not exist"));
             }
+            if let Some(boot) = &spec.init {
+                if boot.env.values().any(|v| v.contains("SECRET-")) {
+                    s.violations.push(format!("{}: a credential's value reached the guest's init", id.hex()));
+                }
+            }
+            let init = spec.init.is_some();
+            let alive = init && !s.silent_images.contains(&spec.image);
             s.machines.insert(
                 id,
                 SimMachine {
@@ -254,10 +263,11 @@ impl gates::Engine for World {
                     image: spec.image.clone(),
                     host_port: spec.host_port,
                     has_disk: disk.is_some(),
-                    service_alive: false,
+                    service_alive: alive,
                     quiesced: false,
                     wedged: false,
                     hung: false,
+                    init,
                     credentials: credentials.to_vec(),
                 },
             );
@@ -268,10 +278,12 @@ impl gates::Engine for World {
     async fn start(&self, id: ComputerId, credentials: &[Credential]) -> GateResult<()> {
         let mut s = self.lock();
         let roll = s.engine_roll(&format!("start {}", id.hex()));
+        let silent = s.silent_images.clone();
         gated(roll, || match s.machines.get_mut(&id) {
             Some(m) if m.state != Machine::Running => {
                 m.state = Machine::Running;
-                m.service_alive = false;
+                // An init launches its service at boot.
+                m.service_alive = m.init && !silent.contains(&m.image);
                 m.quiesced = false;
                 m.credentials = credentials.to_vec();
                 Ok(())
@@ -335,6 +347,9 @@ impl gates::Engine for World {
             if m.wedged {
                 return Err(fault(GateError::Timeout, "msb exec timed out"));
             }
+            if m.init {
+                s.violations.push(format!("{}: the node launched a service its image's init runs", id.hex()));
+            }
             if env.values().any(|v| v.contains("SECRET-")) {
                 s.violations.push(format!("{}: a credential's value reached the guest's environment", id.hex()));
             }
@@ -344,14 +359,23 @@ impl gates::Engine for World {
         })
     }
 
-    async fn quiesce(&self, id: ComputerId) -> GateResult<()> {
+    async fn quiesce(&self, id: ComputerId, stop: Option<&[String]>) -> GateResult<()> {
         let mut s = self.lock();
-        let roll = s.engine_roll(&format!("quiesce {}", id.hex()));
+        let roll = s.engine_roll(&format!("quiesce {}{}", id.hex(), if stop.is_some() { " (its init's stop)" } else { "" }));
+        let s = &mut *s;
         gated(roll, || match s.machines.get_mut(&id) {
             Some(m) if m.state == Machine::Running && m.wedged => Err(fault(GateError::Timeout, "msb exec timed out")),
             Some(m) if m.state == Machine::Running => {
+                if m.init != stop.is_some() {
+                    s.violations.push(format!("{}: quiesced the {} way", id.hex(), if m.init { "node's, not its init's" } else { "init's, on a machine the node launches" }));
+                }
                 m.service_alive = false;
                 m.quiesced = true;
+                if stop.is_some() {
+                    // The init's stop powers the machine off.
+                    m.state = Machine::Stopped;
+                    m.wedged = false;
+                }
                 Ok(())
             }
             _ => Err(fault(GateError::Failed, "not running")),

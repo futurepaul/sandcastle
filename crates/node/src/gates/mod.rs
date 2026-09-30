@@ -51,8 +51,11 @@ pub trait Engine: Send + Sync + 'static {
     /// Launches the service detached, unless the one launched this boot is
     /// alive; its env goes in through stdin, never a command line.
     fn launch(&self, id: ComputerId, argv: &[String], env: &std::collections::BTreeMap<String, String>) -> impl Future<Output = GateResult<()>> + Send;
-    /// Stops the service (SIGTERM, then SIGKILL after 10 s) and syncs.
-    fn quiesce(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
+    /// Stops the service gracefully and syncs: the node's stop script
+    /// (SIGTERM, then SIGKILL after 10 s), or `stop`, the command that
+    /// shuts down a guest whose image's init runs its service (the machine
+    /// then powers off by itself).
+    fn quiesce(&self, id: ComputerId, stop: Option<&[String]>) -> impl Future<Output = GateResult<()>> + Send;
     /// Flushes the guest's writes to its disks.
     fn sync(&self, id: ComputerId) -> impl Future<Output = GateResult<()>> + Send;
 }

@@ -66,8 +66,15 @@ pub enum UrlAuth {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
-    /// The program and its arguments, run without a shell.
+    /// The program and its arguments, run without a shell, which the node
+    /// launches on every boot. Empty when `init` runs the service instead.
+    #[serde(default)]
     pub argv: Vec<String>,
+    /// The image's own init runs the service instead (for Hermes, its s6):
+    /// the engine hands it PID 1, and it starts and supervises what the
+    /// image means to run. The node launches nothing and still probes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<Init>,
     /// The guest port it listens on, on the guest's interface (not loopback).
     pub port: u16,
     /// A path that answers once the service is ready (any status below 500).
@@ -383,6 +390,35 @@ pub struct MeasuredView {
     pub samples: u32,
 }
 
+/// A service run by its image's own init.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Init {
+    /// The init and its arguments, as PID 1 (for Hermes: `/init
+    /// /opt/hermes/docker/main-wrapper.sh gateway run`).
+    pub argv: Vec<String>,
+    /// A command the node runs in the guest to shut it down gracefully;
+    /// the machine then powers off by itself (for s6:
+    /// `/run/s6/basedir/bin/halt`).
+    pub stop: Vec<String>,
+}
+
+/// A command's argv: 1 to `ARGV_ENTRIES_MAX` entries, at most
+/// `ARGV_BYTES_MAX` in all, no NUL, and an absolute program.
+fn validate_argv(argv: &[String], what: &str) -> Result<(), Invalid> {
+    if argv.is_empty() || argv.len() > ARGV_ENTRIES_MAX {
+        return invalid(format!("{what} has 1 to {ARGV_ENTRIES_MAX} entries"));
+    }
+    let bytes: usize = argv.iter().map(|a| a.len()).sum();
+    if bytes > ARGV_BYTES_MAX {
+        return invalid(format!("{what} is at most {ARGV_BYTES_MAX} bytes in all"));
+    }
+    if argv.iter().any(|a| a.bytes().any(|c| c == 0)) {
+        return invalid(format!("{what} has no NUL bytes"));
+    }
+    validate_abs_path(&argv[0], &format!("{what}[0]"))
+}
+
 /// The body of every refusal. `code` is stable; `message` is for people.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
@@ -577,18 +613,16 @@ impl ComputerSpec {
             }
             Storage::Pet => return invalid("pet storage is not built yet"),
         }
-        let argv = &self.service.argv;
-        if argv.is_empty() || argv.len() > ARGV_ENTRIES_MAX {
-            return invalid(format!("service.argv has 1 to {ARGV_ENTRIES_MAX} entries"));
+        match &self.service.init {
+            None => validate_argv(&self.service.argv, "service.argv")?,
+            Some(init) => {
+                if !self.service.argv.is_empty() {
+                    return invalid("service.argv is empty when service.init runs the service");
+                }
+                validate_argv(&init.argv, "service.init.argv")?;
+                validate_argv(&init.stop, "service.init.stop")?;
+            }
         }
-        let argv_bytes: usize = argv.iter().map(|a| a.len()).sum();
-        if argv_bytes > ARGV_BYTES_MAX {
-            return invalid(format!("service.argv is at most {ARGV_BYTES_MAX} bytes in all"));
-        }
-        if argv.iter().any(|a| a.bytes().any(|c| c == 0)) {
-            return invalid("service.argv has no NUL bytes");
-        }
-        validate_abs_path(&argv[0], "service.argv[0]")?;
         if self.service.env.len() > ENV_VARS_MAX {
             return invalid(format!("service.env has at most {ENV_VARS_MAX} variables"));
         }
@@ -672,7 +706,7 @@ mod tests {
             data_gib: 10,
             data_path: "/opt/data".into(),
             service: Service {
-                argv: vec!["/opt/hermes/docker/entrypoint-dispatch.sh".into(), "serve".into()],
+                argv: vec!["/opt/hermes/docker/entrypoint-dispatch.sh".into(), "serve".into()], init: None,
                 port: 9119,
                 health_path: "/api/auth/providers".into(),
                 env: BTreeMap::new(),
@@ -711,6 +745,9 @@ mod tests {
             ("pet", Box::new(|s| s.storage = Storage::Pet)),
             ("ephemeral with a disk", Box::new(|s| s.storage = Storage::Ephemeral)),
             ("no argv", Box::new(|s| s.service.argv.clear())),
+            ("an init and an argv", Box::new(|s| s.service.init = Some(Init { argv: vec!["/init".into()], stop: vec!["/halt".into()] }))),
+            ("an init with a relative program", Box::new(|s| { s.service.argv.clear(); s.service.init = Some(Init { argv: vec!["init".into()], stop: vec!["/halt".into()] }); })),
+            ("an init with no stop", Box::new(|s| { s.service.argv.clear(); s.service.init = Some(Init { argv: vec!["/init".into()], stop: vec![] }); })),
             ("relative program", Box::new(|s| s.service.argv[0] = "hermes".into())),
             ("NUL in argv", Box::new(|s| s.service.argv[1] = "a\0b".into())),
             ("too many args", Box::new(|s| s.service.argv = vec!["/x".into(); ARGV_ENTRIES_MAX + 1])),
@@ -730,6 +767,13 @@ mod tests {
             change(&mut s);
             assert!(s.validate().is_err(), "{what} should be refused");
         }
+        let mut init = hermes();
+        init.service.argv.clear();
+        init.service.init = Some(Init {
+            argv: vec!["/init".into(), "/opt/hermes/docker/main-wrapper.sh".into(), "gateway".into(), "run".into()],
+            stop: vec!["/run/s6/basedir/bin/halt".into()],
+        });
+        assert_eq!(init.validate(), Ok(()), "Hermes under its own init");
         let mut eph = hermes();
         eph.storage = Storage::Ephemeral;
         eph.data_gib = 0;

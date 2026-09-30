@@ -10,8 +10,8 @@ use sandcastle_proto::Credential;
 use crate::check;
 use crate::credentials;
 use crate::limits::{INCREMENTALS_MAX, PRUNE_BATCH_MAX};
-use crate::model::{Computer, Desired, DiskFacts, FaultKind, Fetched, Generation, Knowledge, Machine, Millis, Policy, Restore, SnapshotKind, SnapshotName, Status, Step};
-use crate::step::{Effect, MachineSpec, Next, Note, Observe};
+use crate::model::{Computer, CredentialShape, Desired, DiskFacts, FaultKind, Fetched, Generation, Knowledge, Machine, Millis, Policy, Restore, SnapshotKind, SnapshotName, Status, Step};
+use crate::step::{Boot, Effect, MachineSpec, Next, Note, Observe};
 
 pub fn plan(c: &Computer, k: &Knowledge, p: &Policy, now: Millis) -> Next {
     check::computer(c);
@@ -43,7 +43,7 @@ fn halt(c: &Computer, k: &Knowledge) -> Next {
     if k.quiesced || wedged(c) || stop_failed(c) {
         Next::Do(Effect::Stop { force: stop_failed(c) })
     } else {
-        Next::Do(Effect::Quiesce)
+        Next::Do(Effect::Quiesce { stop: machine_stop(c) })
     }
 }
 
@@ -51,6 +51,18 @@ fn halt(c: &Computer, k: &Knowledge) -> Next {
 /// stop or deletion waits on a machine that will not power off.
 pub fn stop_failed(c: &Computer) -> bool {
     c.failure.as_ref().is_some_and(|f| f.step == Step::Stop)
+}
+
+/// How to stop the machine: as the row kept it when it was made; when
+/// the row never heard it was made (a crash after the create), as the
+/// target generation's, which a lost reply almost always made; else the
+/// node's script (a machine made without an init).
+fn machine_stop(c: &Computer) -> Option<Vec<String>> {
+    match (&c.machine_stop, c.applied_seq) {
+        (Some(stop), _) => Some(stop.clone()),
+        (None, None) => c.target().0.init.as_ref().map(|i| i.stop.clone()),
+        (None, Some(_)) => None,
+    }
 }
 
 pub fn launch_failed(c: &Computer) -> bool {
@@ -155,8 +167,9 @@ fn make(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         guest_port: target.port,
         disk_mount: c.has_disk().then(|| c.fixed.data_path.clone()),
         layer_gib: u32::try_from(p.costs.layer.div_ceil(crate::budget::GIB)).expect("a layer is at most 1024 GiB (checked by the config)"),
+        init: target.init.as_ref().map(|i| Boot { argv: i.argv.clone(), stop: i.stop.clone(), env: boot_env(target, &credentials) }),
     };
-    Next::Do(Effect::Create { seq: target.seq, machine, credentials })
+    Next::Do(Effect::Create { seq: target.seq, machine: Box::new(machine), credentials })
 }
 
 fn start(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
@@ -167,10 +180,29 @@ fn start(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy) -> Next {
         Ok(credentials) => credentials,
         Err(n) => return n,
     };
+    // The engine learns a credential's name, hosts, and placeholder when
+    // it makes a machine, and a machine whose image's init runs its
+    // service boots with the environment it was made with: a new shape is
+    // a new machine, not a start.
+    let held: Vec<CredentialShape> = c.credentials.as_ref().map(|h| h.shape.clone()).unwrap_or_default();
+    if credentials::shape(&credentials) != held {
+        return make(c, target, k, p);
+    }
     if let Some(n) = room(c, k, p) {
         return n;
     }
     Next::Do(Effect::Start { credentials })
+}
+
+/// What an image's init boots with: the service's own settings, and each
+/// credential's placeholder under its name.
+fn boot_env(target: &Generation, credentials: &[Credential]) -> BTreeMap<String, String> {
+    let mut env = target.env.clone();
+    for c in credentials {
+        let shadowed = env.insert(c.name.clone(), credentials::placeholder(c));
+        assert!(shadowed.is_none(), "a credential never shadows a service variable (checked when fetched)");
+    }
+    env
 }
 
 /// What a computer's status says while the node's memory reserve has no
@@ -205,7 +237,9 @@ fn launch_env(c: &Computer, target: &Generation) -> BTreeMap<String, String> {
 /// before the next try. A quiesce or a stop that failed on the way is part
 /// of that restart, so the restart goes on through them.
 fn launch(c: &Computer, target: &Generation, k: &Knowledge) -> Next {
-    if launch_failed(c) || wedged(c) || stop_failed(c) {
+    // An image's init launches its service at boot, and relaunches it:
+    // the node's way to launch it again is a new boot.
+    if launch_failed(c) || wedged(c) || stop_failed(c) || target.init.is_some() {
         return halt(c, k);
     }
     Next::Do(Effect::Launch { argv: target.argv.clone(), env: launch_env(c, target) })
@@ -223,6 +257,15 @@ fn serving(c: &Computer, target: &Generation, k: &Knowledge, p: &Policy, now: Mi
         return serving_duties(c, target, k, p, now).unwrap_or(Next::Rest(None));
     }
     let served_since_launch = c.served_at.is_some_and(|s| s >= launched);
+    if served_since_launch && target.init.is_some() {
+        // Its init supervises it and may be restarting it now: a machine
+        // is restarted only when it stays silent past the grace.
+        let silent_since = c.served_at.expect("served since launch");
+        if now < silent_since.saturating_add(p.startup_grace_ms) {
+            return Next::Rest(None);
+        }
+        return launch(c, target, k);
+    }
     if served_since_launch {
         // It served, then stopped answering: launch it again (the launch
         // script keeps a live service rather than starting a second).

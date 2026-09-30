@@ -146,6 +146,7 @@ fn generation_of(spec: &ComputerSpec, seq: u32) -> Generation {
         health_path: spec.service.health_path.clone(),
         env: spec.service.env.clone(),
         credentials_url: spec.credentials_url.clone(),
+        init: spec.service.init.clone(),
     }
 }
 
@@ -164,6 +165,7 @@ pub fn spec_of(c: &Computer) -> ComputerSpec {
         data_path: c.fixed.data_path.clone(),
         service: sandcastle_proto::Service {
             argv: c.spec.argv.clone(),
+            init: c.spec.init.clone(),
             port: c.spec.port,
             health_path: c.spec.health_path.clone(),
             env: c.spec.env.clone(),
@@ -259,6 +261,7 @@ fn create(
         spec: generation_of(spec, 1),
         good: None,
         applied_seq: None,
+        machine_stop: None,
         failed_seq: None,
         failure: None,
         failures: 0,

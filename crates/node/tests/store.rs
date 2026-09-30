@@ -33,7 +33,7 @@ fn spec() -> ComputerSpec {
         storage: Storage::Data,
         data_gib: 5,
         data_path: "/data".into(),
-        service: Service { argv: vec!["/bin/serve".into(), "--port".into(), "9119".into()], port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH_PASSWORD".into(), "it's secret".into())]) },
+        service: Service { argv: vec!["/bin/serve".into(), "--port".into(), "9119".into()], init: None, port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH_PASSWORD".into(), "it's secret".into())]) },
         url_auth: UrlAuth::Owner,
         credentials_url: None,
     }

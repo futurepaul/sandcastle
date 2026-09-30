@@ -80,6 +80,8 @@ pub struct Generation {
     /// root-only file in the guest.
     pub env: BTreeMap<String, String>,
     pub credentials_url: Option<String>,
+    /// The image's own init runs the service (`argv` is then empty).
+    pub init: Option<sandcastle_proto::Init>,
 }
 
 impl Generation {
@@ -91,6 +93,7 @@ impl Generation {
             && self.health_path == other.health_path
             && self.env == other.env
             && self.credentials_url == other.credentials_url
+            && self.init == other.init
     }
 }
 
@@ -395,6 +398,10 @@ pub struct Computer {
     /// Failures in a row, and when to try again.
     pub failures: u32,
     pub retry_at: Option<Millis>,
+    /// How to stop the machine the node made, when its image's init runs
+    /// its service (that generation's `stop`): kept with the row, since the
+    /// spec may have moved on since.
+    pub machine_stop: Option<Vec<String>>,
     /// When the service was last launched, and last seen answering.
     pub launched_at: Option<Millis>,
     pub served_at: Option<Millis>,

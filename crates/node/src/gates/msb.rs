@@ -121,6 +121,28 @@ impl Msb {
         process::run(Call { what, program: &self.program, args, home: &self.home, env: &env, stdin, deadline, stdout_max }).await
     }
 
+    /// Runs msb with credentials' values and `env` in its environment,
+    /// never its arguments.
+    async fn run_ok_env(&self, what: &'static str, args: &[String], credentials: &[Credential], env: &[(&str, &str)], deadline: Duration) -> GateResult<process::Output> {
+        let mut all: Vec<(&str, &str)> = credentials
+            .iter()
+            .map(|c| {
+                assert!(sandcastle_proto::valid_credential_name(&c.name), "checked when fetched");
+                (c.name.as_str(), c.value.as_str())
+            })
+            .collect();
+        for (k, v) in env {
+            assert!(!all.iter().any(|(n, _)| n == k), "a credential never shadows a service variable (checked when fetched)");
+            all.push((k, v));
+        }
+        let out = process::run(Call { what, program: &self.program, args, home: &self.home, env: &all, stdin: &[], deadline, stdout_max: SMALL_BYTES_MAX }).await?;
+        if out.code == Some(0) {
+            Ok(out)
+        } else {
+            Err(process::failed(what, out.code, &out.stderr))
+        }
+    }
+
     async fn run_ok(&self, what: &'static str, args: &[String], stdin: &[u8], credentials: &[Credential], deadline: Duration) -> GateResult<process::Output> {
         let out = self.run(what, args, stdin, credentials, deadline).await?;
         if out.code == Some(0) {
@@ -197,6 +219,21 @@ impl Msb {
         if let Some(path) = secret_conf {
             args.push("--secret-conf".into());
             args.push(path.to_str().expect("the engine's home is a UTF-8 path").to_string());
+        }
+        if let Some(boot) = &spec.init {
+            // PID 1 is the image's init (msb keeps it across restarts);
+            // its environment is named here and valued in msb's own
+            // environment, never on this command line.
+            args.push("--init".into());
+            args.push(boot.argv[0].clone());
+            for a in &boot.argv[1..] {
+                args.push(format!("--init-arg={a}"));
+            }
+            for name in boot.env.keys() {
+                assert!(valid_env_name(name), "an env name reaches the guest's init: checked by the spec");
+                args.push("-e".into());
+                args.push(name.clone());
+            }
         }
         args.push(spec.image.clone());
         args
@@ -347,7 +384,8 @@ impl super::Engine for Msb {
             Some(PrivateFile::write(path, secret_conf(credentials).as_bytes()).map_err(|e| fault(GateError::Unavailable, format!("the secret config: {e}")))?)
         };
         let args = self.create_args(id, spec, disk.as_deref(), conf.as_ref().map(|f| f.path.as_path()));
-        self.run_ok("msb create", &args, &[], credentials, CREATE_DEADLINE).await.map(|_| ())
+        let boot_env: Vec<(&str, &str)> = spec.init.iter().flat_map(|b| b.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))).collect();
+        self.run_ok_env("msb create", &args, credentials, &boot_env, CREATE_DEADLINE).await.map(|_| ())
     }
 
     async fn start(&self, id: ComputerId, credentials: &[Credential]) -> GateResult<()> {
@@ -394,9 +432,14 @@ impl super::Engine for Msb {
         }
     }
 
-    async fn quiesce(&self, id: ComputerId) -> GateResult<()> {
-        let script: Vec<String> = vec!["/bin/sh".into(), "-c".into(), STOP_SCRIPT.into()];
-        self.exec("msb exec (quiesce)", id, &script, &[]).await.map(|_| ())
+    async fn quiesce(&self, id: ComputerId, stop: Option<&[String]>) -> GateResult<()> {
+        match stop {
+            Some(argv) => self.exec("msb exec (stop)", id, argv, &[]).await.map(|_| ()),
+            None => {
+                let script: Vec<String> = vec!["/bin/sh".into(), "-c".into(), STOP_SCRIPT.into()];
+                self.exec("msb exec (quiesce)", id, &script, &[]).await.map(|_| ())
+            }
+        }
     }
 
     async fn sync(&self, id: ComputerId) -> GateResult<()> {
@@ -413,6 +456,14 @@ mod tests {
         Credential { name: name.into(), value: value.into(), hosts: vec!["openrouter.ai".into(), "*.openrouter.ai".into()], placeholder: placeholder.map(str::to_string) }
     }
 
+    pub(super) fn boot() -> sandcastle_core::step::Boot {
+        sandcastle_core::step::Boot {
+            argv: vec!["/init".into(), "/opt/hermes/docker/main-wrapper.sh".into(), "gateway".into(), "run".into()],
+            stop: vec!["/run/s6/basedir/bin/halt".into()],
+            env: [("DASH_PASSWORD".to_string(), "hunter2".to_string())].into(),
+        }
+    }
+
     #[test]
     fn the_egress_rule_brackets_ipv6() {
         let msb = Msb::new("msb".into(), "/".into(), vec!["206.223.228.129".into(), "2605:6440:d000:1e9::/64".into()]);
@@ -426,7 +477,7 @@ mod tests {
     fn create_arguments_hold_no_owner_syntax() {
         let msb = Msb::new("msb".into(), "/home/sc".into(), vec![]);
         let id = ComputerId::from_bytes([0xab; 8]);
-        let spec = MachineSpec { image: "alpine:3".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: Some("/data".into()), layer_gib: 2 };
+        let spec = MachineSpec { image: "alpine:3".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: Some("/data".into()), layer_gib: 2, init: None };
         let args = msb.create_args(id, &spec, Some(std::path::Path::new("/dev/zvol/tank/sc/abababababababab")), Some(std::path::Path::new("/home/sc/.s.json")));
         assert_eq!(args.last().map(String::as_str), Some("alpine:3"));
         assert!(args.windows(2).any(|w| w[0] == "--mount-disk" && w[1] == "/dev/zvol/tank/sc/abababababababab:/data:format=raw,fstype=ext4"));
@@ -501,7 +552,7 @@ mod tests {
         let msb = Msb::new(program, dir.clone(), vec![]);
         let id = ComputerId::from_bytes([0xab; 8]);
         let c = cred("OPENROUTER_API_KEY", "sk-or-v1-in-the-env", Some("sk-or-v1-sandcastle-placeholder"));
-        let spec = MachineSpec { image: "alpine".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: None, layer_gib: 4 };
+        let spec = MachineSpec { image: "alpine".into(), vcpus: 1, memory_mib: 512, host_port: 20001, guest_port: 8080, disk_mount: None, layer_gib: 4, init: None };
         msb.create(id, &spec, None, std::slice::from_ref(&c)).await.unwrap();
         msb.rotate(id, std::slice::from_ref(&c)).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
@@ -513,6 +564,18 @@ mod tests {
         let conf = text.lines().find(|l| l.starts_with("conf:")).expect("the create was handed its config");
         assert!(conf.contains("sk-or-v1-sandcastle-placeholder") && !conf.contains("in-the-env") && conf.ends_with("mode: 600"), "{conf}");
         assert!(!dir.join(".sandcastle-sc-abababababababab-secrets.json").exists(), "the config goes with the create");
+
+        // Under its image's init: the init and its arguments on the command
+        // line; its environment named there, valued in msb's environment.
+        std::fs::write(&log, "").unwrap();
+        let boot = crate::gates::msb::tests::boot();
+        let init = MachineSpec { init: Some(boot), ..spec };
+        msb.create(id, &init, None, std::slice::from_ref(&c)).await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let argv = text.lines().find(|l| l.starts_with("argv:")).unwrap();
+        assert!(argv.contains("--init /init --init-arg=/opt/hermes/docker/main-wrapper.sh --init-arg=gateway --init-arg=run -e DASH_PASSWORD"), "{argv}");
+        assert!(!argv.contains("hunter2"), "a value never on the command line: {argv}");
+        assert!(text.lines().any(|l| l == "DASH_PASSWORD=hunter2"), "in msb's environment");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

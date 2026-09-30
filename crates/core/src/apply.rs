@@ -82,7 +82,7 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
     let mut shipped = None;
     match effect {
         // Facts about the world, which the batch's knowledge holds.
-        Effect::Quiesce | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
+        Effect::Quiesce { .. } | Effect::Sync | Effect::EnsureDisk { .. } | Effect::DestroyDisk | Effect::Receive { .. } | Effect::Prune { .. } => {}
         Effect::Stop { .. } => {
             if crate::plan::wedged(c) || crate::plan::launch_failed(c) || crate::plan::stop_failed(c) {
                 // Dealt with by the stop: the next stop quiesces first
@@ -94,17 +94,20 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
             n.status_reason = None;
         }
         Effect::Snapshot { name } => taken(&mut n, *name, p, now),
-        Effect::Create { seq, credentials, .. } => {
+        Effect::Create { seq, credentials, machine } => {
             n.applied_seq = Some(*seq);
             n.served_at = None;
             handed(&mut n, credentials, false, p, now);
-            n.launched_at = None;
+            // An image's init launches its service at boot, and the row
+            // keeps how to stop the machine.
+            n.launched_at = machine.init.is_some().then_some(now);
+            n.machine_stop = machine.init.as_ref().map(|b| b.stop.clone());
             n.status = Status::Starting;
             n.status_reason = None;
         }
         Effect::Start { credentials } => {
             handed(&mut n, credentials, false, p, now);
-            n.launched_at = None;
+            n.launched_at = c.machine_stop.is_some().then_some(now);
             n.status = Status::Starting;
             n.status_reason = None;
         }
@@ -115,6 +118,7 @@ fn succeeded(c: &Computer, effect: &Effect, outcome: &Outcome, p: &Policy, now: 
         }
         Effect::Remove => {
             n.applied_seq = None;
+            n.machine_stop = None;
             n.launched_at = None;
             n.status = Status::Absent;
         }
@@ -272,7 +276,7 @@ pub fn learn(k: &mut Knowledge, effect: &Effect, outcome: &Outcome) {
         return;
     }
     match effect {
-        Effect::Quiesce => k.quiesced = true,
+        Effect::Quiesce { .. } => k.quiesced = true,
         Effect::Sync => unreachable!("learned above"),
         Effect::Stop { .. } => {
             k.machine = Machine::Stopped;

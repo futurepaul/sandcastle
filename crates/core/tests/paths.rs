@@ -35,6 +35,7 @@ fn generation(seq: u32, image: &str) -> Generation {
         health_path: "/health".into(),
         env: BTreeMap::from([("DASH".to_string(), "x".to_string())]),
         credentials_url: None,
+        init: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn computer() -> Computer {
         desired: Desired::Running,
         spec: generation(1, "img:1"),
         good: None,
+        machine_stop: None,
         applied_seq: None,
         failed_seq: None,
         failure: None,
@@ -170,7 +172,7 @@ fn a_rebase_stops_cleanly_and_snapshots_before_replacing() {
     let mut r = serving();
     r.c.spec = generation(2, "img:2");
     r.restart(Machine::Running);
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
@@ -209,7 +211,7 @@ fn a_stop_owes_its_snapshot_first() {
     r.restart(Machine::Running);
     assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
     r.noted();
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     // a crash: the stop happened, its record did not
@@ -294,7 +296,7 @@ fn a_silent_new_generation_rolls_back_after_its_grace() {
     assert_eq!(r.next(), Next::Note(Note::GraceExpired { seq: 2 }));
     r.noted();
     assert_eq!(r.c.failed_seq, Some(2));
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
 }
 
 /// Goal: a first generation that fails has nothing to roll back to: it
@@ -321,7 +323,7 @@ fn a_first_generation_that_fails_backs_off() {
 fn a_node_fault_during_a_rebase_does_not_roll_back() {
     let mut r = serving();
     r.c.spec = generation(2, "img:2");
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
@@ -340,7 +342,7 @@ fn a_node_fault_during_a_rebase_does_not_roll_back() {
 fn a_wedged_guest_is_stopped_after_one_failed_quiesce() {
     let mut r = serving();
     r.c.desired = Desired::Deleted;
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb exec timed out".into() }));
     assert_eq!(r.c.failure.as_ref().map(|f| f.step), Some(Step::Quiesce));
     let retry = r.c.retry_at.unwrap();
@@ -365,7 +367,7 @@ fn a_launch_the_node_failed_restarts_the_machine() {
     assert_eq!(r.c.failure.as_ref().map(|f| (f.kind, f.step)), Some((FaultKind::Node, Step::Launch)));
     r.now = r.c.retry_at.unwrap();
     r.k = Knowledge::new(Machine::Running);
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
@@ -381,7 +383,7 @@ fn a_launch_the_node_failed_restarts_the_machine() {
 fn a_machine_that_will_not_stop_is_killed_after_one_failed_stop() {
     let mut r = serving();
     r.c.desired = Desired::Deleted;
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "msb stop: no answer within 60 s".into() }));
@@ -401,7 +403,7 @@ fn a_wedged_guest_on_a_hung_machine_is_killed() {
     r.c.desired = Desired::Stopped;
     assert_eq!(r.next(), Next::Note(Note::Owe { kind: SnapshotKind::Stop }));
     r.noted();
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.answer(Outcome::Failed(Fault { error: GateError::Timeout, detail: "exec".into() }));
     r.now = r.c.retry_at.unwrap();
     r.k = Knowledge::new(Machine::Running);
@@ -427,7 +429,7 @@ fn a_restart_goes_on_through_its_own_failures() {
     };
     r.expect_do(|e| matches!(e, Effect::Launch { .. }));
     fail(&mut r, "launch");
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     fail(&mut r, "quiesce");
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     fail(&mut r, "stop");
@@ -453,13 +455,52 @@ fn a_computer_waits_for_room_in_the_reserve() {
     r.expect_do(|e| matches!(e, Effect::Create { .. }));
 }
 
+/// Goal: a service its image's init runs: the machine boots it (made with
+/// the init, its stop, and an environment of the service's settings and
+/// placeholders, never a value), the node launches nothing, a service
+/// that went quiet is given the grace before its machine restarts, and a
+/// stop goes through the init's own command, as the row kept it.
+#[test]
+fn a_service_its_images_init_runs() {
+    let mut c = computer();
+    c.spec.argv.clear();
+    c.spec.init = Some(sandcastle_proto::Init { argv: vec!["/init".into(), "serve".into()], stop: vec!["/run/s6/basedir/bin/halt".into()] });
+    let mut r = Run::new(c, Machine::Absent);
+    r.k.disk_ready = true;
+    let Effect::Create { machine, .. } = r.expect_do(|e| matches!(e, Effect::Create { .. })) else { unreachable!() };
+    let boot = machine.init.expect("the init boots it");
+    assert_eq!((boot.argv[0].as_str(), boot.stop[0].as_str()), ("/init", "/run/s6/basedir/bin/halt"));
+    assert_eq!(boot.env.get("DASH").map(String::as_str), Some("x"), "its settings");
+    r.ok();
+    assert_eq!(r.c.launched_at, Some(r.now), "booted is launched");
+    assert!(r.c.machine_stop.is_some());
+    r.k.probe = Some(true);
+    assert!(matches!(r.next(), Next::Note(Note::Served { .. })));
+    r.noted();
+    // it goes quiet: its init may be restarting it, so the grace first
+    r.now += MIN;
+    r.k = Knowledge::new(Machine::Running);
+    r.k.probe = Some(false);
+    r.c.snapshot_at = Some(r.now + 10 * MIN);
+    assert_eq!(r.next(), Next::Rest(None), "inside the grace from when it last answered");
+    r.now += 2 * MIN;
+    let Effect::Quiesce { stop } = r.expect_do(|e| matches!(e, Effect::Quiesce { .. })) else { unreachable!() };
+    assert_eq!(stop, r.c.machine_stop, "the init's own stop, as the row kept it");
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
+    r.ok();
+    r.expect_do(|e| matches!(e, Effect::Start { .. }));
+    r.ok();
+    assert_eq!(r.c.launched_at, Some(r.now), "a start boots it again");
+}
+
 /// Goal: a deletion goes service, machine, removal, disk, row, observing
 /// before each, and never destroys a disk under a machine.
 #[test]
 fn a_deletion_goes_in_order() {
     let mut r = serving();
     r.c.desired = Desired::Deleted;
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
     r.ok();
     r.expect_do(|e| matches!(e, Effect::Stop { force: false }));
     r.ok();
@@ -609,7 +650,7 @@ fn credentials_refresh_by_what_the_source_says() {
     let mut renamed = creds("v2");
     renamed[0].name = "OTHER_KEY".into();
     r.k.credentials = Some(Fetched::Values(renamed));
-    r.expect_do(|e| matches!(e, Effect::Quiesce));
+    r.expect_do(|e| matches!(e, Effect::Quiesce { .. }));
 }
 
 /// Goal: a source that is down while a new generation needs its

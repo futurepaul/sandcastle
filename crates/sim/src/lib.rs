@@ -154,6 +154,7 @@ impl Sim {
     fn spec(&mut self) -> ComputerSpec {
         let image = IMAGES[self.rng.below(IMAGES.len() as u64) as usize].to_string();
         let data = !self.rng.chance(150);
+        let init = self.rng.chance(333);
         ComputerSpec {
             image,
             vcpus: 1 + self.rng.below(2) as u32,
@@ -161,7 +162,10 @@ impl Sim {
             storage: if data { Storage::Data } else { Storage::Ephemeral },
             data_gib: if data { 5 } else { 0 },
             data_path: if data { "/data".into() } else { String::new() },
-            service: Service { argv: vec!["/bin/serve".into()], port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH".to_string(), "x".to_string())]) },
+            // A third of the computers run their service under their image's init.
+            service: Service {
+                argv: if init { vec![] } else { vec!["/bin/serve".into()] },
+                init: init.then(|| sandcastle_proto::Init { argv: vec!["/init".into(), "serve".into()], stop: vec!["/halt".into()] }), port: 9119, health_path: "/health".into(), env: BTreeMap::from([("DASH".to_string(), "x".to_string())]) },
             url_auth: UrlAuth::Owner,
             credentials_url: self.rng.chance(400).then(|| CREDENTIALS_URL.to_string()),
         }
@@ -445,7 +449,10 @@ impl Sim {
     pub fn check(&mut self, settled: bool) {
         let seed = self.seed;
         let violations = std::mem::take(&mut self.world.lock().violations);
-        assert!(violations.is_empty(), "seed {seed}: the world saw {violations:?}");
+        if !violations.is_empty() {
+            let story = self.story(30).join("\n  ");
+            panic!("seed {seed}: the world saw {violations:?}; the last calls:\n  {story}");
+        }
         {
             let ledger = self.node.ledger.lock().expect("never poisoned");
             assert!(!ledger.over(), "seed {seed}: {} bytes committed past the memory reserve of {}", ledger.committed(), ledger.reserve());

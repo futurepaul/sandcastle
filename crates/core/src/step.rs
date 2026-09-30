@@ -48,13 +48,29 @@ pub struct MachineSpec {
     /// The engine disk its writable layer may take, GiB: the budget's
     /// `Costs::layer`, enforced by the engine.
     pub layer_gib: u32,
+    /// The image's init as PID 1, and the environment it boots with,
+    /// when the init runs the service.
+    pub init: Option<Boot>,
+}
+
+/// What a machine whose image's init runs its service boots with.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Boot {
+    pub argv: Vec<String>,
+    /// The command that shuts the guest down, which the row keeps.
+    pub stop: Vec<String>,
+    /// The service's own settings and each credential's placeholder:
+    /// never a credential's value.
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
-    /// Stop the service gracefully (SIGTERM, then SIGKILL after 10 s) and
-    /// sync the guest.
-    Quiesce,
+    /// Stop the service gracefully and sync the guest: the node's stop
+    /// script (SIGTERM, then SIGKILL after 10 s, then sync), or, for a
+    /// machine whose image's init runs it, that generation's `stop`
+    /// command, after which the machine powers off by itself.
+    Quiesce { stop: Option<Vec<String>> },
     /// Stop the machine; `force`: kill it, because its last graceful stop
     /// failed (msb waits for a guest to power off with no deadline).
     Stop { force: bool },
@@ -66,7 +82,7 @@ pub enum Effect {
     EnsureDisk { gib: u32 },
     DestroyDisk,
     Receive { link: ChainLink },
-    Create { seq: u32, machine: MachineSpec, credentials: Vec<Credential> },
+    Create { seq: u32, machine: Box<MachineSpec>, credentials: Vec<Credential> },
     Start { credentials: Vec<Credential> },
     /// Swap new values in on the running machine; `withdraw`: they are
     /// dead values, because the source refused.
@@ -85,7 +101,7 @@ impl Effect {
     /// The step a failure of this effect is recorded under.
     pub fn step(&self) -> Step {
         match self {
-            Effect::Quiesce => Step::Quiesce,
+            Effect::Quiesce { .. } => Step::Quiesce,
             Effect::Stop { .. } => Step::Stop,
             Effect::Sync | Effect::Snapshot { .. } => Step::Snapshot,
             Effect::Prune { .. } => Step::Prune,
