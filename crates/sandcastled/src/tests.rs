@@ -218,7 +218,8 @@ fn json(s: &ComputerSpec) -> Option<serde_json::Value> {
 }
 
 /// A computer's service: answers with the headers it saw, and upgrades
-/// `Upgrade: echo` to a byte echo.
+/// `Upgrade: echo` (or `websocket`, not spoken: the router only reads a
+/// client's frame headers) to a byte echo.
 async fn service(port: u16) -> tokio::task::JoinHandle<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     tokio::spawn(async move {
@@ -226,7 +227,8 @@ async fn service(port: u16) -> tokio::task::JoinHandle<()> {
             let Ok((tcp, _)) = listener.accept().await else { return };
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(|mut req: Request<hyper::body::Incoming>| async move {
-                    if req.headers().get("upgrade").map(|v| v.as_bytes()) == Some(b"echo") {
+                    let upgrade = req.headers().get("upgrade").map(|v| v.as_bytes().to_vec());
+                    if let Some(kind) = upgrade.filter(|u| u == b"echo" || u == b"websocket") {
                         let on = hyper::upgrade::on(&mut req);
                         tokio::spawn(async move {
                             if let Ok(up) = on.await {
@@ -235,7 +237,7 @@ async fn service(port: u16) -> tokio::task::JoinHandle<()> {
                                 let _ = tokio::io::copy(&mut r, &mut w).await;
                             }
                         });
-                        let resp = hyper::Response::builder().status(101).header("connection", "upgrade").header("upgrade", "echo").body(Full::new(Bytes::new())).unwrap();
+                        let resp = hyper::Response::builder().status(101).header("connection", "upgrade").header("upgrade", kind).body(Full::new(Bytes::new())).unwrap();
                         return Ok::<_, hyper::Error>(resp);
                     }
                     let seen: serde_json::Map<String, serde_json::Value> =
@@ -524,7 +526,8 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
 /// computer put to sleep warm or cold, or gone idle, pauses or stops; a
 /// request through its URL is held, wakes it (its batch nudged, not left
 /// to the next tick), and is answered by its service; the wake API wakes
-/// it too; bytes through a tunnel opened while it was awake wake it.
+/// it too; an open, quiet tunnel keeps nothing awake, and bytes sent
+/// through it after the computer slept wake it.
 #[tokio::test]
 async fn a_sleeping_computer_wakes_for_a_request() {
     let dir = temp_dir("sleep");
@@ -591,16 +594,24 @@ async fn a_sleeping_computer_wakes_for_a_request() {
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
-    let req = Request::get("/ws").header("host", &host).header("cookie", &session).header("connection", "upgrade").header("upgrade", "echo").body(Full::new(Bytes::new())).unwrap();
+    let req = Request::get("/ws").header("host", &host).header("cookie", &session).header("connection", "upgrade").header("upgrade", "websocket").body(Full::new(Bytes::new())).unwrap();
     let mut resp = send.send_request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
     let mut io = hyper_util::rt::TokioIo::new(hyper::upgrade::on(&mut resp).await.unwrap());
-    h.call(&alice, "POST", "/v1/computers/hermes/sleep", Some(serde_json::json!({"tier": "warm"}))).await;
-    eventually("paused under an open tunnel", || machine(&h) == Some(Machine::Paused)).await;
     use tokio::io::AsyncWriteExt;
+    // A masked client frame: FIN and `opcode`, a 1-byte payload.
+    let frame = |opcode: u8| vec![0x80 | opcode, 0x81, 1, 2, 3, 4, b'k' ^ 1];
+    // Open, its keepalives flowing, it keeps nothing awake.
+    h.world.lock().now += 31_000;
+    io.write_all(&frame(0xA)).await.unwrap();
+    eventually("idle, then paused, under an open WebSocket's pongs", || machine(&h) == Some(Machine::Paused)).await;
     h.world.lock().now += 1_000;
-    io.write_all(b"typed").await.unwrap();
-    eventually("woken by the tunnel's bytes", || machine(&h) == Some(Machine::Running)).await;
+    io.write_all(&frame(0xA)).await.unwrap();
+    // Past a tick: a pong is no activity, so not even the tick wakes it.
+    tokio::time::sleep(sandcastle_node::schedule::TICK + std::time::Duration::from_millis(500)).await;
+    assert_eq!(machine(&h), Some(Machine::Paused), "a pong wakes nothing");
+    io.write_all(&frame(0x1)).await.unwrap();
+    eventually("woken by a message through the WebSocket", || machine(&h) == Some(Machine::Running)).await;
 }
 
 fn commands_view(h: &Harness, name: &str) -> String {
