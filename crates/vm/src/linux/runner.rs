@@ -44,12 +44,17 @@ fn io(what: &'static str) -> impl FnOnce(std::io::Error) -> RunError {
     move |source| RunError::Io { what, source }
 }
 
-/// Events to stdout, each stamped with the runner's own clock.
+/// Events to stdout, each stamped with the runner's own clock, and to
+/// `events.jsonl` in the run directory, where a supervisor that restarted
+/// (and lost the pipe) reads them.
 #[derive(Clone)]
 struct Events {
     t0: Instant,
-    out: Arc<Mutex<std::io::Stdout>>,
+    out: Arc<Mutex<(std::io::Stdout, Option<File>)>>,
 }
+
+/// Events one run keeps on disk; past it they go to stdout only.
+const EVENTS_BYTES_MAX: u64 = 1 << 20;
 
 impl Events {
     fn emit(&self, mut v: serde_json::Value) {
@@ -57,8 +62,13 @@ impl Events {
         let mut out = self.out.lock().expect("an emitter never panics holding it");
         // A supervisor that stopped reading has stopped caring; the VM
         // runs on regardless.
-        let _ = writeln!(out, "{v}");
-        let _ = out.flush();
+        let _ = writeln!(out.0, "{v}");
+        let _ = out.0.flush();
+        if let Some(f) = out.1.as_mut() {
+            if f.metadata().map(|m| m.len()).unwrap_or(0) < EVENTS_BYTES_MAX {
+                let _ = writeln!(f, "{v}");
+            }
+        }
     }
 }
 
@@ -82,7 +92,8 @@ fn bind(path: &Path) -> Result<UnixListener, RunError> {
 pub fn run(config_path: &Path) -> Result<std::convert::Infallible, RunError> {
     let t0 = Instant::now();
     let config = read_config(config_path)?;
-    let events = Events { t0, out: Arc::new(Mutex::new(std::io::stdout())) };
+    let events_file = OpenOptions::new().create(true).append(true).open(config.run_dir.join(paths::EVENTS)).ok();
+    let events = Events { t0, out: Arc::new(Mutex::new((std::io::stdout(), events_file))) };
 
     // libkrun binds the agent socket itself (it listens there for the
     // host); a stale one from a crashed run would make that fail.

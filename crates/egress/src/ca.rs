@@ -26,23 +26,51 @@ pub struct Ca {
     issuer: Issuer<'static, KeyPair>,
     cert_der: CertificateDer<'static>,
     cert_pem: String,
+    key_pem: String,
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
+}
+
+fn ca_params(common_name: &str) -> Result<CertificateParams, CaError> {
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params.distinguished_name.push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+    Ok(params)
 }
 
 impl Ca {
     pub fn generate(common_name: &str) -> Result<Ca, CaError> {
-        let mut params = CertificateParams::new(Vec::<String>::new())?;
-        params.distinguished_name.push(DnType::CommonName, common_name);
-        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+        let params = ca_params(common_name)?;
         let key = KeyPair::generate()?;
         let cert = params.self_signed(&key)?;
         Ok(Ca {
             cert_pem: cert.pem(),
             cert_der: cert.der().clone(),
+            key_pem: key.serialize_pem(),
             issuer: Issuer::new(params, key),
             leaves: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A CA kept on disk: its certificate as guests already trust it, and
+    /// its key. Leaves it signs chain to that certificate (same name, same
+    /// key).
+    pub fn load(common_name: &str, cert_pem: &str, key_pem: &str) -> Result<Ca, CaError> {
+        let key = KeyPair::from_pem(key_pem)?;
+        let der = rustls_pki_types::pem::PemObject::from_pem_slice(cert_pem.as_bytes())
+            .map_err(|_| CaError::Mint(rcgen::Error::CouldNotParseCertificate))?;
+        Ok(Ca {
+            cert_pem: cert_pem.to_string(),
+            cert_der: der,
+            key_pem: key_pem.to_string(),
+            issuer: Issuer::new(ca_params(common_name)?, key),
+            leaves: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The key, for the node to keep (root only, never a guest's).
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
     }
 
     pub fn cert_pem(&self) -> &str {
@@ -87,6 +115,26 @@ impl Ca {
 mod tests {
     use super::*;
     use rustls::client::danger::ServerCertVerifier;
+
+    // Goal: a CA saved and loaded mints leaves that chain to the saved
+    // certificate.
+    #[test]
+    fn saved_and_loaded() {
+        let ca = Ca::generate("node CA").unwrap();
+        let again = Ca::load("node CA", ca.cert_pem(), ca.key_pem()).unwrap();
+        assert_eq!(again.cert_der(), ca.cert_der());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.cert_der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build().unwrap();
+        let mut params = CertificateParams::new(vec!["z.example".to_string()]).unwrap();
+        params.distinguished_name.push(DnType::CommonName, "z.example");
+        let key = KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &again.issuer).unwrap();
+        let name = rustls_pki_types::ServerName::try_from("z.example").unwrap();
+        verifier.verify_server_cert(leaf.der(), &[], &name, &[], rustls_pki_types::UnixTime::now()).unwrap();
+        assert!(Ca::load("node CA", "not a pem", ca.key_pem()).is_err());
+    }
 
     // Goal: a leaf the CA mints verifies against the CA alone.
     #[test]

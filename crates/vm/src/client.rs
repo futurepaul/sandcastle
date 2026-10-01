@@ -237,6 +237,27 @@ impl Vm {
         }
     }
 
+    fn done(&self, req: Request) -> Result<(), ClientError> {
+        let (_w, mut r) = self.open(&req)?;
+        match self.reply(&mut r)? {
+            Reply::Done => Ok(()),
+            other => Err(ClientError::Protocol(format!("{other:?} for {req:?}"))),
+        }
+    }
+
+    /// A signal to the entrypoint.
+    pub fn signal(&self, signal: i32) -> Result<(), ClientError> {
+        self.done(Request::Signal { signal })
+    }
+
+    pub fn freeze(&self) -> Result<(), ClientError> {
+        self.done(Request::Freeze)
+    }
+
+    pub fn thaw(&self) -> Result<(), ClientError> {
+        self.done(Request::Thaw)
+    }
+
     pub fn finish(&self) -> Result<u64, ClientError> {
         let (_w, mut r) = self.open(&Request::Finish)?;
         match self.reply(&mut r)? {

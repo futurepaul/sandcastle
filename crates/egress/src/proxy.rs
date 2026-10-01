@@ -53,7 +53,9 @@ pub struct Decision {
 }
 
 pub struct Egress {
-    rules: Compiled,
+    /// Replaced whole when the rules change (an intercept added while the
+    /// VM runs); a connection decides on the rules it read.
+    rules: std::sync::RwLock<Arc<Compiled>>,
     fake: Mutex<FakeIps>,
     ca: Arc<Ca>,
     /// The handler: an HTTP server on a unix socket (celld's callback, or
@@ -112,13 +114,22 @@ impl Egress {
             .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Egress {
-            rules,
+            rules: std::sync::RwLock::new(Arc::new(rules)),
             fake: Mutex::new(FakeIps::default()),
             ca,
             handler,
             upstream: tokio_rustls::TlsConnector::from(Arc::new(config)),
             log: Mutex::new(Vec::new()),
         }
+    }
+
+    fn rules(&self) -> Arc<Compiled> {
+        self.rules.read().expect("never poisoned").clone()
+    }
+
+    /// The new rules, for connections and lookups from now on.
+    pub fn set_rules(&self, rules: Compiled) {
+        *self.rules.write().expect("never poisoned") = Arc::new(rules);
     }
 
     pub fn decisions(&self) -> Vec<Decision> {
@@ -170,7 +181,7 @@ impl Egress {
     /// let it reach, NXDOMAIN otherwise.
     pub fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
         let q = dns::parse_query(query).ok()?;
-        let decision = self.rules.name(&q.name);
+        let decision = self.rules().name(&q.name);
         let answer = match decision {
             NameDecision::Refuse => dns::answer_nxdomain(&q),
             NameDecision::Intercept(_) | NameDecision::Resolve if q.qtype == dns::TYPE_A => {
@@ -196,7 +207,7 @@ impl Egress {
             },
             _ => None,
         };
-        let decision = self.rules.addr(ip, port, host.as_deref());
+        let decision = self.rules().addr(ip, port, host.as_deref());
         self.note(format!("{ip}:{port}"), host.as_deref(), format!("{decision:?}"));
         match decision {
             AddrDecision::Refuse(_) => Ok(()),
@@ -210,7 +221,7 @@ impl Egress {
         let addrs = tokio::net::lookup_host((host, port)).await?;
         addrs
             .into_iter()
-            .find(|a| self.rules.reachable(a.ip(), port))
+            .find(|a| self.rules().reachable(a.ip(), port))
             .ok_or_else(|| ProxyError::Refused(format!("{host} has no public address")))
     }
 
@@ -270,7 +281,7 @@ impl Egress {
     }
 
     async fn request(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool) -> Response<Body> {
-        match self.rules.action(i).clone() {
+        match self.rules().action(i).clone() {
             Action::Handler => {
                 let h = req.headers_mut();
                 h.insert("x-sandcastle-host", HeaderValue::from_str(host).unwrap_or(HeaderValue::from_static("invalid")));
@@ -336,7 +347,7 @@ mod tests {
     fn egress(internet: bool) -> Egress {
         let rules = Policy {
             internet,
-            intercept: vec![Intercept { host: "model.example.com".into(), action: Action::Handler }],
+            intercept: vec![Intercept::https("model.example.com", Action::Handler)],
             ..Policy::default()
         }
         .compile(&[])
@@ -394,7 +405,7 @@ mod tests {
         });
         let rules = Policy {
             internet: false,
-            intercept: vec![Intercept { host: "model.example.com".into(), action: Action::Handler }],
+            intercept: vec![Intercept::https("model.example.com", Action::Handler)],
             ..Policy::default()
         }
         .compile(&[])

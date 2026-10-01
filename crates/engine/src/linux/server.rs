@@ -1,0 +1,127 @@
+//! The engine's API on its unix socket: HTTP/1.1 and JSON, one route per
+//! Cloudflare call. Bodies are bounded; every answer that is not a success
+//! is an `ErrorBody` with the HTTP status its kind maps to.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Bytes, Incoming};
+use hyper::{Method, Request, Response};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
+use super::engine::Engine;
+use crate::api::{ApiError, DestroyRequest, ErrorBody, InterceptsRequest, SignalRequest, SnapshotRequest, StartRequest};
+
+/// A request body, as read.
+pub const BODY_BYTES_MAX: usize = 1 << 20;
+
+fn json<T: Serialize>(status: u16, v: &T) -> Response<Full<Bytes>> {
+    let mut r = Response::new(Full::new(Bytes::from(serde_json::to_vec(v).expect("serializes"))));
+    *r.status_mut() = hyper::StatusCode::from_u16(status).expect("a status");
+    r.headers_mut().insert("content-type", "application/json".parse().expect("a header"));
+    r
+}
+
+fn error(e: ApiError) -> Response<Full<Bytes>> {
+    json(e.status(), &ErrorBody { error: e.to_string(), kind: e.kind().into() })
+}
+
+fn empty(status: u16) -> Response<Full<Bytes>> {
+    let mut r = Response::new(Full::new(Bytes::new()));
+    *r.status_mut() = hyper::StatusCode::from_u16(status).expect("a status");
+    r
+}
+
+async fn body<T: DeserializeOwned>(req: Request<Incoming>) -> Result<T, ApiError> {
+    let bytes = Limited::new(req.into_body(), BODY_BYTES_MAX)
+        .collect()
+        .await
+        .map_err(|_| ApiError::Invalid(format!("a body of at most {BODY_BYTES_MAX} bytes")))?
+        .to_bytes();
+    // serde's message names a position, not the input.
+    serde_json::from_slice(&bytes).map_err(|e| ApiError::Invalid(format!("the body: {e}")))
+}
+
+pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path: Vec<String> = req.uri().path().trim_matches('/').split('/').map(str::to_string).collect();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let p: Vec<&str> = path.iter().map(String::as_str).collect();
+    let method = req.method().clone();
+    let r = match (&method, p.as_slice()) {
+        (&Method::GET, ["v1", "health"]) => Ok(json(200, &engine.health())),
+        (&Method::GET, ["v1", "containers"]) => Ok(json(200, &engine.list())),
+        (&Method::GET, ["v1", "containers", name]) => engine.inspect(name).map(|i| json(200, &i)),
+        (&Method::POST, ["v1", "containers", name, "start"]) => {
+            let name = name.to_string();
+            match body::<StartRequest>(req).await {
+                Ok(s) => engine.start_timed(&name, s, query.split('&').any(|q| q == "wait=ready")).await.map(|(i, t)| {
+                    let mut v = serde_json::to_value(&i).expect("serializes");
+                    v["timings"] = serde_json::to_value(&t).expect("serializes");
+                    json(201, &v)
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::POST, ["v1", "containers", name, "destroy"]) => {
+            let name = name.to_string();
+            match body::<DestroyRequest>(req).await {
+                Ok(d) => engine.destroy(&name, d.error).await.map(|e| json(200, &e)),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::POST, ["v1", "containers", name, "signal"]) => {
+            let name = name.to_string();
+            match body::<SignalRequest>(req).await {
+                Ok(s) => engine.signal(&name, s.signal).await.map(|()| empty(204)),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::GET, ["v1", "containers", name, "wait"]) => engine.wait(name).await.map(|e| json(200, &e)),
+        (&Method::POST, ["v1", "containers", name, "reclaim"]) => {
+            engine.reclaim(name).await.map(|(b, a)| json(200, &serde_json::json!({"freeKibBefore": b, "freeKibAfter": a})))
+        }
+        (&Method::PUT, ["v1", "containers", name, "intercepts"]) => {
+            let name = name.to_string();
+            match body::<InterceptsRequest>(req).await {
+                Ok(i) => engine.set_intercepts(&name, i.intercepts).map(|()| empty(204)),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::POST, ["v1", "containers", name, "snapshots"]) => {
+            let name = name.to_string();
+            match body::<SnapshotRequest>(req).await {
+                Ok(s) => engine.snapshot(&name, s.name).await.map(|s| json(201, &s)),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::GET, ["v1", "snapshots"]) => Ok(json(200, &engine.snapshots())),
+        (&Method::DELETE, ["v1", "snapshots", id]) => engine.delete_snapshot(id).map(|()| empty(204)),
+        (&Method::GET, ["v1", "images"]) => Ok(json(200, &engine.images())),
+        (&Method::DELETE, ["v1", "data", disk]) => engine.delete_data(disk).map(|()| empty(204)),
+        (&Method::POST, ["v1", "images", "pull"]) => match body::<serde_json::Value>(req).await {
+            Ok(v) => match v["reference"].as_str() {
+                Some(r) => engine.pull(r).await.map(|m| json(200, &m)),
+                None => Err(ApiError::Invalid("{\"reference\": ...}".into())),
+            },
+            Err(e) => Err(e),
+        },
+        _ => Err(ApiError::NotFound(format!("no route {method} {}", path.join("/")))),
+    };
+    Ok(r.unwrap_or_else(error))
+}
+
+/// Serves the API until the process ends.
+pub async fn serve(engine: Arc<Engine>, listener: tokio::net::UnixListener) {
+    // Unbounded by design: the engine serves for its life; each
+    // connection is its own task.
+    loop {
+        let Ok((s, _)) = listener.accept().await else { continue };
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req| route(engine.clone(), req));
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+        });
+    }
+}

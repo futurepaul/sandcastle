@@ -1232,6 +1232,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-engine"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "sandcastle-egress",
+ "sandcastle-rootfs",
+ "sandcastle-vm",
+ "sandcastle-wire",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "sandcastle-guest"
 version = "0.1.0"
 dependencies = [
@@ -1255,6 +1275,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "sandcastle-egress",
+ "sandcastle-engine",
  "sandcastle-rootfs",
  "sandcastle-vm",
  "sandcastle-wire",

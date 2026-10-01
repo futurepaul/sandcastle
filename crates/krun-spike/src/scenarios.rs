@@ -1,60 +1,60 @@
-//! The scenarios, one per acceptance item (docs/krun-spike.md), each
-//! returning its evidence.
+//! The scenarios, one per acceptance item (docs/krun-spike.md,
+//! docs/krun-engine.md), each returning its evidence. They drive the
+//! engine through its API; the escape probe alone goes to the jailer
+//! directly, since it tests the jail beneath the engine.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use sandcastle_vm::Net;
+use sandcastle_engine::api::Instance;
 use sandcastle_vm::client::{ClientError, ExecEvent};
-use sandcastle_wire::{Process, Start, WinSize};
+use sandcastle_wire::{ControlRequest, Process, WinSize};
 use serde_json::{json, Value};
 
-use crate::image::{self, Image};
-use crate::launch::{self, ms, Jail, Running, Spec};
+use crate::launch::{self, ms, Spec};
 use crate::layout::Layout;
+use crate::node::{agent_err, engine_err, start, with_data, Ctr, Node};
 use crate::{stats, Error};
 
 pub const BUSYBOX: &str = "busybox:1.37.0";
-const GIB: u64 = 1 << 30;
-const READY_S: u64 = 60;
+pub const ECHO_SERVER: &str = "jmalloc/echo-server:v0.3.7";
+pub const SLEEP_FOREVER: &[&str] = &["/bin/sh", "-c", "while :; do sleep 3600; done"];
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
-fn jail_of(args: &[String]) -> Jail {
-    if args.iter().any(|a| a == "--jail") {
-        Jail::Yes
-    } else {
-        Jail::No
-    }
-}
-
 pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
-    let Some(cmd) = args.first() else { return Err(Error::msg("a scenario: boot-disk, image, boot, fresh-root")) };
-    let jail = if cmd == "probe" { Jail::Yes } else { jail_of(args) };
+    let Some(cmd) = args.first() else {
+        return Err(Error::msg("a scenario: boot, fresh-root, exec, port, egress, hermes, hermes-memory, crash, parity, probe, census, reset, pull"));
+    };
     let n: usize = flag(args, "--n").map(|s| s.parse().unwrap_or(10)).unwrap_or(10);
     let v = match cmd.as_str() {
-        "boot-disk" => boot_disk(layout)?,
-        "image" => {
-            let r = args.get(1).ok_or_else(|| Error::msg("image <reference>"))?;
-            image::ensure(layout, r, jail)?.1
-        }
-        "setup" => setup(layout)?,
         "reset" => reset(layout, args.iter().any(|a| a == "--all"))?,
-        "boot" => boot(layout, jail, n)?,
-        "fresh-root" => fresh_root(layout, jail)?,
-        "probe" => probe(layout)?,
-        "exec" => exec(layout, jail, n)?,
-        "port" => port(layout, jail, n)?,
-        "egress" => crate::egress::scenario(layout, jail)?,
-        "hermes" => crate::hermes::scenario(layout, jail, n)?,
-        "crash" => crash(layout)?,
-        "hermes-memory" => crate::hermes::memory_scenario(layout, jail)?,
         "census" => census(layout)?,
-        other => return Err(Error::msg(format!("no scenario {other}"))),
+        "probe" => probe(layout)?,
+        other => {
+            let node = Node::new(layout)?;
+            match other {
+                "pull" => {
+                    let r = args.get(1).ok_or_else(|| Error::msg("pull <reference>"))?;
+                    node.block(node.client.pull(r)).map_err(engine_err)?
+                }
+                "boot" => boot(&node, n)?,
+                "fresh-root" => fresh_root(&node)?,
+                "exec" => exec(&node, n)?,
+                "port" => port(&node, n)?,
+                "egress" => crate::egress::scenario(layout, &node)?,
+                "hermes" => crate::hermes::scenario(&node, n)?,
+                "hermes-memory" => crate::hermes::memory_scenario(&node)?,
+                "crash" => crash(layout, &node)?,
+                "parity" => crate::parity::scenario(layout, &node)?,
+                other => return Err(Error::msg(format!("no scenario {other}"))),
+            }
+        }
     };
-    let v = json!({"scenario": cmd, "jail": jail == Jail::Yes, "evidence": v, "versions": versions(layout)});
+    let v = json!({"scenario": cmd, "evidence": v, "versions": versions(layout)});
     save(layout, cmd, &v)?;
     Ok(v)
 }
@@ -66,9 +66,9 @@ fn versions(layout: &Layout) -> Value {
     json!({
         "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
         "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
-        "libkrun_so_sha256_16": sha(layout.lib("libkrun.so")),
         "guest_sha256_16": sha(layout.bin("sandcastle-guest")),
         "runner_sha256_16": sha(layout.bin("sandcastle-vm")),
+        "engine_sha256_16": sha(layout.bin("sandcastle-engine")),
     })
 }
 
@@ -79,267 +79,59 @@ fn save(layout: &Layout, name: &str, v: &Value) -> Result<(), Error> {
     std::fs::write(p, serde_json::to_vec_pretty(v).expect("serializes")).map_err(Error::io("saving the evidence"))
 }
 
-fn boot_disk(layout: &Layout) -> Result<Value, Error> {
-    std::fs::create_dir_all(layout.boot()).map_err(Error::io("the boot directory"))?;
-    let out = launch::boot_disk(layout);
-    let t = Instant::now();
-    sandcastle_rootfs::ext4::boot_disk(&layout.bin("sandcastle-guest"), &out, &layout.tmp().join("bootdir"))
-        .map_err(|e| Error::msg(e.to_string()))?;
-    Ok(json!({"boot_disk": out, "ms": t.elapsed().as_millis() as u64}))
-}
-
-/// A start that runs `argv` in `image`, its env, cwd, and user kept.
-pub fn run_start(image: &Image, id: &str, argv: &[&str], data: bool) -> Start {
-    Start::Run {
-        entrypoint: Process {
-            argv: argv.iter().map(|s| s.to_string()).collect(),
-            env: image.config.env.clone().unwrap_or_default(),
-            cwd: image.config.working_dir.clone().filter(|w| !w.is_empty()),
-            user: image.config.user.clone().filter(|u| !u.is_empty()),
-        },
-        hostname: id.into(),
-        data,
-        data_path: None,
-        ca_pem: None,
-        net: None,
+fn timing_stats(samples: &[Value], key: &str) -> Value {
+    let v: Vec<f64> = samples.iter().filter_map(|t| t[key].as_f64()).map(|us| us / 1000.0).collect();
+    if v.is_empty() {
+        Value::Null
+    } else {
+        stats(&v)
     }
 }
 
-const SLEEP_FOREVER: &[&str] = &["/bin/sh", "-c", "while :; do sleep 3600; done"];
-
-pub fn busybox_vm(layout: &Layout, image: &Image, id: &str, jail: Jail, slot: u32, data: Option<PathBuf>) -> Result<Running, Error> {
-    let has_data = data.is_some();
-    launch::start(
-        layout,
-        Spec {
-            id: id.into(),
-            vcpus: 1,
-            memory_mib: 512,
-            image: Some(image.root.clone()),
-            target: None,
-            scratch_bytes: Some(4 * GIB),
-            data,
-            net: Net::None,
-            start: run_start(image, id, SLEEP_FOREVER, has_data),
-            jail,
-            slot,
-            probe: None,
-            before: None,
-        },
-    )
-}
-
-/// Acceptance 1 (busybox): a start to the guest's ready, ten times.
-fn boot(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
-    let (img, _) = image::ensure(layout, BUSYBOX, jail)?;
-    let (mut spawn_to_ready, mut runner_ready, mut guest_uptime, mut prepare, mut ping) = (vec![], vec![], vec![], vec![], vec![]);
-    for i in 0..n {
-        let id = format!("boot-{i}");
-        let mut vm = busybox_vm(layout, &img, &id, jail, i as u32 % 2, None)?;
-        let (at, ready) = vm.wait_for("ready", Duration::from_secs(READY_S))?;
-        spawn_to_ready.push(ms(vm.spawned, at));
-        runner_ready.push(ready["t_us"].as_f64().unwrap_or(0.0) / 1000.0);
-        guest_uptime.push(ready["guest_uptime_ms"].as_f64().unwrap_or(0.0));
-        prepare.push(vm.prepare_ms);
+/// Acceptance 1 (busybox): starts through the engine, to ready.
+fn boot(node: &Node, n: usize) -> Result<Value, Error> {
+    let (mut total, mut ping, mut timings) = (vec![], vec![], vec![]);
+    for _ in 0..n {
+        let c = node.start("boot", &start(BUSYBOX, SLEEP_FOREVER))?;
+        total.push(c.start_ms);
+        timings.push(c.timings.clone());
         let t = Instant::now();
-        vm.vm.ping().map_err(|e| Error::msg(e.to_string()))?;
+        c.vm.ping().map_err(agent_err)?;
         ping.push(ms(t, Instant::now()));
-        vm.kill()?;
-        launch::remove_run_dir(layout, &id);
+        c.destroy(None)?;
     }
     Ok(json!({
-        "image": BUSYBOX,
-        "vcpus": 1, "memory_mib": 512,
-        "spawn_to_ready_ms": stats(&spawn_to_ready),
-        "runner_clock_ready_ms": stats(&runner_ready),
-        "guest_uptime_at_ready_ms": stats(&guest_uptime),
-        "scratch_disk_ms": stats(&prepare),
+        "image": BUSYBOX, "instance": "lite (1/16 vCPU, 256 MiB; full CPU until ready)",
+        "start_to_ready_ms": stats(&total),
+        "engine_ms": {
+            "prepared": timing_stats(&timings, "preparedUs"),
+            "jailed": timing_stats(&timings, "jailedUs"),
+            "jail_nft": timing_stats(&timings, "jailNftUs"),
+            "vmm_built": timing_stats(&timings, "vmmBuiltUs"),
+            "guest_hello": timing_stats(&timings, "guestHelloUs"),
+            "ready": timing_stats(&timings, "readyUs"),
+        },
         "first_ping_ms": stats(&ping),
     }))
 }
 
-fn sh(vm: &Running, script: &str) -> Result<(String, Option<i32>), Error> {
-    let out = vm
-        .vm
-        .exec(Process { argv: vec!["/bin/sh".into(), "-c".into(), script.into()], ..Process::default() }, None)
-        .map_err(|e| Error::msg(format!("exec: {e}")))?;
-    Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.code))
-}
-
-/// Acceptance 8: a fresh root at each start, `/data` kept.
-fn fresh_root(layout: &Layout, jail: Jail) -> Result<Value, Error> {
-    let (img, _) = image::ensure(layout, BUSYBOX, jail)?;
-    std::fs::create_dir_all(layout.data()).map_err(Error::io("the data directory"))?;
-    let data = layout.data().join("fresh-root.ext4");
-    sandcastle_rootfs::ext4::make(&data, GIB, true, None).map_err(|e| Error::msg(e.to_string()))?;
-    let mut first = busybox_vm(layout, &img, "fresh-1", jail, 0, Some(data.clone()))?;
-    first.wait_for("ready", Duration::from_secs(READY_S))?;
-    let (wrote, _) = sh(&first, "echo first > /marker && echo kept > /data/marker && sync && cat /marker /data/marker")?;
-    first.kill()?;
-    let mut second = busybox_vm(layout, &img, "fresh-2", jail, 1, Some(data.clone()))?;
-    second.wait_for("ready", Duration::from_secs(READY_S))?;
-    let (seen, _) = sh(&second, "if test -e /marker; then echo root-kept; else echo root-fresh; fi; cat /data/marker")?;
-    second.kill()?;
-    for id in ["fresh-1", "fresh-2"] {
-        launch::remove_run_dir(layout, id);
-    }
-    let _ = std::fs::remove_file(&data);
+/// Acceptance 8: a fresh root at each start, the data disk kept.
+fn fresh_root(node: &Node) -> Result<Value, Error> {
+    node.delete_data("fresh-root");
+    let s = with_data(start(BUSYBOX, SLEEP_FOREVER), "fresh-root", "/data", 1);
+    let first = node.start("fresh-1", &s)?;
+    let (wrote, _) = first.sh("echo first > /marker && echo kept > /data/marker && sync && cat /marker /data/marker")?;
+    first.destroy(None)?;
+    let second = node.start("fresh-2", &s)?;
+    let (seen, _) = second.sh("if test -e /marker; then echo root-kept; else echo root-fresh; fi; cat /data/marker")?;
+    second.destroy(None)?;
+    node.delete_data("fresh-root");
     let pass = seen == "root-fresh\nkept\n";
-    if !pass {
-        return Err(Error::msg(format!("fresh root failed: first wrote {wrote:?}, second saw {seen:?}")));
-    }
-    Ok(json!({"first_start_wrote": wrote, "second_start_saw": seen, "pass": pass}))
+    Ok(json!({"pass": pass, "first_start_wrote": wrote, "second_start_saw": seen}))
 }
 
-/// The jail's settings for this node, and the slice's limits (not kept
-/// across a reboot).
-fn setup(layout: &Layout) -> Result<Value, Error> {
-    let kvm_gid = std::fs::read_to_string("/etc/group")
-        .ok()
-        .and_then(|g| g.lines().find(|l| l.starts_with("kvm:")).and_then(|l| l.split(':').nth(2)).and_then(|n| n.parse::<u32>().ok()))
-        .ok_or_else(|| Error::msg("no kvm group"))?;
-    // SAFETY: getuid and getgid have no preconditions.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let settings = sandcastle_vm::jail::Settings {
-        state_root: layout.root.clone(),
-        lib_dir: layout.root.join("prefix/lib"),
-        runner: layout.bin("sandcastle-vm"),
-        uid_base: launch::UID_BASE,
-        uid_count: launch::UID_COUNT,
-        kvm_gid,
-        owner_uid: uid,
-        owner_gid: gid,
-        system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
-    };
-    settings.validate().map_err(|e| Error::msg(e.to_string()))?;
-    std::fs::write(layout.jail_settings(), serde_json::to_vec_pretty(&settings).expect("serializes")).map_err(Error::io("jail.json"))?;
-    let out = std::process::Command::new("sudo")
-        .args(["-n", "systemctl", "set-property", "--runtime", launch::SLICE, "MemoryMax=8G", "CPUQuota=800%"])
-        .output()
-        .map_err(Error::io("systemctl"))?;
-    if !out.status.success() {
-        return Err(Error::msg(format!("set-property: {}", String::from_utf8_lossy(&out.stderr))));
-    }
-    let show = std::process::Command::new("systemctl")
-        .args(["show", launch::SLICE, "-p", "MemoryMax", "-p", "CPUQuotaPerSecUSec"])
-        .output()
-        .map_err(Error::io("systemctl show"))?;
-    Ok(json!({"settings": settings, "slice": String::from_utf8_lossy(&show.stdout)}))
-}
-
-/// Puts the node back as it was: every spike VM stopped (the slice's
-/// scopes), its run directories, data disks, and staging removed; with
-/// `--all`, its images, blobs, and boot disk too. Deletes whole, explicit
-/// roots under the spike's own directory and nothing else.
-fn reset(layout: &Layout, all: bool) -> Result<Value, Error> {
-    let stop = std::process::Command::new("sudo")
-        .args(["-n", "systemctl", "stop", launch::SLICE])
-        .output()
-        .map_err(Error::io("systemctl stop"))?;
-    // A jailer killed outright never handed its VM's files back.
-    let restore = std::process::Command::new("sudo")
-        .args(["-n"])
-        .arg(layout.bin("sandcastle-vm"))
-        .args(["restore", "--settings"])
-        .arg(layout.jail_settings())
-        .output()
-        .map_err(Error::io("restore"))?;
-    if !restore.status.success() && layout.jail_settings().exists() {
-        return Err(Error::msg(format!("restore: {}", String::from_utf8_lossy(&restore.stderr))));
-    }
-    // Unjailed runners (phase 1) are the node user's own processes.
-    let _ = std::process::Command::new("pkill").args(["-u", &unsafe { libc::getuid() }.to_string(), "-f", "sandcastle-vm run --config"]).status();
-    let mut removed = vec![];
-    let mut roots = vec![layout.vms(), layout.data(), layout.tmp(), layout.root.join("jailroot")];
-    if all {
-        roots.extend([layout.images(), layout.blobs(), layout.boot(), layout.results()]);
-    }
-    for r in roots {
-        assert!(r.starts_with(&layout.root) && r != layout.root);
-        if r.exists() {
-            std::fs::remove_dir_all(&r).map_err(Error::io("removing a spike directory"))?;
-            removed.push(r);
-        }
-    }
-    Ok(json!({"slice_stopped": stop.status.success(), "restore": String::from_utf8_lossy(&restore.stdout).trim(), "removed": removed}))
-}
-
-/// Acceptance 7: from inside a VM process's jail, the node's key, its
-/// state, ubuntu's home, another VM's disk, and the node's own services
-/// are out of reach, and the uid is the VM's own.
-fn probe(layout: &Layout) -> Result<Value, Error> {
-    let (img, _) = image::ensure(layout, BUSYBOX, Jail::Yes)?;
-    // Another VM, jailed, whose disk the probe must not reach.
-    let mut other = busybox_vm(layout, &img, "probe-other", Jail::Yes, 1, None)?;
-    other.wait_for("ready", Duration::from_secs(READY_S))?;
-    let other_disk = other.run_dir.join("scratch.ext4");
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
-    let targets: Vec<String> = vec![
-        "/etc/sandcastle/node.key".into(),
-        "/etc/sandcastle".into(),
-        "/var/lib/sandcastle".into(),
-        home.clone(),
-        format!("{home}/.ssh"),
-        format!("{home}/.microsandbox"),
-        other_disk.display().to_string(),
-        layout.root.display().to_string(),
-        "tcp:206.223.228.129:22".into(),
-        "tcp:206.223.228.129:443".into(),
-        "tcp:127.0.0.1:3340".into(),
-        "tcp:127.0.0.53:53".into(),
-    ];
-    let run = launch::start(
-        layout,
-        Spec {
-            id: "probe".into(),
-            vcpus: 1,
-            memory_mib: 512,
-            image: Some(img.root.clone()),
-            target: None,
-            scratch_bytes: Some(GIB),
-            data: None,
-            net: Net::None,
-            start: run_start(&img, "probe", SLEEP_FOREVER, false),
-            jail: Jail::Yes,
-            slot: 0,
-            probe: Some(targets),
-            before: None,
-        },
-    )?;
-    let mut run = run;
-    let (_, report) = run.wait_for_any(Duration::from_secs(30))?;
-    run.wait_exit(Duration::from_secs(10))?;
-    other.kill()?;
-    for id in ["probe", "probe-other"] {
-        launch::remove_run_dir(layout, id);
-    }
-    let reached: Vec<String> = report["must_not_reach"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .filter(|(_, v)| matches!(v.as_str(), Some("listed" | "read" | "connected")))
-                .map(|(k, _)| k.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let uid = report["uid"][0].as_u64().unwrap_or(0);
-    // Its own PID namespace: the probe sees itself, PID 1, and nothing else.
-    let alone = report["visible_pids"] == json!(["1"]);
-    let pass = reached.is_empty()
-        && alone
-        && report["cap_bnd"] == "0000000000000000"
-        && uid >= launch::UID_BASE as u64
-        && report["cap_eff"] == "0000000000000000"
-        && report["no_new_privs"] == "1";
-    Ok(json!({"pass": pass, "reached": reached, "report": report}))
-}
-
-fn argv(a: &[&str]) -> Process {
+pub fn argv(a: &[&str]) -> Process {
     Process { argv: a.iter().map(|s| s.to_string()).collect(), ..Process::default() }
-}
-
-fn err(e: ClientError) -> Error {
-    Error::msg(e.to_string())
 }
 
 /// Reads exec events until `want` appears in the output, or it exits.
@@ -347,7 +139,7 @@ fn read_until(s: &mut sandcastle_vm::client::ExecSession, want: &str) -> Result<
     let mut out = String::new();
     // Bounded by the process's output and exit.
     while !out.contains(want) {
-        match s.next_event().map_err(err)? {
+        match s.next_event().map_err(agent_err)? {
             ExecEvent::Stdout(b) | ExecEvent::Stderr(b) => out.push_str(&String::from_utf8_lossy(&b)),
             ExecEvent::Exited { .. } => break,
             ExecEvent::Started(_) => {}
@@ -359,7 +151,7 @@ fn read_until(s: &mut sandcastle_vm::client::ExecSession, want: &str) -> Result<
 fn until_exit(s: &mut sandcastle_vm::client::ExecSession) -> Result<(Option<i32>, Option<i32>), Error> {
     // Bounded by the process's exit.
     loop {
-        if let ExecEvent::Exited { code, signal } = s.next_event().map_err(err)? {
+        if let ExecEvent::Exited { code, signal } = s.next_event().map_err(agent_err)? {
             return Ok((code, signal));
         }
     }
@@ -367,78 +159,50 @@ fn until_exit(s: &mut sandcastle_vm::client::ExecSession) -> Result<(Option<i32>
 
 /// Acceptance 3: exec's round trip, streams, stdin, a PTY and its resize,
 /// kill, exit codes, the process limit, and the entrypoint's own exit.
-fn exec(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
-    let (img, _) = image::ensure(layout, BUSYBOX, jail)?;
-    let mut vm = busybox_vm(layout, &img, "exec", jail, 0, None)?;
-    vm.wait_for("ready", Duration::from_secs(READY_S))?;
+fn exec(node: &Node, n: usize) -> Result<Value, Error> {
+    let c = node.start("exec", &start(BUSYBOX, SLEEP_FOREVER))?;
+    let vm = &c.vm;
     let mut round_trip = vec![];
     for _ in 0..n.max(20) {
         let t = Instant::now();
-        let out = vm.vm.exec(argv(&["/bin/true"]), None).map_err(err)?;
+        let out = vm.exec(argv(&["/bin/true"]), None).map_err(agent_err)?;
         round_trip.push(ms(t, Instant::now()));
         assert_eq!(out.code, Some(0));
     }
-    let streams = vm.vm.exec(argv(&["/bin/sh", "-c", "echo out; echo err >&2; exit 3"]), None).map_err(err)?;
-    let stdin = vm.vm.exec(argv(&["/bin/cat"]), Some(b"hello through stdin")).map_err(err)?;
-    let big = vm.vm.exec(argv(&["/bin/sh", "-c", "head -c 10000000 /dev/zero"]), None).map_err(err)?;
-
-    let mut pty = vm.vm.exec_session(argv(&["/bin/sh", "-c", "stty size; read x; stty size"]), true, Some(WinSize { rows: 24, cols: 80 })).map_err(err)?;
+    let streams = vm.exec(argv(&["/bin/sh", "-c", "echo out; echo err >&2; exit 3"]), None).map_err(agent_err)?;
+    let stdin = vm.exec(argv(&["/bin/cat"]), Some(b"hello through stdin")).map_err(agent_err)?;
+    let big = vm.exec(argv(&["/bin/sh", "-c", "head -c 10000000 /dev/zero"]), None).map_err(agent_err)?;
+    let mut pty = vm.exec_session(argv(&["/bin/sh", "-c", "stty size; read x; stty size"]), true, Some(WinSize { rows: 24, cols: 80 })).map_err(agent_err)?;
     let before = read_until(&mut pty, "24 80")?;
-    pty.resize(50, 120).map_err(err)?;
-    pty.stdin(b"\n").map_err(err)?;
+    pty.resize(50, 120).map_err(agent_err)?;
+    pty.stdin(b"\n").map_err(agent_err)?;
     let after = read_until(&mut pty, "50 120")?;
     let pty_exit = until_exit(&mut pty)?;
-
-    let mut sleeper = vm.vm.exec_session(argv(&["/bin/sleep", "1000"]), false, None).map_err(err)?;
+    let mut sleeper = vm.exec_session(argv(&["/bin/sleep", "1000"]), false, None).map_err(agent_err)?;
     let t_kill = Instant::now();
-    sleeper.signal(9).map_err(err)?;
+    sleeper.signal(9).map_err(agent_err)?;
     let killed = until_exit(&mut sleeper)?;
     let kill_ms = ms(t_kill, Instant::now());
-
-    let missing = vm.vm.exec(argv(&["/no/such/binary"]), None);
-
-    // The process limit: 64 at once, the 65th refused.
+    let missing = vm.exec(argv(&["/no/such/binary"]), None);
     let mut held = vec![];
     for _ in 0..sandcastle_wire::PROCESSES_MAX {
-        let mut s = vm.vm.exec_session(argv(&["/bin/sleep", "1000"]), false, None).map_err(err)?;
-        match s.next_event().map_err(err)? {
+        let mut s = vm.exec_session(argv(&["/bin/sleep", "1000"]), false, None).map_err(agent_err)?;
+        match s.next_event().map_err(agent_err)? {
             ExecEvent::Started(_) => held.push(s),
             other => return Err(Error::msg(format!("expected started, got {other:?}"))),
         }
     }
-    let over = vm.vm.exec(argv(&["/bin/true"]), None);
+    let over = vm.exec(argv(&["/bin/true"]), None);
     drop(held);
-    // Dropped connections take their processes with them; the slots come back.
     std::thread::sleep(Duration::from_millis(200));
-    let after_limit = vm.vm.exec(argv(&["/bin/true"]), None).map(|o| o.code);
-    vm.kill()?;
-    launch::remove_run_dir(layout, "exec");
+    let after_limit = vm.exec(argv(&["/bin/true"]), None).map(|o| o.code);
+    c.destroy(None)?;
 
-    // The entrypoint's own exit: reported, and the VM stops.
-    let mut short = launch::start(
-        layout,
-        Spec {
-            id: "exec-exit".into(),
-            vcpus: 1,
-            memory_mib: 512,
-            image: Some(img.root.clone()),
-            target: None,
-            scratch_bytes: Some(GIB),
-            data: None,
-            net: Net::None,
-            start: run_start(&img, "exec-exit", &["/bin/sh", "-c", "sleep 0.2; exit 7"], false),
-            jail,
-            slot: 1,
-            probe: None,
-            before: None,
-        },
-    )?;
-    short.wait_for("ready", Duration::from_secs(READY_S))?;
-    let (exited_at, exited) = short.wait_for("exited", Duration::from_secs(10))?;
-    let status = short.wait_exit(Duration::from_secs(10))?;
-    let stop_ms = ms(exited_at, Instant::now());
-    launch::remove_run_dir(layout, "exec-exit");
-
+    // The entrypoint's own exit: `monitor()` reports its code.
+    let t = Instant::now();
+    let short = node.start("exec-exit", &start(BUSYBOX, &["/bin/sh", "-c", "sleep 0.2; exit 7"]))?;
+    let exit = short.wait()?;
+    let exit_ms = ms(t, Instant::now());
     let checks = json!({
         "streams": streams.stdout == b"out\n" && streams.stderr == b"err\n" && streams.code == Some(3),
         "stdin": stdin.stdout == b"hello through stdin",
@@ -448,7 +212,7 @@ fn exec(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
         "missing_binary_refused": matches!(missing, Err(ClientError::Refused(_))),
         "process_limit": matches!(over, Err(ClientError::Refused(ref m)) if m.contains("64")),
         "slots_returned": after_limit.ok() == Some(Some(0)),
-        "entrypoint_exit_code": exited["code"] == 7,
+        "entrypoint_exit_code": exit.code == Some(7) && !exit.destroyed,
     });
     let pass = checks.as_object().expect("an object").values().all(|v| v == true);
     Ok(json!({
@@ -456,29 +220,24 @@ fn exec(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
         "checks": checks,
         "round_trip_ms": stats(&round_trip),
         "kill_to_exit_ms": (kill_ms * 1000.0).round() / 1000.0,
-        "entrypoint_exited_to_runner_gone_ms": (stop_ms * 1000.0).round() / 1000.0,
-        "runner_exit_status": status,
-        "missing": format!("{missing:?}"),
-        "over_limit": format!("{over:?}"),
+        "start_to_monitored_exit_ms": (exit_ms * 10.0).round() / 10.0,
+        "monitor": exit,
     }))
 }
 
-pub const ECHO_SERVER: &str = "jmalloc/echo-server:v0.3.7";
-
-fn connect_retry(vm: &Running, port: u16) -> Result<(std::os::unix::net::UnixStream, Vec<u8>), Error> {
+pub fn connect_retry(c: &Ctr<'_>, port: u16) -> Result<(std::os::unix::net::UnixStream, Vec<u8>), Error> {
     let deadline = Instant::now() + Duration::from_secs(10);
     // Bounded by the deadline: the guest's server may not listen yet.
     loop {
-        match vm.vm.connect(port) {
-            Ok(c) => return Ok(c),
+        match c.vm.connect(port) {
+            Ok(x) => return Ok(x),
             Err(ClientError::Refused(_)) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(err(e)),
+            Err(e) => return Err(agent_err(e)),
         }
     }
 }
 
 fn read_to_end(s: &mut std::os::unix::net::UnixStream, mut got: Vec<u8>) -> Result<Vec<u8>, Error> {
-    use std::io::Read;
     s.read_to_end(&mut got).map_err(Error::io("reading a guest port"))?;
     Ok(got)
 }
@@ -493,7 +252,6 @@ fn ws_frame_masked(text: &[u8]) -> Vec<u8> {
 }
 
 fn ws_read_frame(s: &mut std::os::unix::net::UnixStream, buf: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
-    use std::io::Read;
     let mut chunk = [0u8; 4096];
     // Bounded by one frame's length, which the header gives.
     loop {
@@ -519,147 +277,92 @@ fn ws_read_frame(s: &mut std::os::unix::net::UnixStream, buf: &mut Vec<u8>) -> R
     }
 }
 
-/// Acceptance 4: a connection to a port nobody declared: first byte and
-/// throughput over 100 MB; HTTP and a WebSocket through it.
-fn port(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
-    use std::io::{Read, Write};
-    let (bb, _) = image::ensure(layout, BUSYBOX, jail)?;
+/// Acceptance 4: a connection to a port nobody declared.
+fn port(node: &Node, n: usize) -> Result<Value, Error> {
     const BYTES: usize = 100 << 20;
     let serve = format!("while :; do head -c {BYTES} /dev/zero | nc -l -p 9000; done");
-    let vcpus: u8 = std::env::var("KRUN_SPIKE_VCPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let mut vm = launch::start(
-        layout,
-        Spec {
-            id: "port-nc".into(),
-            vcpus,
-            memory_mib: 512,
-            image: Some(bb.root.clone()),
-            target: None,
-            scratch_bytes: Some(GIB),
-            data: None,
-            net: Net::None,
-            start: run_start(&bb, "port-nc", &["/bin/sh", "-c", &serve], false),
-            jail,
-            slot: 0,
-            probe: None,
-            before: None,
-        },
-    )?;
-    vm.wait_for("ready", Duration::from_secs(READY_S))?;
+    let vcpus: f64 = std::env::var("KRUN_SPIKE_VCPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    let mut s = start(BUSYBOX, &["/bin/sh", "-c", &serve]);
+    s.instance = Some(Instance::Custom { vcpu: vcpus, memory_mib: (vcpus * 3072.0) as u32, disk_mb: 4000 });
+    let c = node.start("port-nc", &s)?;
     let (mut first_byte, mut mb_s) = (vec![], vec![]);
     for _ in 0..3 {
         let t0 = Instant::now();
-        let (mut s, mut got) = connect_retry(&vm, 9000)?;
+        let (mut st, mut got) = connect_retry(&c, 9000)?;
         let mut chunk = vec![0u8; 1 << 20];
         if got.is_empty() {
-            let n = s.read(&mut chunk).map_err(Error::io("first byte"))?;
-            got.extend_from_slice(&chunk[..n]);
+            let k = st.read(&mut chunk).map_err(Error::io("first byte"))?;
+            got.extend_from_slice(&chunk[..k]);
         }
         let t_first = Instant::now();
         let mut total = got.len();
         // Bounded by the server's 100 MB and its close.
         loop {
-            let n = s.read(&mut chunk).map_err(Error::io("throughput"))?;
-            if n == 0 {
+            let k = st.read(&mut chunk).map_err(Error::io("throughput"))?;
+            if k == 0 {
                 break;
             }
-            total += n;
+            total += k;
         }
-        let secs = t_first.elapsed().as_secs_f64();
         if total != BYTES {
             return Err(Error::msg(format!("got {total} of {BYTES} bytes")));
         }
         first_byte.push(ms(t0, t_first));
-        mb_s.push(total as f64 / (1 << 20) as f64 / secs);
+        mb_s.push(total as f64 / (1 << 20) as f64 / t_first.elapsed().as_secs_f64());
         std::thread::sleep(Duration::from_millis(50));
     }
-    // The same bytes as an exec's stdout, with no TCP and no nc: what the
-    // vsock path alone carries.
-    let t = Instant::now();
-    let out = vm.vm.exec(argv(&["/bin/sh", "-c", "head -c 52428800 /dev/zero"]), None).map_err(err)?;
-    let exec_mib_s = out.stdout.len() as f64 / (1 << 20) as f64 / t.elapsed().as_secs_f64();
-    vm.kill()?;
-    launch::remove_run_dir(layout, "port-nc");
+    c.destroy(None)?;
 
-    let (echo, _) = image::ensure(layout, ECHO_SERVER, jail)?;
-    let mut start = run_start(&echo, "port-echo", &[], false);
-    if let Start::Run { entrypoint, .. } = &mut start {
-        entrypoint.argv = echo.config.argv();
-        entrypoint.env.push("PORT=9123".into());
-    }
-    let mut vm = launch::start(
-        layout,
-        Spec {
-            id: "port-echo".into(),
-            vcpus: 1,
-            memory_mib: 512,
-            image: Some(echo.root.clone()),
-            target: None,
-            scratch_bytes: Some(GIB),
-            data: None,
-            net: Net::None,
-            start,
-            jail,
-            slot: 1,
-            probe: None,
-            before: None,
-        },
-    )?;
-    vm.wait_for("ready", Duration::from_secs(READY_S))?;
+    let mut e = start(ECHO_SERVER, &[]);
+    e.env.insert("PORT".into(), "9123".into());
+    let c = node.start("port-echo", &e)?;
     let mut http_ms = vec![];
     let mut http_ok = true;
     for _ in 0..n {
         let t = Instant::now();
-        let (mut s, got) = connect_retry(&vm, 9123)?;
-        s.write_all(b"GET /through-vsock HTTP/1.1\r\nHost: guest\r\nConnection: close\r\n\r\n").map_err(Error::io("http"))?;
-        let resp = read_to_end(&mut s, got)?;
+        let (mut st, got) = connect_retry(&c, 9123)?;
+        st.write_all(b"GET /through-vsock HTTP/1.1\r\nHost: guest\r\nConnection: close\r\n\r\n").map_err(Error::io("http"))?;
+        let resp = read_to_end(&mut st, got)?;
         http_ms.push(ms(t, Instant::now()));
         let text = String::from_utf8_lossy(&resp);
         http_ok &= text.starts_with("HTTP/1.1 200") && text.contains("GET /through-vsock");
     }
-    let (mut s, mut buf) = connect_retry(&vm, 9123)?;
-    s.write_all(b"GET /.ws HTTP/1.1\r\nHost: guest\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    let (mut st, mut buf) = connect_retry(&c, 9123)?;
+    st.write_all(b"GET /.ws HTTP/1.1\r\nHost: guest\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
         .map_err(Error::io("ws"))?;
     let mut chunk = [0u8; 4096];
     // Bounded by the handshake's headers.
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = s.read(&mut chunk).map_err(Error::io("ws handshake"))?;
-        if n == 0 {
+        let k = st.read(&mut chunk).map_err(Error::io("ws handshake"))?;
+        if k == 0 {
             return Err(Error::msg("the websocket handshake closed"));
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&chunk[..k]);
     }
     let end = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("found") + 4;
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
     buf.drain(..end);
-    let greeting = String::from_utf8_lossy(&ws_read_frame(&mut s, &mut buf)?).into_owned();
-    let t = Instant::now();
-    s.write_all(&ws_frame_masked(b"ping through vsock")).map_err(Error::io("ws send"))?;
-    let echoed = ws_read_frame(&mut s, &mut buf)?;
-    let ws_echo_ms = ms(t, Instant::now());
-    vm.kill()?;
-    launch::remove_run_dir(layout, "port-echo");
+    let greeting = String::from_utf8_lossy(&ws_read_frame(&mut st, &mut buf)?).into_owned();
+    st.write_all(&ws_frame_masked(b"ping through vsock")).map_err(Error::io("ws send"))?;
+    let echoed = ws_read_frame(&mut st, &mut buf)?;
+    c.destroy(None)?;
     let ws_ok = head.starts_with("HTTP/1.1 101") && echoed == b"ping through vsock";
     Ok(json!({
         "pass": http_ok && ws_ok,
         "declared_ports": 0,
+        "vcpus": vcpus,
         "nc_first_byte_ms": stats(&first_byte),
         "nc_throughput_mib_s": stats(&mb_s),
-        "vcpus": vcpus,
-        "exec_stdout_mib_s": (exec_mib_s * 10.0).round() / 10.0,
-        "bytes_each": BYTES,
         "http_request_ms": stats(&http_ms),
-        "http_ok": http_ok,
         "ws_handshake": head.lines().next(),
         "ws_greeting": greeting,
-        "ws_echo_ms": (ws_echo_ms * 1000.0).round() / 1000.0,
         "ws_ok": ws_ok,
     }))
 }
 
 /// What of the spike is alive on the node: processes of a VM uid, the
-/// spike's scopes, its run directories, and files a VM uid still owns.
-fn census(layout: &Layout) -> Result<Value, Error> {
+/// engine's containers, the spike's units.
+pub fn census(layout: &Layout) -> Result<Value, Error> {
     let ps = std::process::Command::new("ps").args(["-eo", "uid=,pid=,comm="]).output().map_err(Error::io("ps"))?;
     let vm_procs: Vec<String> = String::from_utf8_lossy(&ps.stdout)
         .lines()
@@ -671,81 +374,150 @@ fn census(layout: &Layout) -> Result<Value, Error> {
         })
         .map(|l| l.trim().to_string())
         .collect();
-    let units = std::process::Command::new("systemctl")
-        .args(["list-units", "--type=scope", "--no-legend", "--plain", "krun-spike-*"])
-        .output()
-        .map_err(Error::io("systemctl"))?;
-    let scopes: Vec<String> = String::from_utf8_lossy(&units.stdout).lines().map(|l| l.split_whitespace().next().unwrap_or("").to_string()).filter(|s| !s.is_empty()).collect();
-    let mut vm_owned = vec![];
-    for dir in [layout.vms(), layout.data()] {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            if let Ok(m) = std::fs::symlink_metadata(e.path()) {
-                let uid = std::os::unix::fs::MetadataExt::uid(&m);
-                if (launch::UID_BASE..launch::UID_BASE + launch::UID_COUNT).contains(&uid) {
-                    vm_owned.push(e.path().display().to_string());
-                }
-            }
-        }
-    }
-    let run_dirs: Vec<String> = std::fs::read_dir(layout.vms()).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-    Ok(json!({"vm_processes": vm_procs, "scopes": scopes, "vm_owned_files": vm_owned, "run_dirs": run_dirs}))
+    let units = std::process::Command::new("systemctl").args(["list-units", "--no-legend", "--plain", "krun-*"]).output().map_err(Error::io("systemctl"))?;
+    let units: Vec<String> =
+        String::from_utf8_lossy(&units.stdout).lines().map(|l| l.split_whitespace().next().unwrap_or("").to_string()).filter(|s| !s.is_empty()).collect();
+    let containers = Node::new(layout).ok().and_then(|n| n.block(n.client.list()).ok()).map(|l| l.into_iter().map(|i| i.name).collect::<Vec<_>>());
+    Ok(json!({"vm_processes": vm_procs, "units": units, "engine_containers": containers}))
 }
 
-/// Phase 7: a VM ended mid-write leaves nothing running and `/data`
-/// intact; a jailer killed outright leaves files reset repairs.
-fn crash(layout: &Layout) -> Result<Value, Error> {
-    let jail = Jail::Yes;
-    let (img, _) = image::ensure(layout, BUSYBOX, jail)?;
-    std::fs::create_dir_all(layout.data()).map_err(Error::io("the data directory"))?;
-    let data = layout.data().join("crash.ext4");
-    let _ = std::fs::remove_file(&data);
-    sandcastle_rootfs::ext4::make(&data, 2 * GIB, true, None).map_err(|e| Error::msg(e.to_string()))?;
+/// Puts the node back: the engine's VMs ended and its run directories
+/// cleared (`sandcastle-engine reset`, as root), the engine and the spike's
+/// scopes stopped; with `--all`, every cache too.
+fn reset(layout: &Layout, all: bool) -> Result<Value, Error> {
+    let cg = "/sys/fs/cgroup/krun.slice/krun-spike.slice/krun-engine.service";
+    let mut engine_reset = std::process::Command::new("sudo");
+    engine_reset.arg("-n").arg(layout.bin("sandcastle-engine")).args(["reset", "--config"]).arg(layout.engine_config()).args(["--cgroup", cg]);
+    if all {
+        engine_reset.arg("--all");
+    }
+    let engine_reset = engine_reset.output().map_err(Error::io("engine reset"))?;
+    let stop = std::process::Command::new("sudo").args(["-n", "systemctl", "stop", "krun-engine", launch::SLICE]).output().map_err(Error::io("systemctl stop"))?;
+    let restore = std::process::Command::new("sudo")
+        .arg("-n")
+        .arg(layout.bin("sandcastle-vm"))
+        .args(["restore", "--settings"])
+        .arg(layout.jail_settings())
+        .output()
+        .map_err(Error::io("restore"))?;
+    let mut removed = vec![];
+    let mut roots = vec![layout.vms(), layout.data(), layout.tmp(), layout.root.join("jailroot")];
+    if all {
+        roots.extend([layout.images(), layout.blobs(), layout.boot(), layout.results()]);
+    }
+    for r in roots {
+        assert!(r.starts_with(&layout.root) && r != layout.root);
+        if r.exists() {
+            std::fs::remove_dir_all(&r).map_err(Error::io("removing a spike directory"))?;
+            removed.push(r);
+        }
+    }
+    Ok(json!({
+        "engine_reset": String::from_utf8_lossy(&engine_reset.stdout).trim(),
+        "engine_reset_err": String::from_utf8_lossy(&engine_reset.stderr).trim(),
+        "stopped": stop.status.success(),
+        "restore": String::from_utf8_lossy(&restore.stdout).trim(),
+        "removed": removed,
+    }))
+}
 
-    // 1. The VM process ends at once while the guest is writing.
-    let mut vm = busybox_vm(layout, &img, "crash-1", jail, 0, Some(data.clone()))?;
-    vm.wait_for("ready", Duration::from_secs(READY_S))?;
-    let (written, _) = sh(&vm, "dd if=/dev/urandom of=/data/blob bs=1M count=64 2>/dev/null && sync && sha256sum /data/blob | cut -d' ' -f1 | tee /data/blob.sha && sync")?;
-    sh(&vm, "(while :; do dd if=/dev/zero of=/data/churn bs=1M count=32 2>/dev/null; done) >/dev/null 2>&1 &")?;
+/// Acceptance 7, beneath the engine: from inside a VM process's jail, the
+/// node's key, its state, the engine's CA key, ubuntu's home, another VM's
+/// disk, and the node's own services are out of reach.
+fn probe(layout: &Layout) -> Result<Value, Error> {
+    let node = Node::new(layout)?;
+    let other = node.start("probe-other", &start(BUSYBOX, SLEEP_FOREVER))?;
+    let image = node.block(node.client.pull(BUSYBOX)).map_err(engine_err)?;
+    let image_root = PathBuf::from(image["root"].as_str().ok_or_else(|| Error::msg("an image root"))?);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+    let targets: Vec<String> = vec![
+        "/etc/sandcastle/node.key".into(),
+        "/etc/sandcastle".into(),
+        "/var/lib/sandcastle".into(),
+        home.clone(),
+        format!("{home}/.ssh"),
+        format!("{home}/.microsandbox"),
+        other.run_dir.join("scratch.ext4").display().to_string(),
+        layout.engine_state().join("ca/ca.key").display().to_string(),
+        layout.root.display().to_string(),
+        "tcp:206.223.228.129:22".into(),
+        "tcp:206.223.228.129:443".into(),
+        "tcp:127.0.0.1:3340".into(),
+        "tcp:127.0.0.53:53".into(),
+    ];
+    let boot = launch::boot_disk(layout);
+    if !boot.exists() {
+        std::fs::create_dir_all(layout.boot()).map_err(Error::io("the boot directory"))?;
+        sandcastle_rootfs::ext4::boot_disk(&layout.bin("sandcastle-guest"), &boot, &layout.tmp().join("bootdir")).map_err(|e| Error::msg(e.to_string()))?;
+    }
+    let mut run = launch::start_probe(
+        layout,
+        Spec {
+            id: "probe".into(),
+            image: image_root,
+            start: sandcastle_wire::Start::Run {
+                entrypoint: argv(SLEEP_FOREVER),
+                hostname: "probe".into(),
+                data: false,
+                data_path: None,
+                ca_pem: None,
+                net: None,
+            },
+            slot: 40,
+            probe: targets,
+        },
+    )?;
+    let (_, report) = run.wait_for_any(Duration::from_secs(30))?;
+    run.wait_exit(Duration::from_secs(10))?;
+    other.destroy(None)?;
+    launch::remove_run_dir(layout, "probe");
+    let reached: Vec<String> = report["must_not_reach"]
+        .as_object()
+        .map(|m| m.iter().filter(|(_, v)| matches!(v.as_str(), Some("listed" | "read" | "connected"))).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default();
+    let uid = report["uid"][0].as_u64().unwrap_or(0);
+    let pass = reached.is_empty()
+        && report["visible_pids"] == json!(["1"])
+        && report["cap_bnd"] == "0000000000000000"
+        && uid >= launch::UID_BASE as u64
+        && report["cap_eff"] == "0000000000000000"
+        && report["no_new_privs"] == "1";
+    Ok(json!({"pass": pass, "reached": reached, "report": report}))
+}
+
+/// Phase 7, through the engine: a VM that dies mid-write is reported and
+/// cleared, its data disk intact; an engine killed outright leaves its VMs
+/// running, for the next engine to find.
+fn crash(layout: &Layout, node: &Node) -> Result<Value, Error> {
+    node.delete_data("crash");
+    let s = with_data(start(BUSYBOX, SLEEP_FOREVER), "crash", "/data", 2);
+    let c = node.start("crash-1", &s)?;
+    let (written, _) = c.sh("dd if=/dev/urandom of=/data/blob bs=1M count=64 2>/dev/null && sync && sha256sum /data/blob | cut -d' ' -f1 | tee /data/blob.sha && sync")?;
+    c.sh("(while :; do dd if=/dev/zero of=/data/churn bs=1M count=32 2>/dev/null; done) >/dev/null 2>&1 &")?;
     std::thread::sleep(Duration::from_millis(500));
+    // The VM process ends at once, as a crash would.
     let t = Instant::now();
-    let status = vm.kill()?;
+    let _ = c.vm.control(&ControlRequest::Kill);
+    let exit = c.wait()?;
     let crash_ms = ms(t, Instant::now());
     let after_crash = census(layout)?;
-    let mut again = busybox_vm(layout, &img, "crash-2", jail, 1, Some(data.clone()))?;
-    again.wait_for("ready", Duration::from_secs(READY_S))?;
-    let (reread, _) = sh(&again, "sha256sum /data/blob | cut -d' ' -f1; cat /data/blob.sha")?;
-    // 2. The jailer itself, root, killed outright with its VM.
-    let unit = format!("krun-spike-{}.scope", again.id);
+    let again = node.start("crash-2", &s)?;
+    let (reread, _) = again.sh("sha256sum /data/blob | cut -d' ' -f1; cat /data/blob.sha")?;
+    // The engine killed outright: its VMs run on (KillMode=process).
     let killed = std::process::Command::new("sudo")
-        .args(["-n", "systemctl", "kill", "--signal=KILL", &unit])
+        .args(["-n", "systemctl", "kill", "--kill-whom=main", "--signal=KILL", "krun-engine"])
         .output()
         .map_err(Error::io("systemctl kill"))?;
-    let _ = again.wait_exit(Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(500));
-    let after_jailer_killed = census(layout)?;
-    let reset_out = reset(layout, false)?;
-    let after_reset = census(layout)?;
-    // The data disk, reset or not, is still whole: one more VM reads it.
-    std::fs::create_dir_all(layout.data()).map_err(Error::io("the data directory"))?;
+    let while_down = census(layout)?;
+    std::mem::forget(again);
     let lines: Vec<&str> = reread.lines().collect();
-    let intact_after_crash = lines.len() == 2 && lines[0] == lines[1] && lines[0] == written.trim();
+    let intact = lines.len() == 2 && lines[0] == lines[1] && lines[0] == written.trim();
     Ok(json!({
-        "pass": intact_after_crash
-            && after_crash["vm_processes"].as_array().is_some_and(|a| a.is_empty())
-            && after_crash["scopes"].as_array().is_some_and(|a| a.is_empty())
-            && after_jailer_killed["vm_processes"].as_array().is_some_and(|a| a.is_empty())
-            && after_reset["vm_processes"].as_array().is_some_and(|a| a.is_empty())
-            && after_reset["vm_owned_files"].as_array().is_some_and(|a| a.is_empty())
-            && after_reset["run_dirs"].as_array().is_some_and(|a| a.is_empty()),
-        "crash_mid_write": {"runner_status": status, "kill_to_gone_ms": (crash_ms * 10.0).round() / 10.0, "census": after_crash},
-        "data_after_crash": {"written_sha256": written.trim(), "reread": reread, "intact": intact_after_crash},
-        "jailer_killed": {
-            "systemctl_kill_status": killed.status.code(),
-            "systemctl_kill_stderr": String::from_utf8_lossy(&killed.stderr).trim(),
-            "census": after_jailer_killed,
-        },
-        "reset": reset_out,
-        "after_reset": after_reset,
+        "pass": intact && !exit.clean() && exit.error.is_some(),
+        "vm_crash": {"monitor": exit, "kill_to_monitored_ms": (crash_ms * 10.0).round() / 10.0, "census": after_crash},
+        "data_after_crash": {"written_sha256": written.trim(), "reread": reread, "intact": intact},
+        "engine_killed": {"systemctl_kill_ok": killed.status.success(), "census_while_down": while_down},
+        "next": "restart the engine and run `census`: the VM it finds is cleared (adopted, from E5)",
     }))
 }

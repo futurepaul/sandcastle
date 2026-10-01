@@ -1,16 +1,23 @@
 //! The rules, as Cloudflare's containers have them: the internet on or
-//! off, allow and deny lists of hosts (exact or `*.` globs), addresses,
-//! `ip:port`, and ranges, and hosts whose requests are intercepted. 128
-//! entries in all. Whatever the rules say, a private address and the
-//! node's own are refused unless a range allows them by name.
+//! off, and intercepts, each HTTP (port 80: a host, a `*.` glob, `*`, an
+//! `ip:port`, or a range) or HTTPS (443 or a given port: a host, a glob,
+//! or `*`), counted as Cloudflare counts them (128 entries; a host or `*`
+//! is two, an address or range one; at most 64 host targets and 128
+//! address targets). Allow and deny lists are sandcastle's own, beyond
+//! Cloudflare's. Whatever the rules say, a private address and the node's
+//! own are refused unless a range allows them by name.
 
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Entries across allow, deny, and intercept, as Cloudflare's 128.
+/// Allow and deny entries (sandcastle's own lists).
 pub const RULES_MAX: usize = 128;
+/// Intercept entries, as Cloudflare counts them.
+pub const INTERCEPT_ENTRIES_MAX: usize = 128;
+pub const HOST_TARGETS_MAX: usize = 64;
+pub const ADDR_TARGETS_MAX: usize = 128;
 pub const HOST_BYTES_MAX: usize = 253;
 pub const PLACEHOLDERS_MAX: usize = 16;
 pub const PLACEHOLDER_BYTES_MIN: usize = 8;
@@ -32,10 +39,116 @@ pub enum Action {
     Substitute { placeholders: Vec<Placeholder> },
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    pub fn port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https => 443,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Intercept {
-    pub host: String,
+    pub scheme: Scheme,
+    /// A host, a `*.` glob, or `*`; for HTTP also an `ip:port` or a range.
+    /// An HTTPS host may end in `:port`.
+    pub target: String,
     pub action: Action,
+}
+
+impl Intercept {
+    pub fn http(target: &str, action: Action) -> Intercept {
+        Intercept { scheme: Scheme::Http, target: target.into(), action }
+    }
+    pub fn https(target: &str, action: Action) -> Intercept {
+        Intercept { scheme: Scheme::Https, target: target.into(), action }
+    }
+}
+
+/// What an intercept matches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Host(Glob),
+    Any,
+    AddrPort(IpAddr, u16),
+    Range(Cidr),
+}
+
+impl Target {
+    /// Cloudflare's count: a host or `*` is two entries (IPv4 and IPv6),
+    /// an address or a range one.
+    pub fn entries(&self) -> usize {
+        match self {
+            Target::Host(_) | Target::Any => 2,
+            Target::AddrPort(..) | Target::Range(_) => 1,
+        }
+    }
+}
+
+/// Parses an intercept's target and the port it applies to.
+pub fn parse_target(scheme: Scheme, s: &str) -> Result<(Target, u16), RuleError> {
+    let bad = || RuleError::Pattern(s.into());
+    if s == "*" {
+        return Ok((Target::Any, scheme.port()));
+    }
+    match scheme {
+        Scheme::Http => {
+            if let Some(c) = Cidr::parse(s) {
+                return Ok((Target::Range(c), 80));
+            }
+            if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+                return Ok((Target::AddrPort(sa.ip(), sa.port()), sa.port()));
+            }
+            if let Ok(ip) = s.parse::<IpAddr>() {
+                let len = if ip.is_ipv4() { 32 } else { 128 };
+                return Ok((Target::Range(Cidr { net: ip, len }), 80));
+            }
+            Glob::parse(s).map(|g| (Target::Host(g), 80)).ok_or_else(bad)
+        }
+        Scheme::Https => {
+            let (host, port) = match s.rsplit_once(':') {
+                Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h, p.parse::<u16>().map_err(|_| bad())?),
+                _ => (s, 443),
+            };
+            if host.parse::<IpAddr>().is_ok() || Cidr::parse(host).is_some() || port == 0 {
+                return Err(bad());
+            }
+            Glob::parse(host).map(|g| (Target::Host(g), port)).ok_or_else(bad)
+        }
+    }
+}
+
+/// Checks a set of intercepts against Cloudflare's limits.
+pub fn check_intercepts(rules: &[Intercept]) -> Result<Vec<(Target, u16)>, RuleError> {
+    let mut parsed = Vec::with_capacity(rules.len());
+    let (mut entries, mut hosts, mut addrs) = (0, 0, 0);
+    for r in rules {
+        let (t, port) = parse_target(r.scheme, &r.target)?;
+        entries += t.entries();
+        match t {
+            Target::Host(_) | Target::Any => hosts += 1,
+            Target::AddrPort(..) | Target::Range(_) => addrs += 1,
+        }
+        parsed.push((t, port));
+    }
+    if entries > INTERCEPT_ENTRIES_MAX {
+        return Err(RuleError::Intercepts(format!("{entries} entries pass the limit of {INTERCEPT_ENTRIES_MAX}")));
+    }
+    if hosts > HOST_TARGETS_MAX {
+        return Err(RuleError::Intercepts(format!("{hosts} host targets pass the limit of {HOST_TARGETS_MAX}")));
+    }
+    if addrs > ADDR_TARGETS_MAX {
+        return Err(RuleError::Intercepts(format!("{addrs} address targets pass the limit of {ADDR_TARGETS_MAX}")));
+    }
+    Ok(parsed)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -57,6 +170,8 @@ pub enum RuleError {
     Pattern(String),
     #[error("a placeholder: {0}")]
     Placeholder(&'static str),
+    #[error("intercepts: {0}")]
+    Intercepts(String),
 }
 
 /// A host pattern: exact, or `*.suffix` for any name below the suffix.
@@ -193,7 +308,7 @@ pub struct Compiled {
     pub internet: bool,
     allow: Vec<Pattern>,
     deny: Vec<Pattern>,
-    intercept: Vec<(Glob, Action)>,
+    intercept: Vec<(Target, u16, Action)>,
     node_addrs: Vec<IpAddr>,
 }
 
@@ -213,15 +328,15 @@ pub enum AddrDecision {
 
 impl Policy {
     pub fn compile(&self, node_addrs: &[IpAddr]) -> Result<Compiled, RuleError> {
-        let n = self.allow.len() + self.deny.len() + self.intercept.len();
+        let n = self.allow.len() + self.deny.len();
         if n > RULES_MAX {
             return Err(RuleError::TooMany(n));
         }
         let allow = self.allow.iter().map(|s| Pattern::parse(s)).collect::<Result<_, _>>()?;
         let deny = self.deny.iter().map(|s| Pattern::parse(s)).collect::<Result<_, _>>()?;
+        let targets = check_intercepts(&self.intercept)?;
         let mut intercept = Vec::new();
-        for i in &self.intercept {
-            let g = Glob::parse(&i.host).ok_or_else(|| RuleError::Pattern(i.host.clone()))?;
+        for ((t, port), i) in targets.into_iter().zip(&self.intercept) {
             if let Action::Substitute { placeholders } = &i.action {
                 if placeholders.len() > PLACEHOLDERS_MAX {
                     return Err(RuleError::Placeholder("too many"));
@@ -235,7 +350,7 @@ impl Policy {
                     }
                 }
             }
-            intercept.push((g, i.action.clone()));
+            intercept.push((t, port, i.action.clone()));
         }
         Ok(Compiled { internet: self.internet, allow, deny, intercept, node_addrs: node_addrs.to_vec() })
     }
@@ -243,14 +358,18 @@ impl Policy {
 
 impl Compiled {
     pub fn action(&self, i: usize) -> &Action {
-        &self.intercept[i].1
+        &self.intercept[i].2
     }
 
-    /// What a name resolves to: intercepted names always resolve (to a
-    /// fake address), even with the internet off; others only when the
-    /// rules let the guest reach them.
+    /// What a name resolves to: intercepted names (and every name, under
+    /// a `*` intercept) always resolve (to a fake address), even with the
+    /// internet off; others only when the rules let the guest reach them.
     pub fn name(&self, host: &str) -> NameDecision {
-        if let Some(i) = self.intercept.iter().position(|(g, _)| g.matches(host)) {
+        if let Some(i) = self.intercept.iter().position(|(t, ..)| match t {
+            Target::Host(g) => g.matches(host),
+            Target::Any => true,
+            _ => false,
+        }) {
             return NameDecision::Intercept(i);
         }
         if self.deny.iter().any(|p| p.matches(None, 0, Some(host))) {
@@ -268,11 +387,34 @@ impl Compiled {
         if let Some(h) = host {
             // A connection by name went to the name's fake address; the
             // real one is checked when the proxy resolves it (`reachable`).
+            let hit = self.intercept.iter().position(|(t, p, _)| {
+                *p == port
+                    && match t {
+                        Target::Host(g) => g.matches(h),
+                        Target::Any => true,
+                        _ => false,
+                    }
+            });
+            if let Some(i) = hit {
+                return AddrDecision::Intercept(i);
+            }
             return match self.name(h) {
-                NameDecision::Intercept(i) => AddrDecision::Intercept(i),
                 NameDecision::Refuse => AddrDecision::Refuse("the name is not allowed"),
-                NameDecision::Resolve => AddrDecision::Splice,
+                // Intercepted on another port, or not at all: the name's
+                // real address, if the internet or a rule allows it.
+                _ if self.deny.iter().any(|p| p.matches(None, port, Some(h))) => AddrDecision::Refuse("denied"),
+                _ if self.internet || self.allow.iter().any(|p| p.matches(None, port, Some(h))) => AddrDecision::Splice,
+                _ => AddrDecision::Refuse("the internet is off"),
             };
+        }
+        let hit = self.intercept.iter().position(|(t, p, _)| match t {
+            Target::AddrPort(a, ap) => *a == ip && *ap == port,
+            Target::Range(c) => c.contains(ip) && *p == port,
+            Target::Any => *p == port,
+            Target::Host(_) => false,
+        });
+        if let Some(i) = hit {
+            return AddrDecision::Intercept(i);
         }
         if self.node_addrs.contains(&ip) {
             return AddrDecision::Refuse("the node's own address");
@@ -342,6 +484,58 @@ mod tests {
         }
     }
 
+    // Goal: each Cloudflare target form parses, and the forms it refuses
+    // are refused.
+    #[test]
+    fn intercept_targets() {
+        assert_eq!(parse_target(Scheme::Https, "a.example.com").unwrap().1, 443);
+        assert_eq!(parse_target(Scheme::Https, "*.example.com:8443").unwrap().1, 8443);
+        assert_eq!(parse_target(Scheme::Https, "*").unwrap(), (Target::Any, 443));
+        assert!(parse_target(Scheme::Https, "10.0.0.0/8").is_err(), "https takes no ranges");
+        assert!(parse_target(Scheme::Https, "1.2.3.4").is_err());
+        assert_eq!(parse_target(Scheme::Http, "1.2.3.4:8080").unwrap(), (Target::AddrPort(ip("1.2.3.4"), 8080), 8080));
+        assert!(matches!(parse_target(Scheme::Http, "10.0.0.0/8").unwrap(), (Target::Range(_), 80)));
+        assert!(matches!(parse_target(Scheme::Http, "10.1.2.3").unwrap(), (Target::Range(_), 80)));
+        assert!(parse_target(Scheme::Http, "not a target!").is_err());
+    }
+
+    // Goal: Cloudflare's accounting: 64 host targets (128 entries) fit and
+    // a 65th is refused; 128 ranges fit and a 129th is refused.
+    #[test]
+    fn intercept_accounting() {
+        let hosts = |n: usize| (0..n).map(|i| Intercept::https(&format!("h{i}.example.com"), Action::Handler)).collect::<Vec<_>>();
+        check_intercepts(&hosts(HOST_TARGETS_MAX)).unwrap();
+        assert!(matches!(check_intercepts(&hosts(HOST_TARGETS_MAX + 1)), Err(RuleError::Intercepts(_))));
+        let ranges = |n: usize| (0..n).map(|i| Intercept::http(&format!("10.{}.{}.0/24", i / 256, i % 256), Action::Handler)).collect::<Vec<_>>();
+        check_intercepts(&ranges(ADDR_TARGETS_MAX)).unwrap();
+        assert!(matches!(check_intercepts(&ranges(ADDR_TARGETS_MAX + 1)), Err(RuleError::Intercepts(_))));
+        let mut mixed = hosts(32);
+        mixed.extend(ranges(64));
+        check_intercepts(&mixed).unwrap();
+        mixed.push(Intercept::http("10.250.0.0/16", Action::Handler));
+        assert!(matches!(check_intercepts(&mixed), Err(RuleError::Intercepts(_))), "129 entries");
+    }
+
+    // Goal: address intercepts match by address and port; `*` for HTTP
+    // takes every port-80 connection.
+    #[test]
+    fn address_intercepts() {
+        let c = Policy {
+            internet: false,
+            intercept: vec![Intercept::http("10.9.0.0/16", Action::Handler), Intercept::http("1.2.3.4:8080", Action::Handler)],
+            ..Policy::default()
+        }
+        .compile(&[])
+        .unwrap();
+        assert_eq!(c.addr(ip("10.9.1.1"), 80, None), AddrDecision::Intercept(0));
+        assert_eq!(c.addr(ip("10.9.1.1"), 81, None), AddrDecision::Refuse("not a public address"));
+        assert_eq!(c.addr(ip("1.2.3.4"), 8080, None), AddrDecision::Intercept(1));
+        let all = Policy { internet: false, intercept: vec![Intercept::http("*", Action::Handler)], ..Policy::default() }.compile(&[]).unwrap();
+        assert_eq!(all.addr(ip("93.184.215.14"), 80, None), AddrDecision::Intercept(0));
+        assert_eq!(all.addr(ip("93.184.215.14"), 443, None), AddrDecision::Refuse("the internet is off"));
+        assert_eq!(all.name("anything.example"), NameDecision::Intercept(0), "a * target resolves every name");
+    }
+
     // Goal: 128 rules are allowed and 129 refused, as Cloudflare's.
     #[test]
     fn rule_limit() {
@@ -351,7 +545,7 @@ mod tests {
         let bad = Policy { deny: vec!["not a pattern!".into()], ..Policy::default() };
         assert!(matches!(bad.compile(&[]), Err(RuleError::Pattern(_))));
         let short = Policy {
-            intercept: vec![Intercept { host: "a.com".into(), action: Action::Substitute { placeholders: vec![Placeholder { placeholder: "SHORT".into(), value: "v".into() }] } }],
+            intercept: vec![Intercept::https("a.com", Action::Substitute { placeholders: vec![Placeholder { placeholder: "SHORT".into(), value: "v".into() }] })],
             ..Policy::default()
         };
         assert!(matches!(short.compile(&[]), Err(RuleError::Placeholder(_))));
@@ -366,7 +560,7 @@ mod tests {
         let on = Policy {
             internet: true,
             deny: vec!["blocked.example.com".into(), "1.2.3.4:443".into()],
-            intercept: vec![Intercept { host: "model.example.com".into(), action: Action::Handler }],
+            intercept: vec![Intercept::https("model.example.com", Action::Handler)],
             ..Policy::default()
         }
         .compile(&[node])
@@ -376,6 +570,8 @@ mod tests {
         assert_eq!(on.name("blocked.example.com"), NameDecision::Refuse);
         assert_eq!(on.addr(ip("93.184.215.14"), 443, Some("example.org")), AddrDecision::Splice);
         assert_eq!(on.addr(ip("93.184.215.14"), 443, Some("model.example.com")), AddrDecision::Intercept(0));
+        // Intercepted for HTTPS only: port 80 to the name is the real host.
+        assert_eq!(on.addr(ip("198.18.0.1"), 80, Some("model.example.com")), AddrDecision::Splice);
         assert_eq!(on.addr(node, 22, None), AddrDecision::Refuse("the node's own address"));
         assert_eq!(on.addr(ip("10.0.0.1"), 80, None), AddrDecision::Refuse("not a public address"));
         assert_eq!(on.addr(ip("169.254.169.254"), 80, None), AddrDecision::Refuse("not a public address"));
@@ -389,7 +585,7 @@ mod tests {
         let off = Policy {
             internet: false,
             allow: vec!["api.example.net".into(), "10.9.0.0/16".into()],
-            intercept: vec![Intercept { host: "*.internal.example".into(), action: Action::Handler }],
+            intercept: vec![Intercept::https("*.internal.example", Action::Handler)],
             ..Policy::default()
         }
         .compile(&[node])

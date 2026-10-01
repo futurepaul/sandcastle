@@ -11,4 +11,4 @@ pub mod rules;
 pub mod sni;
 
 pub use proxy::Egress;
-pub use rules::{Action, Intercept, Placeholder, Policy};
+pub use rules::{Action, Intercept, Placeholder, Policy, Scheme};

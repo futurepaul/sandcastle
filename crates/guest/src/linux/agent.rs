@@ -32,13 +32,32 @@ const COPY_BYTES: usize = 256 * 1024;
 
 pub struct Ctx {
     mnt: OwnedFd,
+    /// The entrypoint, as this namespace sees it.
+    entry_pid: libc::pid_t,
     processes: AtomicUsize,
     connections: AtomicUsize,
+    /// Bumped by every freeze, so a timed thaw only thaws its own.
+    freezes: AtomicUsize,
 }
 
 impl Ctx {
-    pub fn new(mnt: OwnedFd) -> Ctx {
-        Ctx { mnt, processes: AtomicUsize::new(0), connections: AtomicUsize::new(0) }
+    pub fn new(mnt: OwnedFd, entry_pid: libc::pid_t) -> Ctx {
+        Ctx { mnt, entry_pid, processes: AtomicUsize::new(0), connections: AtomicUsize::new(0), freezes: AtomicUsize::new(0) }
+    }
+}
+
+// FIFREEZE and FITHAW, _IOWR('X', 119/120, int).
+const FIFREEZE: libc::c_ulong = 0xC004_5877;
+const FITHAW: libc::c_ulong = 0xC004_5878;
+
+fn freeze_ioctl(request: libc::c_ulong) -> io::Result<()> {
+    let dir = std::fs::File::open(crate::mounts::SCRATCH)?;
+    // SAFETY: FIFREEZE/FITHAW on a directory of the filesystem, no argument.
+    let r = unsafe { libc::ioctl(dir.as_raw_fd(), request as _, 0) };
+    if r == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -149,6 +168,42 @@ async fn connection(fd: OwnedFd, ctx: Arc<Ctx>) -> Result<(), WireError> {
         Request::Connect { port } => connect(port, frames, wr).await,
         Request::Reclaim => {
             let reply = reclaim().await;
+            send(&mut wr, &reply).await
+        }
+        Request::Signal { signal } => {
+            // SAFETY: kill(2) on the entrypoint, PID 1 of the workload's
+            // namespace: from here, outside it, a signal it has no handler
+            // for is still dropped, as a container's PID 1 drops it.
+            let r = unsafe { libc::kill(ctx.entry_pid, signal) };
+            let reply = if r == 0 { Reply::Done } else { Reply::error(ErrorKind::Io, io::Error::last_os_error().to_string()) };
+            send(&mut wr, &reply).await
+        }
+        Request::Freeze => {
+            // SAFETY: sync(2) has no preconditions.
+            unsafe { libc::sync() };
+            let reply = match freeze_ioctl(FIFREEZE) {
+                Ok(()) => {
+                    let mine = ctx.freezes.fetch_add(1, Ordering::SeqCst) + 1;
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(sandcastle_wire::FREEZE_S_MAX)).await;
+                        if ctx.freezes.load(Ordering::SeqCst) == mine {
+                            let _ = freeze_ioctl(FITHAW);
+                        }
+                    });
+                    Reply::Done
+                }
+                Err(e) => Reply::error(ErrorKind::Io, format!("freeze: {e}")),
+            };
+            send(&mut wr, &reply).await
+        }
+        Request::Thaw => {
+            ctx.freezes.fetch_add(1, Ordering::SeqCst);
+            let reply = match freeze_ioctl(FITHAW) {
+                Ok(()) => Reply::Done,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Reply::Done,
+                Err(e) => Reply::error(ErrorKind::Io, format!("thaw: {e}")),
+            };
             send(&mut wr, &reply).await
         }
         Request::Layer { .. } | Request::Finish => {

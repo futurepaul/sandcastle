@@ -130,7 +130,7 @@ fn run(
         let mut child = exec::spawn_entrypoint(&entrypoint).map_err(io("starting the entrypoint"))?;
         let pid = child.id().expect("a running child has a pid");
         let mnt = std::fs::File::open(format!("/proc/{pid}/ns/mnt")).map_err(io("the workload's mount namespace"))?;
-        let ctx = Arc::new(Ctx::new(OwnedFd::from(mnt)));
+        let ctx = Arc::new(Ctx::new(OwnedFd::from(mnt), pid as libc::pid_t));
         let listener = AsyncFd::new(listener).map_err(io("registering the agent"))?;
         life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
         let _ = std::io::stdout().flush();

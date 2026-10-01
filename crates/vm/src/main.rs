@@ -2,8 +2,9 @@
 //! binary so the jail binds one file.
 //!
 //! - `run --config <path>`: boot the VM the config describes, here.
-//! - `jail --config <path> --settings <path> --uid <uid> [--probe <what>...]`:
-//!   as root, jail the runner (or the probe) as `uid` and wait for it.
+//! - `jail --config <path> --settings <path> --uid <uid> [--cgroup <dir>]
+//!   [--probe <what>...]`: as root, jail the runner (or the probe) as
+//!   `uid`, in the cgroup if given, and wait for it.
 //! - `probe <what>...`: what the jailer runs with `--probe`.
 //! - `restore --settings <path>`: as root, hand back to the node's user any
 //!   VM file a jailer killed outright left owned by a VM uid.
@@ -31,7 +32,8 @@ fn main() -> ExitCode {
             };
             let Ok(uid) = uid.parse::<u32>() else { return usage() };
             let probe = args.iter().position(|a| a == "--probe").map(|i| args[i + 1..].to_vec());
-            jail(PathBuf::from(config), PathBuf::from(settings), uid, probe)
+            let cgroup = flag("--cgroup").map(PathBuf::from);
+            jail(PathBuf::from(config), PathBuf::from(settings), uid, cgroup, probe)
         }
         "probe" => probe(&args[1..]),
         "restore" => {
@@ -54,7 +56,7 @@ fn run(config: PathBuf) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-fn jail(config: PathBuf, settings: PathBuf, uid: u32, probe: Option<Vec<String>>) -> ExitCode {
+fn jail(config: PathBuf, settings: PathBuf, uid: u32, cgroup: Option<PathBuf>, probe: Option<Vec<String>>) -> ExitCode {
     use sandcastle_vm::linux::jail::{run, Payload};
     let settings: sandcastle_vm::jail::Settings = match std::fs::read(&settings)
         .map_err(|e| e.to_string())
@@ -70,7 +72,7 @@ fn jail(config: PathBuf, settings: PathBuf, uid: u32, probe: Option<Vec<String>>
         Some(what) => Payload::Probe { must_not_reach: what.into_iter().map(PathBuf::from).collect() },
         None => Payload::Runner,
     };
-    match run(&config, &settings, uid, payload) {
+    match run(&config, &settings, uid, cgroup.as_deref(), payload) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("sandcastle-vm jail: {e}");
@@ -121,7 +123,7 @@ fn run(_: PathBuf) -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn jail(_: PathBuf, _: PathBuf, _: u32, _: Option<Vec<String>>) -> ExitCode {
+fn jail(_: PathBuf, _: PathBuf, _: u32, _: Option<PathBuf>, _: Option<Vec<String>>) -> ExitCode {
     eprintln!("sandcastle-vm jails on Linux only");
     ExitCode::FAILURE
 }

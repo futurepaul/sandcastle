@@ -45,4 +45,14 @@ impl Layout {
     pub fn jail_settings(&self) -> PathBuf {
         self.root.join("jail.json")
     }
+    pub fn engine_config(&self) -> PathBuf {
+        self.root.join("engine.json")
+    }
+    /// The engine's state directory (its `state_dir`).
+    pub fn engine_state(&self) -> PathBuf {
+        self.root.join("e")
+    }
+    pub fn engine_socket(&self) -> PathBuf {
+        self.engine_state().join("engine.sock")
+    }
 }

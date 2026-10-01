@@ -20,4 +20,5 @@ pub mod paths {
     pub const CONTROL_SOCK: &str = "control.sock";
     pub const CONSOLE_LOG: &str = "console.log";
     pub const CONFIG: &str = "config.json";
+    pub const EVENTS: &str = "events.jsonl";
 }

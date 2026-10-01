@@ -52,11 +52,17 @@ pub enum Payload {
 }
 
 /// Runs `payload` jailed as `uid`; returns its exit status.
-pub fn run(config_path: &Path, settings: &Settings, uid: u32, payload: Payload) -> Result<i32, JailerError> {
+pub fn run(config_path: &Path, settings: &Settings, uid: u32, cgroup: Option<&Path>, payload: Payload) -> Result<i32, JailerError> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(JailerError::NotRoot);
     }
+    // Into the VM's cgroup before the fork, so the VM is born in it.
+    if let Some(cg) = cgroup {
+        let procs = cg.join("cgroup.procs");
+        std::fs::write(&procs, std::process::id().to_string()).map_err(sys("joining the cgroup", &procs))?;
+    }
+    let t0 = std::time::Instant::now();
     let config = read_config(config_path)?;
     let plan = jail::plan(&config, settings, uid)?;
     for p in &plan.owned {
@@ -93,7 +99,7 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, payload: Payload) 
     if pid == 0 {
         // SAFETY: restores the mask the jailer was started with.
         unsafe { libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-        let e = child(&plan, &jail_root, &config.id, payload);
+        let e = child(&plan, &jail_root, &config.id, payload, t0);
         eprintln!("jailer child: {e}");
         // SAFETY: leave without running the parent's destructors twice.
         unsafe { libc::_exit(127) };
@@ -131,8 +137,8 @@ fn chown(p: &Path, uid: u32, gid: u32) -> Result<(), JailerError> {
     check(unsafe { libc::lchown(c.as_ptr(), uid, gid) }).map_err(sys("chown", p))
 }
 
-fn child(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) -> JailerError {
-    match child_inner(plan, jail_root, hostname, payload) {
+fn child(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload, t0: std::time::Instant) -> JailerError {
+    match child_inner(plan, jail_root, hostname, payload, t0) {
         Ok(never) => match never {},
         Err(e) => e,
     }
@@ -156,7 +162,7 @@ fn mount(source: Option<&Path>, target: &Path, fstype: Option<&str>, flags: libc
     check(r).map_err(sys("mount", target))
 }
 
-fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) -> Result<std::convert::Infallible, JailerError> {
+fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload, t0: std::time::Instant) -> Result<std::convert::Infallible, JailerError> {
     let flags = libc::CLONE_NEWNS | libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
     // SAFETY: unshare with namespace flags in a single-threaded child.
     check(unsafe { libc::unshare(flags) }).map_err(sys("unshare", "/"))?;
@@ -168,6 +174,7 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
         super::net::set_address(tap, gw, sandcastle_wire::egress::PREFIX).map_err(sys("addressing the tap", tap))?;
         super::net::set_up(tap).map_err(sys("bringing up the tap", tap))?;
     }
+    let t_net = t0.elapsed();
     if let Some(rules) = &plan.nft {
         // The namespace's own tables: nothing here touches the host's.
         use std::io::Write;
@@ -183,6 +190,7 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
         }
     }
 
+    let t_nft = t0.elapsed();
     mount(Some(Path::new("tmpfs")), jail_root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("size=16m,mode=0755"))?;
     for m in &plan.mounts {
         let target = jail_root.join(m.target.strip_prefix("/").expect("plan targets are absolute"));
@@ -270,6 +278,14 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }).map_err(sys("pdeathsig", "/"))?;
     super::seccomp::install().map_err(sys("seccomp", "/"))?;
 
+    // Where the jail's time went, for the supervisor (the runner's stdout
+    // is this process's).
+    println!(
+        "{{\"event\":\"jailed\",\"jail_us\":{},\"net_us\":{},\"nft_us\":{}}}",
+        t0.elapsed().as_micros(),
+        t_net.as_micros(),
+        (t_nft - t_net).as_micros()
+    );
     let mut argv: Vec<CString> = vec![CString::new("sandcastle-vm").expect("no NUL")];
     match payload {
         Payload::Runner => {

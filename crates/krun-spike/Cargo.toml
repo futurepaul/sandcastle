@@ -14,6 +14,7 @@ sandcastle-wire.workspace = true
 sandcastle-vm.workspace = true
 sandcastle-rootfs.workspace = true
 sandcastle-egress.workspace = true
+sandcastle-engine.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

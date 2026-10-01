@@ -27,8 +27,10 @@ pub const PROCESSES_MAX: usize = 64;
 pub const CONNECTIONS_MAX: usize = 256;
 /// One image layer, compressed.
 pub const LAYER_BYTES_MAX: u64 = 16 << 30;
-/// A PTY's rows and columns.
-pub const WINSIZE_MAX: u16 = 4096;
+/// A PTY's rows and columns: 1 to 65535, as Cloudflare's `resize`.
+pub const WINSIZE_MAX: u16 = u16::MAX;
+/// A frozen filesystem thaws itself after this, whatever the host does.
+pub const FREEZE_S_MAX: u64 = 60;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Invalid {
@@ -222,6 +224,12 @@ pub enum Request {
     Finish,
     /// Drop the guest's page cache so free-page reporting hands it back.
     Reclaim,
+    /// A signal to the entrypoint (Cloudflare's `container.signal`).
+    Signal { signal: i32 },
+    /// Flush and freeze the writable layer's filesystem for a snapshot;
+    /// it thaws on `Thaw` or after `FREEZE_S_MAX`.
+    Freeze,
+    Thaw,
 }
 
 impl Request {
@@ -255,7 +263,8 @@ impl Request {
                 }
                 Ok(())
             }
-            Request::Ping | Request::Finish | Request::Reclaim => Ok(()),
+            Request::Signal { signal } if !(1..=64).contains(signal) => Err(Invalid::Bad("signal")),
+            Request::Ping | Request::Finish | Request::Reclaim | Request::Signal { .. } | Request::Freeze | Request::Thaw => Ok(()),
         }
     }
 }
@@ -302,6 +311,8 @@ pub enum Reply {
     LayerApplied { entries: u64, whiteouts: u64 },
     Finished { entries: u64 },
     Reclaimed { free_kib_before: u64, free_kib_after: u64 },
+    /// A request that answers nothing more was done.
+    Done,
     Error { kind: ErrorKind, message: String },
 }
 
@@ -541,7 +552,9 @@ mod tests {
         assert_eq!(Input::Signal { signal: 65 }.validate(), Err(Invalid::Bad("signal")));
         Input::Signal { signal: 9 }.validate().unwrap();
         assert!(WinSize { rows: 0, cols: 80 }.validate().is_err());
-        assert!(WinSize { rows: WINSIZE_MAX + 1, cols: 80 }.validate().is_err());
+        WinSize { rows: WINSIZE_MAX, cols: WINSIZE_MAX }.validate().unwrap();
+        assert!(Request::Signal { signal: 0 }.validate().is_err());
+        Request::Signal { signal: 15 }.validate().unwrap();
     }
 
     #[test]
