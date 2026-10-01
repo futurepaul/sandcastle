@@ -5,12 +5,14 @@
 //! - `jail --config <path> --settings <path> --uid <uid> [--probe <what>...]`:
 //!   as root, jail the runner (or the probe) as `uid` and wait for it.
 //! - `probe <what>...`: what the jailer runs with `--probe`.
+//! - `restore --settings <path>`: as root, hand back to the node's user any
+//!   VM file a jailer killed outright left owned by a VM uid.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: sandcastle-vm run --config <path> | jail --config <path> --settings <path> --uid <uid> [--probe <what>...] | probe <what>...");
+    eprintln!("usage: sandcastle-vm run --config <path> | jail --config <path> --settings <path> --uid <uid> [--probe <what>...] | probe <what>... | restore --settings <path>");
     ExitCode::from(2)
 }
 
@@ -32,6 +34,10 @@ fn main() -> ExitCode {
             jail(PathBuf::from(config), PathBuf::from(settings), uid, probe)
         }
         "probe" => probe(&args[1..]),
+        "restore" => {
+            let Some(settings) = flag("--settings") else { return usage() };
+            restore(PathBuf::from(settings))
+        }
         _ => usage(),
     }
 }
@@ -71,6 +77,36 @@ fn jail(config: PathBuf, settings: PathBuf, uid: u32, probe: Option<Vec<String>>
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn restore(settings: PathBuf) -> ExitCode {
+    let settings: sandcastle_vm::jail::Settings = match std::fs::read(&settings)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sandcastle-vm restore: settings: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match sandcastle_vm::linux::jail::restore(&settings) {
+        Ok(n) => {
+            println!("{{\"restored\":{n}}}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("sandcastle-vm restore: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restore(_: PathBuf) -> ExitCode {
+    eprintln!("sandcastle-vm restores on Linux only");
+    ExitCode::FAILURE
 }
 
 #[cfg(target_os = "linux")]

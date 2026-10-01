@@ -53,28 +53,36 @@ fn parse(n: &GuestNet) -> io::Result<(Ipv4Addr, u8, Ipv4Addr)> {
     Ok((addr, prefix, gw))
 }
 
+/// `lo` up: the workload's own services talk over it, and the agent's
+/// port connections arrive through it.
+pub fn loopback_up() -> io::Result<()> {
+    let s = socket()?;
+    let mut r = ifreq("lo");
+    // SAFETY: SIOCGIFFLAGS/SIOCSIFFLAGS read and write `r`.
+    unsafe {
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut r))?;
+        r.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFFLAGS as _, &r))?;
+    }
+    Ok(())
+}
+
 pub fn configure(n: &GuestNet, root: &str) -> io::Result<()> {
     let (addr, prefix, gw) = parse(n)?;
     let s = socket()?;
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-    for (name, up) in [("lo", true), (IFACE, true)] {
-        let mut r = ifreq(name);
-        // SAFETY: the interface ioctls read and write `r`.
-        unsafe {
-            if name == IFACE {
-                r.ifr_ifru.ifru_addr = sin(addr);
-                check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFADDR as _, &r))?;
-                r.ifr_ifru.ifru_netmask = sin(Ipv4Addr::from(mask));
-                check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFNETMASK as _, &r))?;
-                r.ifr_ifru.ifru_mtu = n.mtu as libc::c_int;
-                check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFMTU as _, &r))?;
-            }
-            check(libc::ioctl(s.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut r))?;
-            if up {
-                r.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
-            }
-            check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFFLAGS as _, &r))?;
-        }
+    let mut r = ifreq(IFACE);
+    // SAFETY: the interface ioctls read and write `r`.
+    unsafe {
+        r.ifr_ifru.ifru_addr = sin(addr);
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFADDR as _, &r))?;
+        r.ifr_ifru.ifru_netmask = sin(Ipv4Addr::from(mask));
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFNETMASK as _, &r))?;
+        r.ifr_ifru.ifru_mtu = n.mtu as libc::c_int;
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFMTU as _, &r))?;
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut r))?;
+        r.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+        check(libc::ioctl(s.as_raw_fd(), libc::SIOCSIFFLAGS as _, &r))?;
     }
     // SAFETY: rtentry is plain data; SIOCADDRT reads it.
     unsafe {

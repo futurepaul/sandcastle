@@ -68,6 +68,21 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, payload: Payload) 
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(sys("creating", &jail_root)(e)),
     }
+    // A stop (systemd's SIGTERM, a ^C, a hangup) must still hand the
+    // VM's files back, so the parent takes those signals synchronously:
+    // blocked here, waited for with the child's exit below, and answered
+    // by killing the VM. The child unblocks them before it execs.
+    // SAFETY: sigset operations on a local set, and sigprocmask.
+    let (set, old) = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD] {
+            libc::sigaddset(&mut set, sig);
+        }
+        check(libc::sigprocmask(libc::SIG_BLOCK, &set, &mut old)).map_err(sys("sigprocmask", "/"))?;
+        (set, old)
+    };
     // SAFETY: unshare with a namespace flag; this process is single-threaded.
     check(unsafe { libc::unshare(libc::CLONE_NEWPID) }).map_err(sys("unshare pid", "/"))?;
     // SAFETY: single-threaded, so the child may run arbitrary code before exec.
@@ -76,22 +91,30 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, payload: Payload) 
         return Err(sys("fork", "/")(std::io::Error::last_os_error()));
     }
     if pid == 0 {
+        // SAFETY: restores the mask the jailer was started with.
+        unsafe { libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
         let e = child(&plan, &jail_root, &config.id, payload);
         eprintln!("jailer child: {e}");
         // SAFETY: leave without running the parent's destructors twice.
         unsafe { libc::_exit(127) };
     }
     let mut status = 0;
-    // Bounded by the child's life: retried only when a signal interrupts.
+    // Bounded by the child's life: each pass reaps it or takes one signal.
     loop {
-        // SAFETY: waits on our own child.
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // SAFETY: waits on our own child without blocking.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
             break;
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(sys("waitpid", "/")(e));
+        if r == -1 {
+            return Err(sys("waitpid", "/")(std::io::Error::last_os_error()));
+        }
+        // SAFETY: waits for one of the blocked signals.
+        let sig = unsafe { libc::sigwaitinfo(&set, std::ptr::null_mut()) };
+        if sig == libc::SIGTERM || sig == libc::SIGINT || sig == libc::SIGHUP {
+            // SAFETY: kill(2) on our own child, PID 1 of its namespace, which
+            // only SIGKILL reaches from here.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
     for p in &plan.owned {
@@ -247,3 +270,48 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
     unsafe { libc::execve(runner.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
     Err(sys("execve", inside::RUNNER)(std::io::Error::last_os_error()))
 }
+
+/// Hands every file under the spike's run and data directories that a VM
+/// uid still owns back to the node's user: what a jailer killed outright
+/// (and so never able to) leaves behind. Never follows a link, and touches
+/// only owners in the VM range.
+pub fn restore(settings: &Settings) -> Result<u64, JailerError> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(JailerError::NotRoot);
+    }
+    settings.validate()?;
+    let range = settings.uid_base..settings.uid_base + settings.uid_count;
+    let mut stack: Vec<PathBuf> = ["vms", "data"].iter().map(|d| settings.state_root.join(d)).filter(|p| p.exists()).collect();
+    let mut restored = 0u64;
+    let mut visited = 0usize;
+    // Bounded: a stack of directories, each visited once, at most
+    // RESTORE_ENTRIES_MAX entries in all.
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(sys("reading", &dir))? {
+            let entry = entry.map_err(sys("reading", &dir))?;
+            visited += 1;
+            if visited > RESTORE_ENTRIES_MAX {
+                return Err(JailerError::Sys { what: "restore", path: dir.display().to_string(), source: std::io::Error::other("too many entries") });
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(sys("stat", &path))?;
+            if meta.is_dir() {
+                stack.push(path.clone());
+            }
+            if range.contains(&std::os::unix::fs::MetadataExt::uid(&meta)) {
+                chown(&path, settings.owner_uid, settings.owner_gid)?;
+                restored += 1;
+            }
+        }
+        let meta = std::fs::symlink_metadata(&dir).map_err(sys("stat", &dir))?;
+        if range.contains(&std::os::unix::fs::MetadataExt::uid(&meta)) {
+            chown(&dir, settings.owner_uid, settings.owner_gid)?;
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
+
+/// Entries `restore` walks before it refuses.
+pub const RESTORE_ENTRIES_MAX: usize = 100_000;

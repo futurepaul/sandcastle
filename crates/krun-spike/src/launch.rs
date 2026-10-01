@@ -90,6 +90,10 @@ impl Running {
         self.wait_exit(Duration::from_secs(10))
     }
 
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn wait_exit(&mut self, timeout: Duration) -> Result<i32, Error> {
         let deadline = Instant::now() + timeout;
         // Bounded by `timeout`.
@@ -222,6 +226,17 @@ impl Running {
                 Ok((at, v)) => self.seen.push((at, v)),
                 Err(_) => return Err(Error::msg(format!("{}: nothing within {timeout:?}; saw {:?}", self.id, self.seen))),
             }
+        }
+    }
+}
+
+/// A scenario that fails partway leaves no VM behind: the handle's drop
+/// kills a VM still running.
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.running() {
+            let _ = self.vm.control(&ControlRequest::Kill);
+            let _ = self.wait_exit(Duration::from_secs(10));
         }
     }
 }

@@ -27,6 +27,8 @@ use super::sys;
 /// a background child may hold the streams open indefinitely.
 const DRAIN_MS: u64 = 100;
 const OUT_QUEUE: usize = 64;
+/// A port connection's copy buffer, each way.
+const COPY_BYTES: usize = 256 * 1024;
 
 pub struct Ctx {
     mnt: OwnedFd,
@@ -167,7 +169,9 @@ async fn connect(port: u16, frames: Frames<OwnedReadHalf>, mut wr: OwnedWriteHal
         tcp.write_all(&leftover).await?;
     }
     let mut host = rd.reunite(wr).map_err(|e| WireError::Io(io::Error::other(e.to_string())))?;
-    tokio::io::copy_bidirectional(&mut host, &mut tcp).await?;
+    // Large buffers: each copy crosses vsock, where fewer, bigger writes
+    // carry more per second.
+    tokio::io::copy_bidirectional_with_sizes(&mut host, &mut tcp, COPY_BYTES, COPY_BYTES).await?;
     Ok(())
 }
 

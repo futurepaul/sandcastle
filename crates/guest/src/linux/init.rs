@@ -112,6 +112,7 @@ fn run(
         sys::mkdir_p(dir).map_err(io("mkdir the CA's directory"))?;
         std::fs::write(&at, ca).map_err(io("writing the CA"))?;
     }
+    super::net::loopback_up().map_err(io("bringing up lo"))?;
     if let Some(n) = &net {
         super::net::configure(n, mounts::ROOT).map_err(io("configuring the network"))?;
     }
