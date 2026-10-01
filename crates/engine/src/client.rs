@@ -117,6 +117,11 @@ impl EngineClient {
         self.json("GET", &format!("/v1/containers/{name}/wait"), None::<&()>).await
     }
 
+    /// The tail of the container's stdout and stderr.
+    pub async fn logs(&self, name: &str) -> Result<serde_json::Value, EngineError> {
+        self.json("GET", &format!("/v1/containers/{name}/logs"), None::<&()>).await
+    }
+
     pub async fn reclaim(&self, name: &str) -> Result<serde_json::Value, EngineError> {
         self.json("POST", &format!("/v1/containers/{name}/reclaim"), None::<&()>).await
     }

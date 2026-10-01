@@ -21,4 +21,7 @@ pub mod paths {
     pub const CONSOLE_LOG: &str = "console.log";
     pub const CONFIG: &str = "config.json";
     pub const EVENTS: &str = "events.jsonl";
+    /// The entrypoint's output: the container's logs.
+    pub const STDOUT_LOG: &str = "stdout.log";
+    pub const STDERR_LOG: &str = "stderr.log";
 }

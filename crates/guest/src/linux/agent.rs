@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sandcastle_wire::session::{GuestExec, Stdin};
 use sandcastle_wire::{
-    decode_message, encode_message, frame, Decoder, ErrorKind, Frame, Input, Kind, Process, Reply, Request,
+    decode_message, encode_message, frame, Decoder, ErrorKind, Frame, Input, Kind, Output, Process, Reply, Request,
     WinSize, WireError, CONNECTIONS_MAX, PROCESSES_MAX,
 };
 use tokio::io::unix::AsyncFd;
@@ -164,7 +164,7 @@ async fn connection(fd: OwnedFd, ctx: Arc<Ctx>) -> Result<(), WireError> {
     };
     match req {
         Request::Ping => send(&mut wr, &Reply::Pong { uptime_ms: sys::uptime_ms() }).await,
-        Request::Exec { process, pty, stdin } => run_exec(&ctx, process, pty, stdin, frames, wr).await,
+        Request::Exec { process, pty, stdin, stdout, stderr } => run_exec(&ctx, process, pty, (stdin, stdout, stderr), frames, wr).await,
         Request::Connect { port } => connect(port, frames, wr).await,
         Request::Reclaim => {
             let reply = reclaim().await;
@@ -333,13 +333,13 @@ async fn run_exec(
     ctx: &Ctx,
     process: Process,
     pty: Option<WinSize>,
-    stdin_wanted: bool,
+    (stdin_wanted, stdout, stderr): (bool, Output, Output),
     mut frames: Frames<OwnedReadHalf>,
     mut wr: OwnedWriteHalf,
 ) -> Result<(), WireError> {
     let mut session = GuestExec::new();
     session
-        .open(&Request::Exec { process: process.clone(), pty, stdin: stdin_wanted })
+        .open(&Request::Exec { process: process.clone(), pty, stdin: stdin_wanted, stdout, stderr })
         .expect("a fresh session takes its exec");
     let Some(_slot) = Slot::take(&ctx.processes, PROCESSES_MAX) else {
         return send(&mut wr, &Reply::error(ErrorKind::Limit, format!("{PROCESSES_MAX} processes at once"))).await;
@@ -349,9 +349,9 @@ async fn run_exec(
             Ok((m, s)) => (Some(Arc::new(AsyncFd::new(m)?)), Stdios::Pty(s)),
             Err(e) => return send(&mut wr, &Reply::error(ErrorKind::Io, format!("openpty: {e}"))).await,
         },
-        None => (None, Stdios::Pipes { stdin: stdin_wanted }),
+        None => (None, Stdios::Pipes { stdin: stdin_wanted, stdout, stderr }),
     };
-    let mut child = match exec::spawn_exec(&process, ctx.mnt.as_raw_fd(), stdios) {
+    let (mut child, combined) = match exec::spawn_exec(&process, ctx.mnt.as_raw_fd(), stdios) {
         Ok(c) => c,
         Err(e) => {
             let kind = if e.kind() == io::ErrorKind::NotFound { ErrorKind::NotFound } else { ErrorKind::Io };
@@ -366,6 +366,9 @@ async fn run_exec(
     let mut stdin_pipe = child.stdin.take();
     if let Some(m) = &master {
         readers.push(tokio::spawn(pump_pty(m.clone(), tx.clone())));
+    } else if let Some(r) = combined {
+        let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(r)?;
+        readers.push(tokio::spawn(pump(rx, Kind::Stdout, tx.clone())));
     } else {
         if let Some(out) = child.stdout.take() {
             readers.push(tokio::spawn(pump(out, Kind::Stdout, tx.clone())));

@@ -10,14 +10,33 @@ use std::time::Instant;
 use sandcastle_egress::{Action, Intercept};
 use sandcastle_engine::api::{Instance, SnapshotRef};
 use sandcastle_engine::{EngineError, StartRequest};
+use sandcastle_vm::client::ExecEvent;
+use sandcastle_wire::Output;
 use serde_json::{json, Value};
 
 use crate::egress::{StandIn, CA_IN_GUEST, CURL, MODEL_HOST, STAND_IN};
 use crate::launch::ms;
 use crate::layout::Layout;
-use crate::node::{engine_err, start, Node};
+use crate::node::{agent_err, engine_err, start, Node};
 use crate::scenarios::{BUSYBOX, SLEEP_FOREVER};
 use crate::Error;
+
+/// Runs `sh -c 'echo to-out; echo to-err >&2'` with the given output
+/// options: what came back on stdout and on stderr.
+fn collect(c: &crate::node::Ctr<'_>, stdout: Output, stderr: Output) -> Result<(String, String), Error> {
+    let p = crate::scenarios::argv(&["/bin/sh", "-c", "echo to-out; echo to-err >&2"]);
+    let mut s = c.vm.exec_with(p, false, None, stdout, stderr).map_err(agent_err)?;
+    let (mut out, mut err) = (String::new(), String::new());
+    // Bounded by the process's exit.
+    loop {
+        match s.next_event().map_err(agent_err)? {
+            ExecEvent::Stdout(b) => out.push_str(&String::from_utf8_lossy(&b)),
+            ExecEvent::Stderr(b) => err.push_str(&String::from_utf8_lossy(&b)),
+            ExecEvent::Exited { .. } => return Ok((out, err)),
+            ExecEvent::Started(_) => {}
+        }
+    }
+}
 
 fn refused(r: Result<sandcastle_engine::Info, EngineError>, status: u16) -> bool {
     matches!(r, Err(EngineError::Api { status: s, .. }) if s == status)
@@ -65,6 +84,12 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let (ca, _) = c.sh(&format!("head -1 {CA_IN_GUEST}"))?;
     check("ca_at_cloudflares_path", ca.starts_with("-----BEGIN CERTIFICATE-----"));
 
+    // exec's output options: stderr combined into stdout, stdout ignored.
+    let (out, err) = collect(&c, Output::Pipe, Output::Combined)?;
+    check("exec_stderr_combined", out.contains("to-out") && out.contains("to-err") && err.is_empty());
+    let (out, err) = collect(&c, Output::Ignore, Output::Pipe)?;
+    check("exec_stdout_ignored", out.is_empty() && err.contains("to-err"));
+
     // A snapshot of the writable root, and a start from it.
     c.sh("echo snapshotted > /etc/parity-marker && sync")?;
     let t = Instant::now();
@@ -86,6 +111,13 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     check("snapshot_listed", listed.iter().any(|x| x.id == snap.id));
     node.block(node.client.delete_snapshot(&snap.id)).map_err(engine_err)?;
     check("deleted_snapshot_gone", refused(node.try_start("parity-gone", &restore), 404));
+
+    // The container's logs: its entrypoint's stdout and stderr.
+    let logged = node.start("parity-logs", &start(BUSYBOX, &["/bin/sh", "-c", "echo hello-stdout; echo hello-stderr >&2; while :; do sleep 3600; done"]))?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let logs = node.block(node.client.logs("parity-logs")).map_err(engine_err)?;
+    check("logs_carry_stdout_and_stderr", logs["stdout"] == "hello-stdout\n" && logs["stderr"] == "hello-stderr\n");
+    logged.destroy(None)?;
 
     // signal and monitor.
     // A PID 1 with no handler for a signal never gets it (here, on Docker,

@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::Stdio;
 
-use sandcastle_wire::Process;
+use sandcastle_wire::{Output, Process};
 use tokio::process::{Child, Command};
 
 use super::sys::{check, cstr};
@@ -101,7 +101,9 @@ pub fn spawn_entrypoint(process: &Process) -> io::Result<Child> {
     let root = cstr(mounts::ROOT)?;
     let old = cstr(OLD_ROOT)?;
     let old_abs = cstr(&format!("/{OLD_ROOT}"))?;
-    command.stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    // Its output is the container's logs: piped to the init, which sends
+    // it to the runner.
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // SAFETY: the closure makes system calls only, on values prepared
     // above, between fork and exec in a single-threaded child.
     unsafe {
@@ -134,25 +136,47 @@ pub fn spawn_entrypoint(process: &Process) -> io::Result<Child> {
 pub enum Stdios {
     /// A PTY's slave on all three; the agent holds the master.
     Pty(std::os::fd::OwnedFd),
-    Pipes { stdin: bool },
+    Pipes { stdin: bool, stdout: Output, stderr: Output },
+}
+
+/// A pipe, both ends close-on-exec: (read, write).
+fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 writes two descriptors we then own.
+    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    // SAFETY: fresh descriptors.
+    Ok(unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Starts `process` in the workload's mount namespace (`mnt`, the
 /// entrypoint's) and PID namespace (this thread's children's), in a
-/// session of its own so a signal reaches its whole group.
-pub fn spawn_exec(process: &Process, mnt: RawFd, stdios: Stdios) -> io::Result<Child> {
+/// session of its own so a signal reaches its whole group. With stderr
+/// combined, both streams share one pipe, whose read end is returned.
+pub fn spawn_exec(process: &Process, mnt: RawFd, stdios: Stdios) -> io::Result<(Child, Option<std::os::fd::OwnedFd>)> {
     let mut command = Command::new(&process.argv[0]);
     let tty = matches!(stdios, Stdios::Pty(_));
     let prepared = prepare(&mut command, process, tty)?;
+    let mut combined = None;
     match stdios {
         Stdios::Pty(slave) => {
             command.stdin(Stdio::from(slave.try_clone()?));
             command.stdout(Stdio::from(slave.try_clone()?));
             command.stderr(Stdio::from(slave));
         }
-        Stdios::Pipes { stdin } => {
+        Stdios::Pipes { stdin, stdout, stderr } => {
             command.stdin(if stdin { Stdio::piped() } else { Stdio::null() });
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            match (stdout, stderr) {
+                (Output::Pipe, Output::Combined) => {
+                    let (r, w) = pipe()?;
+                    command.stdout(Stdio::from(w.try_clone()?)).stderr(Stdio::from(w));
+                    combined = Some(r);
+                }
+                (out, err) => {
+                    let s = |o: Output| if o == Output::Pipe { Stdio::piped() } else { Stdio::null() };
+                    command.stdout(s(out)).stderr(s(err));
+                }
+            }
         }
     }
     // SAFETY: system calls only, on prepared values, after fork.
@@ -167,7 +191,7 @@ pub fn spawn_exec(process: &Process, mnt: RawFd, stdios: Stdios) -> io::Result<C
         });
     }
     command.kill_on_drop(true);
-    command.spawn()
+    Ok((command.spawn()?, combined))
 }
 
 /// A new PTY at `rows` by `cols`: (master, slave), the master non-blocking.

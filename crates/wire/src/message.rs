@@ -201,6 +201,17 @@ impl Event {
     }
 }
 
+/// Where an exec's stdout or stderr goes, as Cloudflare's options name it:
+/// piped back, dropped, or (stderr only) merged into stdout.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Output {
+    #[default]
+    Pipe,
+    Ignore,
+    Combined,
+}
+
 /// The first frame of an agent connection: what this connection is for.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -213,6 +224,10 @@ pub enum Request {
         pty: Option<WinSize>,
         #[serde(default)]
         stdin: bool,
+        #[serde(default)]
+        stdout: Output,
+        #[serde(default)]
+        stderr: Output,
     },
     /// A byte stream to `127.0.0.1:port` inside the guest, raw after the
     /// guest's `Connected`.
@@ -235,8 +250,11 @@ pub enum Request {
 impl Request {
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {
-            Request::Exec { process, pty, .. } => {
+            Request::Exec { process, pty, stdout, .. } => {
                 process.validate()?;
+                if *stdout == Output::Combined {
+                    return Err(Invalid::Bad("stdout cannot be combined; stderr can"));
+                }
                 if let Some(w) = pty {
                     w.validate()?;
                 }
@@ -496,7 +514,13 @@ mod tests {
     fn messages_round_trip() {
         let msgs = vec![
             Request::Ping,
-            Request::Exec { process: process(&["/bin/sh", "-c", "true"]), pty: Some(WinSize { rows: 24, cols: 80 }), stdin: true },
+            Request::Exec {
+                process: process(&["/bin/sh", "-c", "true"]),
+                pty: Some(WinSize { rows: 24, cols: 80 }),
+                stdin: true,
+                stdout: Output::Pipe,
+                stderr: Output::Combined,
+            },
             Request::Connect { port: 8642 },
             Request::Layer { media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(), digest: format!("sha256:{}", "a".repeat(64)), bytes: 10 },
         ];
@@ -551,6 +575,8 @@ mod tests {
         assert_eq!(Input::Signal { signal: 0 }.validate(), Err(Invalid::Bad("signal")));
         assert_eq!(Input::Signal { signal: 65 }.validate(), Err(Invalid::Bad("signal")));
         Input::Signal { signal: 9 }.validate().unwrap();
+        let combined_stdout = Request::Exec { process: process(&["a"]), pty: None, stdin: false, stdout: Output::Combined, stderr: Output::Pipe };
+        assert!(combined_stdout.validate().is_err());
         assert!(WinSize { rows: 0, cols: 80 }.validate().is_err());
         WinSize { rows: WINSIZE_MAX, cols: WINSIZE_MAX }.validate().unwrap();
         assert!(Request::Signal { signal: 0 }.validate().is_err());

@@ -51,6 +51,7 @@ fn io(what: &'static str) -> impl FnOnce(std::io::Error) -> RunError {
 struct Events {
     t0: Instant,
     out: Arc<Mutex<(std::io::Stdout, Option<File>)>>,
+    run_dir: std::path::PathBuf,
 }
 
 /// Events one run keeps on disk; past it they go to stdout only.
@@ -93,7 +94,7 @@ pub fn run(config_path: &Path) -> Result<std::convert::Infallible, RunError> {
     let t0 = Instant::now();
     let config = read_config(config_path)?;
     let events_file = OpenOptions::new().create(true).append(true).open(config.run_dir.join(paths::EVENTS)).ok();
-    let events = Events { t0, out: Arc::new(Mutex::new((std::io::stdout(), events_file))) };
+    let events = Events { t0, out: Arc::new(Mutex::new((std::io::stdout(), events_file))), run_dir: config.run_dir.clone() };
 
     // libkrun binds the agent socket itself (it listens there for the
     // host); a stale one from a crashed run would make that fail.
@@ -179,6 +180,40 @@ fn serve_lifecycle(listener: UnixListener, lifecycle: &Mutex<Lifecycle>, events:
     }
 }
 
+/// A container's log file: appended to, and when it passes its limit,
+/// moved to `.1` (replacing the last) and started again.
+struct LogFile {
+    path: std::path::PathBuf,
+    file: Option<File>,
+    bytes: u64,
+}
+
+/// One log file's size before it rotates; a container keeps two of each.
+pub const LOG_BYTES_MAX: u64 = 8 << 20;
+
+impl LogFile {
+    fn new(path: std::path::PathBuf) -> LogFile {
+        LogFile { path, file: None, bytes: 0 }
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        if self.bytes + data.len() as u64 > LOG_BYTES_MAX {
+            self.file = None;
+            let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+            self.bytes = 0;
+        }
+        if self.file.is_none() {
+            use std::os::unix::fs::OpenOptionsExt;
+            self.file = OpenOptions::new().create(true).append(true).mode(0o644).open(&self.path).ok();
+        }
+        if let Some(f) = self.file.as_mut() {
+            if f.write_all(data).is_ok() {
+                self.bytes += data.len() as u64;
+            }
+        }
+    }
+}
+
 fn lifecycle_session(
     stream: UnixStream,
     lifecycle: &Mutex<Lifecycle>,
@@ -187,10 +222,27 @@ fn lifecycle_session(
 ) -> Result<(), WireError> {
     let mut writer = stream.try_clone()?;
     let mut reader = FrameReader::new(stream);
-    // Bounded: the guest says hello, ready, and exited, then powers off;
-    // anything out of order ends the session.
+    let run_dir = events.run_dir.clone();
+    let mut stdout = LogFile::new(run_dir.join(paths::STDOUT_LOG));
+    let mut stderr = LogFile::new(run_dir.join(paths::STDERR_LOG));
+    // Bounded: the guest says hello and ready, sends its entrypoint's
+    // output (bounded per file), says exited, and powers off; anything out
+    // of order ends the session.
     loop {
-        let msg: GuestEvent = reader.read_message()?;
+        let frame = reader.read_frame()?;
+        match frame.kind {
+            sandcastle_wire::Kind::Stdout => {
+                stdout.append(&frame.payload);
+                continue;
+            }
+            sandcastle_wire::Kind::Stderr => {
+                stderr.append(&frame.payload);
+                continue;
+            }
+            sandcastle_wire::Kind::Stdin => return Err(WireError::NotControl(frame.kind)),
+            sandcastle_wire::Kind::Control => {}
+        }
+        let msg: GuestEvent = sandcastle_wire::decode_message(&frame)?;
         let mut l = lifecycle.lock().expect("lock");
         match msg {
             GuestEvent::Hello { version, uptime_ms } => {

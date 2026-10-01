@@ -36,6 +36,8 @@ const DESTROY_WAIT: Duration = Duration::from_secs(10);
 /// A build VM's size.
 const BUILD_MEMORY_MIB: u32 = 1024;
 const BUILD_VCPUS: u8 = 2;
+/// The bytes of each log stream `logs` returns.
+const LOG_TAIL_BYTES: usize = 64 * 1024;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -304,6 +306,23 @@ impl Engine {
         api::validate_name(name)?;
         let vm = self.get(name)?;
         Ok(self.info_of(&vm))
+    }
+
+    /// The container's logs: the last `LOG_TAIL_BYTES` of its
+    /// entrypoint's stdout and stderr.
+    pub fn logs(&self, name: &str) -> Result<serde_json::Value, ApiError> {
+        api::validate_name(name)?;
+        let vm = self.get(name)?;
+        let tail = |file: &str| -> String {
+            let mut bytes = std::fs::read(vm.run_dir.join(file.replace(".log", ".log.1"))).unwrap_or_default();
+            bytes.extend(std::fs::read(vm.run_dir.join(file)).unwrap_or_default());
+            let from = bytes.len().saturating_sub(LOG_TAIL_BYTES);
+            String::from_utf8_lossy(&bytes[from..]).into_owned()
+        };
+        Ok(serde_json::json!({
+            "stdout": tail(sandcastle_vm::paths::STDOUT_LOG),
+            "stderr": tail(sandcastle_vm::paths::STDERR_LOG),
+        }))
     }
 
     /// A data disk removed, when no running VM has it.

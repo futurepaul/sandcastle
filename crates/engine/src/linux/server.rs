@@ -79,6 +79,7 @@ pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Respon
             }
         }
         (&Method::GET, ["v1", "containers", name, "wait"]) => engine.wait(name).await.map(|e| json(200, &e)),
+        (&Method::GET, ["v1", "containers", name, "logs"]) => engine.logs(name).map(|l| json(200, &l)),
         (&Method::POST, ["v1", "containers", name, "reclaim"]) => {
             engine.reclaim(name).await.map(|(b, a)| json(200, &serde_json::json!({"freeKibBefore": b, "freeKibAfter": a})))
         }

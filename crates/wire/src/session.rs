@@ -185,6 +185,8 @@ mod tests {
             process: Process { argv: vec!["/bin/cat".into()], ..Process::default() },
             pty: pty.then_some(WinSize { rows: 24, cols: 80 }),
             stdin,
+            stdout: crate::message::Output::Pipe,
+            stderr: crate::message::Output::Pipe,
         }
     }
 

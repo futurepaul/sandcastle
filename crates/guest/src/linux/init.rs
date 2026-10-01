@@ -5,10 +5,10 @@
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::ExitStatusExt as _;
 use std::sync::Arc;
 
-use sandcastle_wire::{write_message, Event, FrameReader, GuestNet, Process, Start};
+use sandcastle_wire::{encode_message, write_message, Event, FrameReader, GuestNet, Kind, Process, Start};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 
@@ -126,7 +126,7 @@ fn run(
     // on this thread alone, so every fork is from here.
     // SAFETY: unshare with a namespace flag.
     sys::check(unsafe { libc::unshare(libc::CLONE_NEWPID) }).map_err(io("unshare pid"))?;
-    let status = rt.block_on(async {
+    let result: Result<(), InitError> = rt.block_on(async {
         let mut child = exec::spawn_entrypoint(&entrypoint).map_err(io("starting the entrypoint"))?;
         let pid = child.id().expect("a running child has a pid");
         let mnt = std::fs::File::open(format!("/proc/{pid}/ns/mnt")).map_err(io("the workload's mount namespace"))?;
@@ -134,13 +134,73 @@ fn run(
         let listener = AsyncFd::new(listener).map_err(io("registering the agent"))?;
         life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
         let _ = std::io::stdout().flush();
-        tokio::select! {
-            status = child.wait() => status.map_err(io("waiting for the entrypoint")),
+        // From here the lifecycle channel carries the entrypoint's output
+        // too, so one task writes it all, in order.
+        let stream = life.stream.try_clone().map_err(io("the lifecycle channel"))?;
+        stream.set_nonblocking(true).map_err(io("the lifecycle channel"))?;
+        let stream = tokio::net::UnixStream::from_std(stream).map_err(io("the lifecycle channel"))?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(LOG_QUEUE);
+        let writer = tokio::spawn(lifecycle_writer(stream, rx));
+        let pumps = [
+            child.stdout.take().map(|o| tokio::spawn(pump_log(o, Kind::Stdout, tx.clone()))),
+            child.stderr.take().map(|e| tokio::spawn(pump_log(e, Kind::Stderr, tx.clone()))),
+        ];
+        let status = tokio::select! {
+            status = child.wait() => status.map_err(io("waiting for the entrypoint"))?,
             never = agent::serve(listener, ctx) => match never {},
+        };
+        // The entrypoint is gone, and with it its PID namespace: its last
+        // output, then its exit, then power off, as a container stops when
+        // its process does.
+        for p in pumps.into_iter().flatten() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(LOG_DRAIN_MS), p).await;
         }
-    })?;
-    // The entrypoint is gone, and with it its PID namespace: report, flush,
-    // and power off, as a container stops when its process does.
-    let _ = life.send(&Event::Exited { code: status.code(), signal: status.signal() });
+        let mut exited = Vec::new();
+        encode_message(&Event::Exited { code: status.code(), signal: status.signal() }, &mut exited)?;
+        let _ = tx.send(exited).await;
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+        Ok(())
+    });
+    if let Err(e) = result {
+        let _ = life.send(&Event::Failed { message: e.to_string().chars().take(1000).collect() });
+    }
     sys::poweroff()
+}
+
+/// Frames queued for the lifecycle channel at once.
+const LOG_QUEUE: usize = 64;
+/// After the entrypoint exits, its output is drained for this long.
+const LOG_DRAIN_MS: u64 = 200;
+
+async fn lifecycle_writer(mut stream: tokio::net::UnixStream, mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    use tokio::io::AsyncWriteExt;
+    // Bounded by the senders: it ends when every one has dropped.
+    while let Some(bytes) = rx.recv().await {
+        if stream.write_all(&bytes).await.is_err() {
+            return;
+        }
+    }
+    let _ = stream.flush().await;
+}
+
+/// The entrypoint's stdout or stderr as data frames, back-pressured: a
+/// runner slow to write its logs slows the entrypoint's writes, as a
+/// container's logging does.
+async fn pump_log<R: tokio::io::AsyncRead + Unpin>(mut r: R, kind: Kind, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; sandcastle_wire::frame::DATA_BYTES_MAX];
+    // Bounded by the stream's end.
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut out = Vec::with_capacity(n + 5);
+                sandcastle_wire::frame::encode_data(kind, &buf[..n], &mut out);
+                if tx.send(out).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }

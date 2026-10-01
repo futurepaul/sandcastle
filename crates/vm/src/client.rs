@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sandcastle_wire::session::{HostExec, Outcome};
 use sandcastle_wire::{
-    write_data, write_message, ControlReply, ControlRequest, Frame, FrameReader, Input, Kind, Process,
+    write_data, write_message, ControlReply, ControlRequest, Frame, FrameReader, Input, Kind, Output, Process,
     Reply, Request, WinSize, WireError,
 };
 use thiserror::Error;
@@ -150,7 +150,12 @@ impl Vm {
     }
 
     pub fn exec_session(&self, process: Process, stdin: bool, pty: Option<WinSize>) -> Result<ExecSession, ClientError> {
-        let (writer, reader) = self.open(&Request::Exec { process, pty, stdin })?;
+        self.exec_with(process, stdin, pty, Output::Pipe, Output::Pipe)
+    }
+
+    /// An exec with Cloudflare's output options.
+    pub fn exec_with(&self, process: Process, stdin: bool, pty: Option<WinSize>, stdout: Output, stderr: Output) -> Result<ExecSession, ClientError> {
+        let (writer, reader) = self.open(&Request::Exec { process, pty, stdin, stdout, stderr })?;
         Ok(ExecSession { writer, reader, host: HostExec::new() })
     }
 
