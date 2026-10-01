@@ -127,6 +127,9 @@ pub fn run(config_path: &Path) -> Result<std::convert::Infallible, RunError> {
             .spawn(move || boot_watchdog(&lifecycle, &events))
             .map_err(io("spawning the boot watchdog"))?;
     }
+    if matches!(config.net, crate::config::Net::Tap { .. }) {
+        super::forward::start(&config.run_dir).map_err(io("starting the forwarder"))?;
+    }
     // Kept open for the life of the process: libkrun borrows them.
     std::mem::forget(console);
     std::mem::forget(null);

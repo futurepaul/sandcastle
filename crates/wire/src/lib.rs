@@ -13,6 +13,7 @@
 //! Everything a guest sends is hostile input to the host: every frame is
 //! bounded, every message validated, before anything acts on it.
 
+pub mod egress;
 pub mod frame;
 pub mod message;
 pub mod session;

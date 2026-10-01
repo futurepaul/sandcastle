@@ -4,7 +4,7 @@
 # already vetted where they overlap; new ones passed the two-week cooldown.
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e", "crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/krun-spike"]
+members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e", "crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/krun-spike"]
 
 [workspace.package]
 edition = "2021"
@@ -18,6 +18,7 @@ sandcastle-node = { path = "crates/node" }
 sandcastle-wire = { path = "crates/wire" }
 sandcastle-vm = { path = "crates/vm" }
 sandcastle-rootfs = { path = "crates/rootfs" }
+sandcastle-egress = { path = "crates/egress" }
 aes-gcm = "=0.10.3"
 base64 = "=0.22.1"
 clap = { version = "=4.6.6", features = ["derive", "env"] }

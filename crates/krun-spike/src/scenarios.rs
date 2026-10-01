@@ -47,6 +47,7 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
         "probe" => probe(layout)?,
         "exec" => exec(layout, jail, n)?,
         "port" => port(layout, jail, n)?,
+        "egress" => crate::egress::scenario(layout, jail)?,
         other => return Err(Error::msg(format!("no scenario {other}"))),
     };
     let v = json!({"scenario": cmd, "jail": jail == Jail::Yes, "evidence": v, "versions": versions(layout)});
@@ -118,6 +119,7 @@ pub fn busybox_vm(layout: &Layout, image: &Image, id: &str, jail: Jail, slot: u3
             jail,
             slot,
             probe: None,
+            before: None,
         },
     )
 }
@@ -296,6 +298,7 @@ fn probe(layout: &Layout) -> Result<Value, Error> {
             jail: Jail::Yes,
             slot: 0,
             probe: Some(targets),
+            before: None,
         },
     )?;
     let mut run = run;
@@ -422,6 +425,7 @@ fn exec(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
             jail,
             slot: 1,
             probe: None,
+            before: None,
         },
     )?;
     short.wait_for("ready", Duration::from_secs(READY_S))?;
@@ -533,6 +537,7 @@ fn port(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
             jail,
             slot: 0,
             probe: None,
+            before: None,
         },
     )?;
     vm.wait_for("ready", Duration::from_secs(READY_S))?;
@@ -592,6 +597,7 @@ fn port(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
             jail,
             slot: 1,
             probe: None,
+            before: None,
         },
     )?;
     vm.wait_for("ready", Duration::from_secs(READY_S))?;

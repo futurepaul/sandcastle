@@ -1214,6 +1214,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-egress"
+version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "sandcastle-wire",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
+
+[[package]]
 name = "sandcastle-guest"
 version = "0.1.0"
 dependencies = [
@@ -1232,7 +1250,11 @@ name = "sandcastle-krun-spike"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
+ "sandcastle-egress",
  "sandcastle-rootfs",
  "sandcastle-vm",
  "sandcastle-wire",

@@ -160,6 +160,11 @@ impl VmConfig {
                 return Err(ConfigError::Net("mac must be locally administered unicast"));
             }
         }
+        if let Start::Run { net, .. } = &self.start {
+            if net.is_some() != matches!(self.net, Net::Tap { .. }) {
+                return Err(ConfigError::Net("the guest has an address exactly when it has a tap"));
+            }
+        }
         self.start.validate().map_err(|e| ConfigError::Start(e.to_string()))?;
         Ok(())
     }
@@ -267,6 +272,10 @@ pub(crate) mod tests {
     fn tap_checked() {
         let mut c = run_config();
         c.net = Net::Tap { name: "tap0".into(), mac: [0x02, 0, 0, 0, 0, 1] };
+        assert_eq!(c.validate(), Err(ConfigError::Net("the guest has an address exactly when it has a tap")));
+        if let Start::Run { net, .. } = &mut c.start {
+            *net = Some(sandcastle_wire::GuestNet { address: "10.0.2.15/24".into(), gateway: "10.0.2.2".into(), dns: "10.0.2.2".into(), mtu: 1500 });
+        }
         c.validate().unwrap();
         c.net = Net::Tap { name: "tap0".into(), mac: [0x01, 0, 0, 0, 0, 1] };
         assert!(c.validate().is_err());

@@ -26,6 +26,9 @@ pub enum Jail {
     Yes,
 }
 
+/// Work done in a fresh run directory before its runner starts.
+pub type Before = Box<dyn FnOnce(&std::path::Path) -> Result<(), Error>>;
+
 pub struct Spec {
     pub id: String,
     pub vcpus: u8,
@@ -43,6 +46,9 @@ pub struct Spec {
     /// Run the escape probe in the jail instead of the VM, with these
     /// targets (paths and `tcp:ip:port`).
     pub probe: Option<Vec<String>>,
+    /// Run in the fresh run directory before the runner starts (the
+    /// node's egress socket goes there).
+    pub before: Option<Before>,
 }
 
 pub struct Running {
@@ -124,6 +130,9 @@ pub fn start(layout: &Layout, spec: Spec) -> Result<Running, Error> {
         std::fs::remove_dir_all(&run_dir).map_err(Error::io("clearing a run directory"))?;
     }
     std::fs::create_dir_all(&run_dir).map_err(Error::io("making a run directory"))?;
+    if let Some(before) = spec.before {
+        before(&run_dir)?;
+    }
     let mut disks = vec![Disk { role: DiskRole::Boot, path: boot_disk(layout) }];
     if let Some(i) = &spec.image {
         disks.push(Disk { role: DiskRole::Image, path: i.clone() });

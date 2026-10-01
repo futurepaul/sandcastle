@@ -77,6 +77,7 @@ pub fn ensure(layout: &Layout, reference: &str, jail: Jail) -> Result<(Image, se
             jail,
             slot: 63,
             probe: None,
+            before: None,
         },
     )?;
     vm.wait_for("ready", Duration::from_secs(60))?;

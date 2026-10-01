@@ -164,6 +164,23 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
     super::net::loopback_up().map_err(sys("bringing up lo", "lo"))?;
     if let Some(tap) = &plan.tap {
         super::net::make_tap(tap, plan.uid, plan.gid).map_err(sys("creating the tap", tap))?;
+        let gw = sandcastle_wire::egress::GATEWAY_ADDR.octets();
+        super::net::set_address(tap, gw, sandcastle_wire::egress::PREFIX).map_err(sys("addressing the tap", tap))?;
+        super::net::set_up(tap).map_err(sys("bringing up the tap", tap))?;
+    }
+    if let Some(rules) = &plan.nft {
+        // The namespace's own tables: nothing here touches the host's.
+        use std::io::Write;
+        let mut nft = std::process::Command::new("/usr/sbin/nft")
+            .args(["-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(sys("running nft", "/usr/sbin/nft"))?;
+        nft.stdin.take().expect("piped").write_all(rules.as_bytes()).map_err(sys("writing the rules", "nft"))?;
+        let status = nft.wait().map_err(sys("waiting for nft", "nft"))?;
+        if !status.success() {
+            return Err(JailerError::Sys { what: "nft", path: "-f -".into(), source: std::io::Error::other(format!("exited {status}")) });
+        }
     }
 
     mount(Some(Path::new("tmpfs")), jail_root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("size=16m,mode=0755"))?;

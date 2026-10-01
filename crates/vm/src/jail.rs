@@ -82,6 +82,8 @@ pub struct Plan {
     /// Symlinks in the jail's root: (link, target).
     pub links: Vec<(PathBuf, PathBuf)>,
     pub tap: Option<String>,
+    /// The VM network namespace's nftables, when it has a tap.
+    pub nft: Option<String>,
     /// The configuration the runner reads inside the jail.
     pub inside: VmConfig,
 }
@@ -207,6 +209,7 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
     inside_config.libkrunfw = Path::new(inside::LIB).join(krunfw_name);
     inside_config.validate().map_err(|e| JailError::Config(e.to_string()))?;
 
+    let nft = tap.as_deref().map(nft_ruleset);
     let plan = Plan {
         uid,
         gid: uid,
@@ -215,6 +218,7 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
         owned,
         links: vec![("/lib".into(), "usr/lib".into()), ("/lib64".into(), "usr/lib64".into())],
         tap,
+        nft,
         inside: inside_config,
     };
     check(&plan, settings)?;
@@ -254,6 +258,33 @@ fn check(plan: &Plan, settings: &Settings) -> Result<(), JailError> {
     }
     assert!(plan.uid != 0 && plan.uid != settings.owner_uid);
     Ok(())
+}
+
+/// The VM process's network namespace: no route out, so the only things
+/// the guest reaches are the forwarder's two ports, where every TCP
+/// connection and every DNS query is redirected. Nothing is forwarded.
+pub fn nft_ruleset(tap: &str) -> String {
+    use sandcastle_wire::egress::{PORT_DNS, PORT_TCP};
+    assert!(!tap.is_empty() && tap.bytes().all(|b| b.is_ascii_alphanumeric()));
+    format!(
+        "table inet sandcastle {{\n\
+         \tchain prerouting {{\n\
+         \t\ttype nat hook prerouting priority dstnat; policy accept;\n\
+         \t\tiifname \"{tap}\" udp dport 53 redirect to :{PORT_DNS}\n\
+         \t\tiifname \"{tap}\" meta l4proto tcp redirect to :{PORT_TCP}\n\
+         \t}}\n\
+         \tchain input {{\n\
+         \t\ttype filter hook input priority filter; policy drop;\n\
+         \t\tiifname \"lo\" accept\n\
+         \t\tct state established,related accept\n\
+         \t\tiifname \"{tap}\" tcp dport {PORT_TCP} accept\n\
+         \t\tiifname \"{tap}\" udp dport {PORT_DNS} accept\n\
+         \t}}\n\
+         \tchain forward {{\n\
+         \t\ttype filter hook forward priority filter; policy drop;\n\
+         \t}}\n\
+         }}\n"
+    )
 }
 
 /// The sockets the node connects to, as the host sees them.
@@ -339,8 +370,18 @@ mod tests {
     fn tap_binds_tun() {
         let mut c = config();
         c.net = Net::Tap { name: "tap0".into(), mac: [0x02, 0, 0, 0, 0, 1] };
+        if let sandcastle_wire::Start::Run { net, .. } = &mut c.start {
+            *net = Some(sandcastle_wire::GuestNet { address: "10.0.2.15/24".into(), gateway: "10.0.2.2".into(), dns: "10.0.2.2".into(), mtu: 1500 });
+        }
         let p = plan(&c, &settings(), 300_002).unwrap();
         assert_eq!(p.tap.as_deref(), Some("tap0"));
         assert!(p.mounts.iter().any(|m| m.target == Path::new("/dev/net/tun")));
+        let nft = p.nft.unwrap();
+        // Everything the guest sends is redirected, accepted only at the
+        // forwarder, and never forwarded.
+        assert!(nft.contains("meta l4proto tcp redirect to :15001"));
+        assert!(nft.contains("udp dport 53 redirect to :15353"));
+        assert!(nft.contains("chain forward") && nft.contains("policy drop"));
+        assert!(plan(&config(), &settings(), 300_002).unwrap().nft.is_none());
     }
 }
