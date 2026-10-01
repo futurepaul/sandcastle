@@ -317,6 +317,61 @@ impl Exit {
     }
 }
 
+/// `exec(cmd, options)`, as Cloudflare takes it; the process's `PATH` is
+/// the start's unless `env` names one, and nothing else of the start's env
+/// reaches it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecRequest {
+    pub cmd: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `uid:gid`, or a name in the image's `/etc/passwd`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Stdin is piped (frames on the stream); otherwise it is closed.
+    #[serde(default)]
+    pub stdin: bool,
+    #[serde(default)]
+    pub stdout: sandcastle_wire::Output,
+    #[serde(default)]
+    pub stderr: sandcastle_wire::Output,
+    /// A pseudo-terminal of this size; Cloudflare's `pty: true` is 80x24.
+    #[serde(default)]
+    pub pty: Option<PtySize>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl ExecRequest {
+    /// What the agent's own checks do not cover: Cloudflare's option rules.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.cmd.is_empty() || self.cmd[0].is_empty() {
+            return Err(invalid("exec: a command"));
+        }
+        for (k, v) in &self.env {
+            if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+                return Err(invalid("exec: env names are non-empty, without = or NUL; values without NUL"));
+            }
+        }
+        if self.stdout == sandcastle_wire::Output::Combined {
+            return Err(invalid("exec: stdout is pipe or ignore"));
+        }
+        if let Some(p) = self.pty {
+            if p.cols == 0 || p.rows == 0 {
+                return Err(invalid("exec: a pty of 1 to 65535 columns and rows"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SignalRequest {
     pub signal: i32,
@@ -479,5 +534,28 @@ mod tests {
         validate_signal(15).unwrap();
         assert!(validate_signal(0).is_err() && validate_signal(65).is_err());
         assert!(validate_snapshot_name(&Some(String::new())).is_err());
+    }
+    #[test]
+    fn exec_requests() {
+        let ok = ExecRequest { cmd: vec!["sh".into()], ..Default::default() };
+        ok.validate().unwrap();
+        let bad = |f: &dyn Fn(&mut ExecRequest)| {
+            let mut r = ok.clone();
+            f(&mut r);
+            r.validate().is_err()
+        };
+        assert!(bad(&|r| r.cmd.clear()));
+        assert!(bad(&|r| r.cmd = vec![String::new()]));
+        assert!(bad(&|r| {
+            r.env.insert("A=B".into(), "c".into());
+        }));
+        assert!(bad(&|r| {
+            r.env.insert("A".into(), "c\0".into());
+        }));
+        assert!(bad(&|r| r.stdout = sandcastle_wire::Output::Combined));
+        assert!(bad(&|r| r.pty = Some(PtySize { cols: 0, rows: 24 })));
+        let parsed: ExecRequest = serde_json::from_str(r#"{"cmd":["ls"],"stderr":"combined","pty":{"cols":80,"rows":24}}"#).unwrap();
+        parsed.validate().unwrap();
+        assert!(serde_json::from_str::<ExecRequest>(r#"{"cmd":["ls"],"tty":true}"#).is_err(), "an unknown option");
     }
 }

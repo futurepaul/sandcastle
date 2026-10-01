@@ -116,7 +116,9 @@ impl Vm {
         let phase = *self.phase.lock().expect("never poisoned");
         Info {
             name: self.name.clone(),
-            image: r.image.clone(),
+            // Cloudflare's `inspect()`: empty while starting, and for a
+            // container started from a snapshot.
+            image: if phase == Phase::Starting || r.request.container_snapshot.is_some() { String::new() } else { r.image.clone() },
             labels: r.request.labels.clone(),
             running: true,
             state: match phase {
@@ -792,7 +794,7 @@ impl Engine {
         let policy = Policy { internet: req.enable_internet, allow: req.allow.clone(), deny: req.deny.clone(), intercept: req.intercepts.clone() };
         let rules = policy.compile(&self.node_addrs).map_err(|e| ApiError::Invalid(e.to_string()))?;
         let handler = req.handler.as_deref().and_then(|h| h.strip_prefix("unix:")).unwrap_or("/nonexistent").into();
-        let egress = Arc::new(Egress::new(rules, self.ca.clone(), handler));
+        let egress = Arc::new(Egress::new(rules, self.ca.clone(), handler, name.to_string()));
         let sock = run_dir.join(EGRESS_SOCK);
         let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("binding the egress socket"))?;
         mode(&sock, 0o777).map_err(internal("the egress socket's mode"))?;
@@ -1021,7 +1023,7 @@ impl Engine {
         let policy = Policy { internet: req.enable_internet, allow: req.allow.clone(), deny: req.deny.clone(), intercept: req.intercepts.clone() };
         let rules = policy.compile(&self.node_addrs).map_err(|e| ApiError::Invalid(e.to_string()))?;
         let handler = req.handler.as_deref().and_then(|h| h.strip_prefix("unix:")).unwrap_or("/nonexistent").into();
-        let egress = Arc::new(Egress::new(rules, self.ca.clone(), handler));
+        let egress = Arc::new(Egress::new(rules, self.ca.clone(), handler, rec.name.clone()));
         let sock = run_dir.join(EGRESS_SOCK);
         let _ = std::fs::remove_file(&sock);
         let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("rebinding the egress socket"))?;
@@ -1124,6 +1126,35 @@ impl Engine {
         }
         let c = vm.agent();
         tokio::task::spawn_blocking(move || f(c)).await.map_err(|e| ApiError::Internal(e.to_string()))?.map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    /// `exec(cmd, options)`: the agent's session once the process has
+    /// started (Cloudflare's `exec` resolves then), with its pid. A command
+    /// the guest cannot start is refused here, before any stream.
+    pub async fn exec_open(&self, name: &str, req: api::ExecRequest) -> Result<(sandcastle_vm::client::ExecSession, u32), ApiError> {
+        req.validate()?;
+        let path = self.get(name)?.path_env.clone();
+        let mut env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if !req.env.contains_key("PATH") {
+            env.extend(path.map(|p| format!("PATH={p}")));
+        }
+        let process = Process { argv: req.cmd, env, cwd: req.cwd, user: req.user };
+        process.validate().map_err(|e| ApiError::Invalid(format!("exec: {e}")))?;
+        let pty = req.pty.map(|p| sandcastle_wire::WinSize { rows: p.rows, cols: p.cols });
+        let (stdin, stdout, stderr) = (req.stdin, req.stdout, req.stderr);
+        let opened = self
+            .agent(name, move |c| {
+                let mut s = c.exec_with(process, stdin, pty, stdout, stderr)?;
+                let first = s.next_event();
+                Ok((s, first))
+            })
+            .await?;
+        match opened {
+            (s, Ok(sandcastle_vm::client::ExecEvent::Started(pid))) => Ok((s, pid)),
+            (_, Ok(other)) => Err(ApiError::Internal(format!("exec: {other:?} before the process started"))),
+            (_, Err(sandcastle_vm::client::ClientError::Refused(m))) => Err(ApiError::Invalid(format!("exec: {m}"))),
+            (_, Err(e)) => Err(ApiError::Internal(format!("exec: {e}"))),
+        }
     }
 
     /// `signal(n)`: to the entrypoint.

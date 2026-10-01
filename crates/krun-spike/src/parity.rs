@@ -106,6 +106,7 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let restore_ms = ms(t, Instant::now());
     let (marker, _) = r.sh("cat /etc/parity-marker")?;
     check("restored_from_snapshot", marker == "snapshotted\n");
+    check("inspect_image_empty_when_restored", node.inspect("parity-restored")?.is_some_and(|i| i.image.is_empty()));
     r.destroy(None)?;
     let listed = node.block(node.client.snapshots()).map_err(engine_err)?;
     check("snapshot_listed", listed.iter().any(|x| x.id == snap.id));

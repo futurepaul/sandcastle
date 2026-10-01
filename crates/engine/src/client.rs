@@ -1,7 +1,7 @@
 //! The engine's client: its API from another process on the node (the
-//! spike's driver, celld). Lifecycle calls go to the engine; exec and
-//! ports go to the agent socket `inspect` names, with
-//! `sandcastle_vm::client`.
+//! spike's driver, celld). Lifecycle calls and exec go to the engine;
+//! ports to `ports.sock` (`crate::ports`). The driver may also reach a
+//! VM's agent socket straight, with `sandcastle_vm::client`.
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +80,36 @@ impl EngineClient {
         let body = body.map(|b| serde_json::to_vec(b).expect("serializes"));
         let (_, bytes) = self.call(method, path, body).await?;
         serde_json::from_slice(&bytes).map_err(|e| EngineError::Decode(e.to_string()))
+    }
+
+    /// `exec` over the API: the framed stream (`crate::exec_stream`) once
+    /// the process has started; its first frame is `Started`.
+    pub async fn exec(&self, name: &str, req: &crate::api::ExecRequest) -> Result<hyper::upgrade::Upgraded, EngineError> {
+        let s = tokio::net::UnixStream::connect(&self.socket).await.map_err(|e| EngineError::Connect(self.socket.clone(), e))?;
+        let (mut send, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.map_err(|e| EngineError::Http(e.to_string()))?;
+        tokio::spawn(conn.with_upgrades());
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/containers/{name}/exec"))
+            .header("host", "engine")
+            .header("content-type", "application/json")
+            .header("connection", "Upgrade")
+            .header("upgrade", crate::exec_stream::UPGRADE)
+            .body(Full::new(Bytes::from(serde_json::to_vec(req).expect("serializes"))))
+            .map_err(|e| EngineError::Http(e.to_string()))?;
+        let resp = send.send_request(req).await.map_err(|e| EngineError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status != 101 {
+            let bytes = http_body_util::Limited::new(resp.into_body(), ANSWER_BYTES_MAX)
+                .collect()
+                .await
+                .map_err(|_| EngineError::Http("an answer too large or cut off".into()))?
+                .to_bytes();
+            let e: ErrorBody = serde_json::from_slice(&bytes).map_err(|e| EngineError::Decode(e.to_string()))?;
+            return Err(EngineError::Api { status, kind: e.kind, message: e.error });
+        }
+        hyper::upgrade::on(resp).await.map_err(|e| EngineError::Http(e.to_string()))
     }
 
     pub async fn health(&self) -> Result<serde_json::Value, EngineError> {

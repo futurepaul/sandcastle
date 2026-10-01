@@ -61,6 +61,9 @@ pub struct Egress {
     /// The handler: an HTTP server on a unix socket (celld's callback, or
     /// a stand-in).
     handler: PathBuf,
+    /// The container this proxy serves, named to the handler in
+    /// `x-sandcastle-container`, so one handler serves a node's VMs.
+    container: String,
     upstream: tokio_rustls::TlsConnector,
     log: Mutex<Vec<Decision>>,
 }
@@ -104,7 +107,7 @@ fn text(status: u16, msg: &str) -> Response<Body> {
 }
 
 impl Egress {
-    pub fn new(rules: Compiled, ca: Arc<Ca>, handler: PathBuf) -> Egress {
+    pub fn new(rules: Compiled, ca: Arc<Ca>, handler: PathBuf, container: String) -> Egress {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
@@ -118,6 +121,7 @@ impl Egress {
             fake: Mutex::new(FakeIps::default()),
             ca,
             handler,
+            container,
             upstream: tokio_rustls::TlsConnector::from(Arc::new(config)),
             log: Mutex::new(Vec::new()),
         }
@@ -283,9 +287,11 @@ impl Egress {
     async fn request(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool) -> Response<Body> {
         match self.rules().action(i).clone() {
             Action::Handler => {
+                // Each replaces whatever the guest sent under its name.
                 let h = req.headers_mut();
                 h.insert("x-sandcastle-host", HeaderValue::from_str(host).unwrap_or(HeaderValue::from_static("invalid")));
                 h.insert("x-sandcastle-scheme", HeaderValue::from_static(if tls { "https" } else { "http" }));
+                h.insert("x-sandcastle-container", HeaderValue::from_str(&self.container).unwrap_or(HeaderValue::from_static("invalid")));
                 match self.to_handler(req).await {
                     Ok(r) => r,
                     Err(e) => text(502, &format!("the handler: {e}")),
@@ -352,7 +358,7 @@ mod tests {
         }
         .compile(&[])
         .unwrap();
-        Egress::new(rules, Arc::new(Ca::generate("t").unwrap()), "/nonexistent".into())
+        Egress::new(rules, Arc::new(Ca::generate("t").unwrap()), "/nonexistent".into(), "c".into())
     }
 
     fn query(name: &str, qtype: u16) -> Vec<u8> {
@@ -398,8 +404,9 @@ mod tests {
         tokio::spawn(async move {
             let (s, _) = handler.accept().await.unwrap();
             let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
-                let host = req.headers().get("x-sandcastle-host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!("stand-in for {host}{}", req.uri().path())))))
+                let header = |n: &str| req.headers().get_all(n).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
+                let (host, container) = (header("x-sandcastle-host"), header("x-sandcastle-container"));
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!("stand-in for {host}{} from {container}", req.uri().path())))))
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
         });
@@ -411,7 +418,7 @@ mod tests {
         .compile(&[])
         .unwrap();
         let ca = Arc::new(Ca::generate("t").unwrap());
-        let eg = Arc::new(Egress::new(rules, ca.clone(), handler_sock));
+        let eg = Arc::new(Egress::new(rules, ca.clone(), handler_sock, "c-1".into()));
         // The guest's lookup assigns the fake address it then dials.
         eg.answer(&query("model.example.com", dns::TYPE_A)).unwrap();
         let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 1));
@@ -435,11 +442,16 @@ mod tests {
             .unwrap();
         let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.unwrap();
         tokio::spawn(conn);
-        let req = Request::get("/v1/chat").header("host", "model.example.com").body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        // A guest that names another container is overruled.
+        let req = Request::get("/v1/chat")
+            .header("host", "model.example.com")
+            .header("x-sandcastle-container", "forged")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
         let resp = send.send_request(req).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"stand-in for model.example.com/v1/chat");
+        assert_eq!(&body[..], b"stand-in for model.example.com/v1/chat from c-1");
         let d = eg.decisions();
         assert!(d.iter().any(|d| d.decision == "Intercept(0)"));
         let _ = std::fs::remove_dir_all(&dir);

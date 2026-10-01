@@ -46,6 +46,7 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                 "exec" => exec(&node, n)?,
                 "port" => port(&node, n)?,
                 "port-nic" => crate::ports::scenario(layout, &node)?,
+                "exec-api" => crate::apiexec::scenario(&node)?,
                 "dmesg" => dmesg(&node)?,
                 "egress" => crate::egress::scenario(layout, &node)?,
                 "hermes" => crate::hermes::scenario(&node, n)?,

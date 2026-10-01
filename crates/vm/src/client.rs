@@ -62,7 +62,71 @@ pub struct ExecSession {
     host: HostExec,
 }
 
+/// An exec session's writing half: stdin, resizes, signals.
+pub struct ExecWriter {
+    writer: UnixStream,
+}
+
+/// An exec session's reading half: its output and its end.
+pub struct ExecReader {
+    reader: FrameReader<UnixStream>,
+    host: HostExec,
+}
+
+impl ExecWriter {
+    pub fn stdin(&mut self, data: &[u8]) -> Result<(), ClientError> {
+        assert!(!data.is_empty(), "an empty write closes stdin; use close_stdin");
+        write_data(&mut self.writer, Kind::Stdin, data)?;
+        Ok(())
+    }
+
+    pub fn close_stdin(&mut self) -> Result<(), ClientError> {
+        write_data(&mut self.writer, Kind::Stdin, &[])?;
+        Ok(())
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), ClientError> {
+        write_message(&mut self.writer, &Input::Resize { size: WinSize { rows, cols } })?;
+        Ok(())
+    }
+
+    pub fn signal(&mut self, signal: i32) -> Result<(), ClientError> {
+        write_message(&mut self.writer, &Input::Signal { signal })?;
+        Ok(())
+    }
+}
+
+impl ExecReader {
+    pub fn next_event(&mut self) -> Result<ExecEvent, ClientError> {
+        next_event(&mut self.reader, &mut self.host)
+    }
+}
+
+fn next_event(reader: &mut FrameReader<UnixStream>, host: &mut HostExec) -> Result<ExecEvent, ClientError> {
+    let frame: Frame = reader.read_frame()?;
+    match frame.kind {
+        Kind::Stdout | Kind::Stderr => {
+            host.output().map_err(|e| ClientError::Protocol(e.to_string()))?;
+            Ok(if frame.kind == Kind::Stdout { ExecEvent::Stdout(frame.payload) } else { ExecEvent::Stderr(frame.payload) })
+        }
+        Kind::Control => {
+            let reply: Reply = sandcastle_wire::decode_message(&frame)?;
+            match host.reply(&reply).map_err(|e| ClientError::Protocol(e.to_string()))? {
+                Outcome::Started(pid) => Ok(ExecEvent::Started(pid)),
+                Outcome::Exited { code, signal } => Ok(ExecEvent::Exited { code, signal }),
+                Outcome::Refused(m) => Err(ClientError::Refused(m)),
+            }
+        }
+        Kind::Stdin => Err(ClientError::Protocol("the guest sent stdin".into())),
+    }
+}
+
 impl ExecSession {
+    /// The two halves, for a writer and a reader on separate threads.
+    pub fn split(self) -> (ExecWriter, ExecReader) {
+        (ExecWriter { writer: self.writer }, ExecReader { reader: self.reader, host: self.host })
+    }
+
     pub fn stdin(&mut self, data: &[u8]) -> Result<(), ClientError> {
         assert!(!data.is_empty(), "an empty write closes stdin; use close_stdin");
         write_data(&mut self.writer, Kind::Stdin, data)?;
@@ -85,22 +149,7 @@ impl ExecSession {
     }
 
     pub fn next_event(&mut self) -> Result<ExecEvent, ClientError> {
-        let frame: Frame = self.reader.read_frame()?;
-        match frame.kind {
-            Kind::Stdout | Kind::Stderr => {
-                self.host.output().map_err(|e| ClientError::Protocol(e.to_string()))?;
-                Ok(if frame.kind == Kind::Stdout { ExecEvent::Stdout(frame.payload) } else { ExecEvent::Stderr(frame.payload) })
-            }
-            Kind::Control => {
-                let reply: Reply = sandcastle_wire::decode_message(&frame)?;
-                match self.host.reply(&reply).map_err(|e| ClientError::Protocol(e.to_string()))? {
-                    Outcome::Started(pid) => Ok(ExecEvent::Started(pid)),
-                    Outcome::Exited { code, signal } => Ok(ExecEvent::Exited { code, signal }),
-                    Outcome::Refused(m) => Err(ClientError::Refused(m)),
-                }
-            }
-            Kind::Stdin => Err(ClientError::Protocol("the guest sent stdin".into())),
-        }
+        next_event(&mut self.reader, &mut self.host)
     }
 }
 

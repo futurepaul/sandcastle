@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::engine::Engine;
-use crate::api::{ApiError, DestroyRequest, ErrorBody, InterceptsRequest, SignalRequest, SnapshotRequest, StartRequest};
+use crate::api::{ApiError, DestroyRequest, ErrorBody, ExecRequest, InterceptsRequest, SignalRequest, SnapshotRequest, StartRequest};
 
 /// A request body, as read.
 pub const BODY_BYTES_MAX: usize = 1 << 20;
@@ -69,7 +69,15 @@ async fn save_body(engine: &Engine, req: Request<Incoming>) -> Result<std::path:
     Ok(path)
 }
 
-pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// `exec`'s answer: the switch to its framed stream.
+fn switching() -> Response<Full<Bytes>> {
+    let mut r = empty(101);
+    r.headers_mut().insert("connection", "Upgrade".parse().expect("a header"));
+    r.headers_mut().insert("upgrade", crate::exec_stream::UPGRADE.parse().expect("a header"));
+    r
+}
+
+pub async fn route(engine: Arc<Engine>, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let path: Vec<String> = req.uri().path().trim_matches('/').split('/').map(str::to_string).collect();
     let query = req.uri().query().unwrap_or("").to_string();
     let p: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -100,6 +108,23 @@ pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Respon
             let name = name.to_string();
             match body::<SignalRequest>(req).await {
                 Ok(s) => engine.signal(&name, s.signal).await.map(|()| empty(204)),
+                Err(e) => Err(e),
+            }
+        }
+        (&Method::POST, ["v1", "containers", name, "exec"]) => {
+            let name = name.to_string();
+            let upgrading = req.headers().get("upgrade").and_then(|v| v.to_str().ok()) == Some(crate::exec_stream::UPGRADE);
+            let on_upgrade = hyper::upgrade::on(&mut req);
+            match body::<ExecRequest>(req).await {
+                Ok(_) if !upgrading => Err(ApiError::Invalid(format!("exec upgrades to {}", crate::exec_stream::UPGRADE))),
+                Ok(x) => engine.exec_open(&name, x).await.map(|(session, pid)| {
+                    tokio::spawn(async move {
+                        if let Ok(up) = on_upgrade.await {
+                            super::exec::bridge(up, session, pid).await;
+                        }
+                    });
+                    switching()
+                }),
                 Err(e) => Err(e),
             }
         }
@@ -154,7 +179,7 @@ pub async fn serve(engine: Arc<Engine>, listener: tokio::net::UnixListener) {
         let engine = engine.clone();
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| route(engine.clone(), req));
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).with_upgrades().await;
         });
     }
 }

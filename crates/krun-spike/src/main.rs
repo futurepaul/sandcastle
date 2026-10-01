@@ -4,6 +4,8 @@
 //! this node, not the product's.
 
 #[cfg(target_os = "linux")]
+mod apiexec;
+#[cfg(target_os = "linux")]
 mod corpus;
 #[cfg(target_os = "linux")]
 mod egress;
