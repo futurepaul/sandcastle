@@ -48,6 +48,10 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
         "exec" => exec(layout, jail, n)?,
         "port" => port(layout, jail, n)?,
         "egress" => crate::egress::scenario(layout, jail)?,
+        "hermes" => crate::hermes::scenario(layout, jail, n)?,
+        "crash" => crash(layout)?,
+        "hermes-memory" => crate::hermes::memory_scenario(layout, jail)?,
+        "census" => census(layout)?,
         other => return Err(Error::msg(format!("no scenario {other}"))),
     };
     let v = json!({"scenario": cmd, "jail": jail == Jail::Yes, "evidence": v, "versions": versions(layout)});
@@ -95,6 +99,7 @@ pub fn run_start(image: &Image, id: &str, argv: &[&str], data: bool) -> Start {
         },
         hostname: id.into(),
         data,
+        data_path: None,
         ca_pem: None,
         net: None,
     }
@@ -649,5 +654,98 @@ fn port(layout: &Layout, jail: Jail, n: usize) -> Result<Value, Error> {
         "ws_greeting": greeting,
         "ws_echo_ms": (ws_echo_ms * 1000.0).round() / 1000.0,
         "ws_ok": ws_ok,
+    }))
+}
+
+/// What of the spike is alive on the node: processes of a VM uid, the
+/// spike's scopes, its run directories, and files a VM uid still owns.
+fn census(layout: &Layout) -> Result<Value, Error> {
+    let ps = std::process::Command::new("ps").args(["-eo", "uid=,pid=,comm="]).output().map_err(Error::io("ps"))?;
+    let vm_procs: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .and_then(|u| u.parse::<u32>().ok())
+                .is_some_and(|u| (launch::UID_BASE..launch::UID_BASE + launch::UID_COUNT).contains(&u))
+        })
+        .map(|l| l.trim().to_string())
+        .collect();
+    let units = std::process::Command::new("systemctl")
+        .args(["list-units", "--type=scope", "--no-legend", "--plain", "krun-spike-*"])
+        .output()
+        .map_err(Error::io("systemctl"))?;
+    let scopes: Vec<String> = String::from_utf8_lossy(&units.stdout).lines().map(|l| l.split_whitespace().next().unwrap_or("").to_string()).filter(|s| !s.is_empty()).collect();
+    let mut vm_owned = vec![];
+    for dir in [layout.vms(), layout.data()] {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if let Ok(m) = std::fs::symlink_metadata(e.path()) {
+                let uid = std::os::unix::fs::MetadataExt::uid(&m);
+                if (launch::UID_BASE..launch::UID_BASE + launch::UID_COUNT).contains(&uid) {
+                    vm_owned.push(e.path().display().to_string());
+                }
+            }
+        }
+    }
+    let run_dirs: Vec<String> = std::fs::read_dir(layout.vms()).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    Ok(json!({"vm_processes": vm_procs, "scopes": scopes, "vm_owned_files": vm_owned, "run_dirs": run_dirs}))
+}
+
+/// Phase 7: a VM ended mid-write leaves nothing running and `/data`
+/// intact; a jailer killed outright leaves files reset repairs.
+fn crash(layout: &Layout) -> Result<Value, Error> {
+    let jail = Jail::Yes;
+    let (img, _) = image::ensure(layout, BUSYBOX, jail)?;
+    std::fs::create_dir_all(layout.data()).map_err(Error::io("the data directory"))?;
+    let data = layout.data().join("crash.ext4");
+    let _ = std::fs::remove_file(&data);
+    sandcastle_rootfs::ext4::make(&data, 2 * GIB, true, None).map_err(|e| Error::msg(e.to_string()))?;
+
+    // 1. The VM process ends at once while the guest is writing.
+    let mut vm = busybox_vm(layout, &img, "crash-1", jail, 0, Some(data.clone()))?;
+    vm.wait_for("ready", Duration::from_secs(READY_S))?;
+    let (written, _) = sh(&vm, "dd if=/dev/urandom of=/data/blob bs=1M count=64 2>/dev/null && sync && sha256sum /data/blob | cut -d' ' -f1 | tee /data/blob.sha && sync")?;
+    sh(&vm, "(while :; do dd if=/dev/zero of=/data/churn bs=1M count=32 2>/dev/null; done) >/dev/null 2>&1 &")?;
+    std::thread::sleep(Duration::from_millis(500));
+    let t = Instant::now();
+    let status = vm.kill()?;
+    let crash_ms = ms(t, Instant::now());
+    let after_crash = census(layout)?;
+    let mut again = busybox_vm(layout, &img, "crash-2", jail, 1, Some(data.clone()))?;
+    again.wait_for("ready", Duration::from_secs(READY_S))?;
+    let (reread, _) = sh(&again, "sha256sum /data/blob | cut -d' ' -f1; cat /data/blob.sha")?;
+    // 2. The jailer itself, root, killed outright with its VM.
+    let unit = format!("krun-spike-{}.scope", again.id);
+    let killed = std::process::Command::new("sudo")
+        .args(["-n", "systemctl", "kill", "--signal=KILL", &unit])
+        .output()
+        .map_err(Error::io("systemctl kill"))?;
+    let _ = again.wait_exit(Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(500));
+    let after_jailer_killed = census(layout)?;
+    let reset_out = reset(layout, false)?;
+    let after_reset = census(layout)?;
+    // The data disk, reset or not, is still whole: one more VM reads it.
+    std::fs::create_dir_all(layout.data()).map_err(Error::io("the data directory"))?;
+    let lines: Vec<&str> = reread.lines().collect();
+    let intact_after_crash = lines.len() == 2 && lines[0] == lines[1] && lines[0] == written.trim();
+    Ok(json!({
+        "pass": intact_after_crash
+            && after_crash["vm_processes"].as_array().is_some_and(|a| a.is_empty())
+            && after_crash["scopes"].as_array().is_some_and(|a| a.is_empty())
+            && after_jailer_killed["vm_processes"].as_array().is_some_and(|a| a.is_empty())
+            && after_reset["vm_processes"].as_array().is_some_and(|a| a.is_empty())
+            && after_reset["vm_owned_files"].as_array().is_some_and(|a| a.is_empty())
+            && after_reset["run_dirs"].as_array().is_some_and(|a| a.is_empty()),
+        "crash_mid_write": {"runner_status": status, "kill_to_gone_ms": (crash_ms * 10.0).round() / 10.0, "census": after_crash},
+        "data_after_crash": {"written_sha256": written.trim(), "reread": reread, "intact": intact_after_crash},
+        "jailer_killed": {
+            "systemctl_kill_status": killed.status.code(),
+            "systemctl_kill_stderr": String::from_utf8_lossy(&killed.stderr).trim(),
+            "census": after_jailer_killed,
+        },
+        "reset": reset_out,
+        "after_reset": after_reset,
     }))
 }

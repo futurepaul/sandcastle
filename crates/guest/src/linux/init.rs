@@ -81,7 +81,9 @@ fn boot(life_out: &mut Option<Lifecycle>) -> Result<std::convert::Infallible, In
     let life = life_out.as_mut().expect("just set");
     match start {
         Start::Build => build::run(life),
-        Start::Run { entrypoint, hostname, data, ca_pem, net } => run(life, entrypoint, &hostname, data, ca_pem, net),
+        Start::Run { entrypoint, hostname, data, data_path, ca_pem, net } => {
+            run(life, entrypoint, &hostname, data.then_some(data_path), ca_pem, net)
+        }
     }
 }
 
@@ -89,7 +91,7 @@ fn run(
     life: &mut Lifecycle,
     entrypoint: Process,
     hostname: &str,
-    data: bool,
+    data: Option<Option<String>>,
     ca_pem: Option<String>,
     net: Option<GuestNet>,
 ) -> Result<std::convert::Infallible, InitError> {
@@ -103,8 +105,8 @@ fn run(
     sys::mkdir_p(mounts::UPPER).map_err(io("mkdir upper"))?;
     sys::mkdir_p(mounts::WORK).map_err(io("mkdir work"))?;
     sys::mount(&mounts::overlay()).map_err(io("mounting the overlay"))?;
-    if data {
-        sys::mount(&mounts::data()).map_err(io("mounting /data"))?;
+    if let Some(path) = data {
+        sys::mount(&mounts::data(path.as_deref())).map_err(io("mounting the data disk"))?;
     }
     if let Some(ca) = ca_pem {
         let at = format!("{}/{}", mounts::ROOT, mounts::CA_PATH);

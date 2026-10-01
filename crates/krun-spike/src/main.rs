@@ -6,6 +6,8 @@
 #[cfg(target_os = "linux")]
 mod egress;
 #[cfg(target_os = "linux")]
+mod hermes;
+#[cfg(target_os = "linux")]
 mod image;
 #[cfg(target_os = "linux")]
 mod launch;

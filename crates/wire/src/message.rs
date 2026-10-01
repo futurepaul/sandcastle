@@ -135,8 +135,11 @@ pub enum Start {
     Run {
         entrypoint: Process,
         hostname: String,
-        /// A data disk is attached and mounted at `/data`.
+        /// A data disk is attached and mounted at `data_path`.
         data: bool,
+        /// Where the data disk is mounted (`/data` when not given).
+        #[serde(default)]
+        data_path: Option<String>,
         /// Trusted by the workload, written where images look for it.
         #[serde(default)]
         ca_pem: Option<String>,
@@ -151,8 +154,14 @@ pub enum Start {
 impl Start {
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {
-            Start::Run { entrypoint, hostname, ca_pem, .. } => {
+            Start::Run { entrypoint, hostname, ca_pem, data_path, .. } => {
                 entrypoint.validate()?;
+                if let Some(p) = data_path {
+                    limit("data_path", p.len(), PATH_BYTES_MAX)?;
+                    if !p.starts_with('/') || p == "/" || p.split('/').any(|c| c == ".." || c == ".") || p.contains('\0') {
+                        return Err(Invalid::Bad("data_path"));
+                    }
+                }
                 limit("hostname", hostname.len(), HOSTNAME_BYTES_MAX)?;
                 if hostname.is_empty()
                     || !hostname.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -537,11 +546,16 @@ mod tests {
 
     #[test]
     fn start_hostname() {
-        let run = |h: &str| Start::Run { entrypoint: process(&["/init"]), hostname: h.into(), data: false, ca_pem: None, net: None };
+        let run = |h: &str| Start::Run { entrypoint: process(&["/init"]), hostname: h.into(), data: false, data_path: None, ca_pem: None, net: None };
         run("hermes-1").validate().unwrap();
         assert!(run("").validate().is_err());
         assert!(run("a.b").validate().is_err());
         assert!(run(&"a".repeat(HOSTNAME_BYTES_MAX + 1)).validate().is_err());
+        let with = |p: &str| Start::Run { entrypoint: process(&["/init"]), hostname: "h".into(), data: true, data_path: Some(p.into()), ca_pem: None, net: None };
+        with("/opt/data").validate().unwrap();
+        for bad in ["/", "opt/data", "/opt/../etc", "/opt/./data"] {
+            assert!(with(bad).validate().is_err(), "{bad}");
+        }
     }
 
     // Goal: an error reply never passes its own limit, whatever it carries.

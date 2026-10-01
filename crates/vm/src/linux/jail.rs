@@ -262,6 +262,12 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
     }
     // SAFETY: getuid has no preconditions.
     assert_eq!(unsafe { libc::getuid() }, plan.uid, "the drop holds");
+    // The VM dies with its jailer: a jailer killed outright takes the
+    // runner with it. Set after the drop, which clears it. (From inside the
+    // new PID namespace the parent is outside, so getppid reads 0 and
+    // cannot say whether it is still there.)
+    // SAFETY: prctl with plain values.
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }).map_err(sys("pdeathsig", "/"))?;
     super::seccomp::install().map_err(sys("seccomp", "/"))?;
 
     let mut argv: Vec<CString> = vec![CString::new("sandcastle-vm").expect("no NUL")];

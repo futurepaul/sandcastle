@@ -20,6 +20,7 @@ pub const PATH_BYTES_MAX: usize = 256;
 /// A unix socket's path, without its NUL (`sun_path` is 108 bytes).
 pub const SOCKET_PATH_BYTES_MAX: usize = 107;
 pub const TAP_NAME_BYTES_MAX: usize = 15;
+pub const KERNEL_ARGS_MAX: usize = 8;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +70,10 @@ pub struct VmConfig {
     /// virtio-balloon with free-page reporting: freed guest memory goes
     /// back to the host.
     pub balloon: bool,
+    /// Kernel parameters beyond the runner's own, `key=value` with plain
+    /// characters only (a tuning, never a root or an init).
+    #[serde(default)]
+    pub kernel_args: Vec<String>,
     pub start: Start,
 }
 
@@ -90,6 +95,8 @@ pub enum ConfigError {
     Net(&'static str),
     #[error("start: {0}")]
     Start(String),
+    #[error("kernel_args: at most {KERNEL_ARGS_MAX}, each key=value of plain characters, none naming the root or init")]
+    KernelArg,
 }
 
 /// An absolute path with no `.` or `..`, so what is checked is what is
@@ -160,6 +167,18 @@ impl VmConfig {
                 return Err(ConfigError::Net("mac must be locally administered unicast"));
             }
         }
+        if self.kernel_args.len() > KERNEL_ARGS_MAX {
+            return Err(ConfigError::KernelArg);
+        }
+        for a in &self.kernel_args {
+            let ok = a.len() <= 64
+                && a.split_once('=').is_some_and(|(k, v)| !k.is_empty() && !v.is_empty())
+                && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"._=-".contains(&b))
+                && !["root=", "init=", "rootfstype=", "ro", "rw"].iter().any(|p| a.starts_with(p));
+            if !ok {
+                return Err(ConfigError::KernelArg);
+            }
+        }
         if let Start::Run { net, .. } = &self.start {
             if net.is_some() != matches!(self.net, Net::Tap { .. }) {
                 return Err(ConfigError::Net("the guest has an address exactly when it has a tap"));
@@ -173,7 +192,12 @@ impl VmConfig {
     /// disk is the kernel's root, read-only, and our init runs from it.
     /// Later arguments win, so these replace libkrun's virtio-fs root.
     pub fn kernel_cmdline(&self) -> String {
-        format!("root={} rootfstype=ext4 ro init=/init", sandcastle_wire::disks::BOOT)
+        let mut c = format!("root={} rootfstype=ext4 ro init=/init", sandcastle_wire::disks::BOOT);
+        for a in &self.kernel_args {
+            c.push(' ');
+            c.push_str(a);
+        }
+        c
     }
 
     pub fn sock(&self, name: &str) -> PathBuf {
@@ -201,10 +225,12 @@ pub(crate) mod tests {
             ],
             net: Net::None,
             balloon: true,
+            kernel_args: vec![],
             start: Start::Run {
                 entrypoint: Process { argv: vec!["/bin/sh".into()], ..Process::default() },
                 hostname: "t1".into(),
                 data: false,
+                data_path: None,
                 ca_pem: None,
                 net: None,
             },
@@ -237,6 +263,11 @@ pub(crate) mod tests {
         assert_eq!(c(&|c| c.run_dir = "/run/../etc".into()), Err(ConfigError::Path("run_dir")));
         assert_eq!(c(&|c| c.run_dir = "relative".into()), Err(ConfigError::Path("run_dir")));
         assert_eq!(c(&|c| c.run_dir = format!("/{}", "a".repeat(100)).into()), Err(ConfigError::SocketPath));
+        c(&|c| c.kernel_args = vec!["page_reporting.page_reporting_order=0".into()]).unwrap();
+        for bad in ["init=/bin/sh", "root=/dev/vdb", "a b=c", "noequals", "x=$(y)"] {
+            assert_eq!(c(&|c| c.kernel_args = vec![bad.into()]), Err(ConfigError::KernelArg), "{bad}");
+        }
+        assert_eq!(c(&|c| c.kernel_args = vec!["a=b".into(); KERNEL_ARGS_MAX + 1]), Err(ConfigError::KernelArg));
     }
 
     // Goal: the disks' order is the guest's, and shared disks stay

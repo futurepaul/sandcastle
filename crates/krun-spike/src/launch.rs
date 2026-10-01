@@ -159,7 +159,9 @@ pub fn start(layout: &Layout, spec: Spec) -> Result<Running, Error> {
         run_dir: run_dir.clone(),
         disks,
         net: spec.net,
-        balloon: true,
+        // The control for acceptance 6 runs without it.
+        balloon: std::env::var("KRUN_SPIKE_BALLOON").map(|v| v != "0").unwrap_or(true),
+        kernel_args: std::env::var("KRUN_SPIKE_KERNEL_ARGS").map(|v| v.split_whitespace().map(str::to_string).collect()).unwrap_or_default(),
         start: spec.start,
     };
     config.validate().map_err(|e| Error::msg(format!("{}: {e}", spec.id)))?;

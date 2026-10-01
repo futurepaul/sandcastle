@@ -92,20 +92,40 @@ async fn stand_in(listener: tokio::net::UnixListener) {
     }
 }
 
-struct World {
-    rt: tokio::runtime::Runtime,
-    ca: Arc<Ca>,
-    handler: std::path::PathBuf,
-    node: Vec<IpAddr>,
+pub struct World {
+    pub rt: tokio::runtime::Runtime,
+    pub ca: Arc<Ca>,
+    pub handler: std::path::PathBuf,
+    pub node: Vec<IpAddr>,
 }
 
-fn policy(internet: bool) -> Policy {
+impl World {
+    /// A CA, the stand-in handler on a unix socket, and the runtime both
+    /// run on.
+    pub fn new(layout: &Layout) -> Result<World, Error> {
+        std::fs::create_dir_all(layout.tmp()).map_err(Error::io("tmp"))?;
+        let handler = layout.tmp().join("handler.sock");
+        let _ = std::fs::remove_file(&handler);
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(Error::io("a runtime"))?;
+        let listener = {
+            let _guard = rt.enter();
+            tokio::net::UnixListener::bind(&handler).map_err(Error::io("the stand-in's socket"))?
+        };
+        rt.spawn(stand_in(listener));
+        let ca = Arc::new(Ca::generate("sandcastle spike CA").map_err(|e| Error::msg(e.to_string()))?);
+        Ok(World { rt, ca, handler, node: node_addrs() })
+    }
+}
+
+pub fn policy(internet: bool) -> Policy {
     Policy {
         internet,
         allow: vec![],
         deny: vec![],
         intercept: vec![
             Intercept { host: MODEL_HOST.into(), action: Action::Handler },
+            Intercept { host: "openrouter.ai".into(), action: Action::Handler },
+            Intercept { host: "*.openrouter.ai".into(), action: Action::Handler },
             Intercept {
                 host: SUBSTITUTED_HOST.into(),
                 action: Action::Substitute { placeholders: vec![Placeholder { placeholder: PLACEHOLDER.into(), value: TEST_VALUE.into() }] },
@@ -114,8 +134,22 @@ fn policy(internet: bool) -> Policy {
     }
 }
 
-fn vm(layout: &Layout, w: &World, img: &Image, id: &str, internet: bool, jail: Jail, slot: u32) -> Result<(Running, Arc<Egress>), Error> {
-    let rules = policy(internet).compile(&w.node).map_err(|e| Error::msg(e.to_string()))?;
+/// What a networked VM runs, beyond its image's defaults.
+pub struct NetVm<'a> {
+    pub id: &'a str,
+    pub internet: bool,
+    pub jail: Jail,
+    pub slot: u32,
+    pub vcpus: u8,
+    pub memory_mib: u32,
+    pub argv: Vec<String>,
+    pub env: Vec<String>,
+    /// The data disk and where the guest mounts it.
+    pub data: Option<(std::path::PathBuf, String)>,
+}
+
+pub fn net_vm(layout: &Layout, w: &World, img: &Image, v: NetVm<'_>) -> Result<(Running, Arc<Egress>), Error> {
+    let rules = policy(v.internet).compile(&w.node).map_err(|e| Error::msg(e.to_string()))?;
     let egress = Arc::new(Egress::new(rules, w.ca.clone(), w.handler.clone()));
     let (eg, handle) = (egress.clone(), w.rt.handle().clone());
     let before = Box::new(move |run_dir: &Path| -> Result<(), Error> {
@@ -129,8 +163,9 @@ fn vm(layout: &Layout, w: &World, img: &Image, id: &str, internet: bool, jail: J
         handle.spawn(eg.serve(listener));
         Ok(())
     });
-    let mut start = crate::scenarios::run_start(img, id, &["/bin/sh", "-c", "while :; do sleep 3600; done"], false);
-    if let Start::Run { ca_pem, net, .. } = &mut start {
+    let argv: Vec<&str> = v.argv.iter().map(String::as_str).collect();
+    let mut start = crate::scenarios::run_start(img, v.id, &argv, v.data.is_some());
+    if let Start::Run { ca_pem, net, entrypoint, data_path, .. } = &mut start {
         *ca_pem = Some(w.ca.cert_pem().to_string());
         *net = Some(GuestNet {
             address: format!("{GUEST_ADDR}/{PREFIX}"),
@@ -138,26 +173,33 @@ fn vm(layout: &Layout, w: &World, img: &Image, id: &str, internet: bool, jail: J
             dns: GATEWAY_ADDR.to_string(),
             mtu: MTU,
         });
+        entrypoint.env.extend(v.env);
+        *data_path = v.data.as_ref().map(|(_, p)| p.clone());
     }
     let running = launch::start(
         layout,
         Spec {
-            id: id.into(),
-            vcpus: 1,
-            memory_mib: 512,
+            id: v.id.into(),
+            vcpus: v.vcpus,
+            memory_mib: v.memory_mib,
             image: Some(img.root.clone()),
             target: None,
-            scratch_bytes: Some(1 << 30),
-            data: None,
-            net: Net::Tap { name: "tap0".into(), mac: [0x02, 0x53, 0x43, 0, 0, slot as u8 + 1] },
+            scratch_bytes: Some(16 << 30),
+            data: v.data.map(|(d, _)| d),
+            net: Net::Tap { name: "tap0".into(), mac: [0x02, 0x53, 0x43, 0, 0, v.slot as u8 + 1] },
             start,
-            jail,
-            slot,
+            jail: v.jail,
+            slot: v.slot,
             probe: None,
             before: Some(before),
         },
     )?;
     Ok((running, egress))
+}
+
+fn vm(layout: &Layout, w: &World, img: &Image, id: &str, internet: bool, jail: Jail, slot: u32) -> Result<(Running, Arc<Egress>), Error> {
+    let argv = ["/bin/sh", "-c", "while :; do sleep 3600; done"].iter().map(|s| s.to_string()).collect();
+    net_vm(layout, w, img, NetVm { id, internet, jail, slot, vcpus: 1, memory_mib: 512, argv, env: vec![], data: None })
 }
 
 fn sh(vm: &Running, script: &str) -> Result<(String, Option<i32>), Error> {
@@ -172,16 +214,7 @@ fn sh(vm: &Running, script: &str) -> Result<(String, Option<i32>), Error> {
 
 pub fn scenario(layout: &Layout, jail: Jail) -> Result<Value, Error> {
     let (img, _) = image::ensure(layout, CURL, jail)?;
-    std::fs::create_dir_all(layout.tmp()).map_err(Error::io("tmp"))?;
-    let handler = layout.tmp().join("handler.sock");
-    let _ = std::fs::remove_file(&handler);
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(Error::io("a runtime"))?;
-    let listener = {
-        let _guard = rt.enter();
-        tokio::net::UnixListener::bind(&handler).map_err(Error::io("the stand-in's socket"))?
-    };
-    rt.spawn(stand_in(listener));
-    let w = World { rt, ca: Arc::new(Ca::generate("sandcastle spike CA").map_err(|e| Error::msg(e.to_string()))?), handler, node: node_addrs() };
+    let w = World::new(layout)?;
 
     // The internet on: intercepted, substituted, spliced, and refused.
     let (mut on, on_egress) = vm(layout, &w, &img, "egress-on", true, jail, 0)?;

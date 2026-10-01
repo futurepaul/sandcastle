@@ -82,9 +82,11 @@ pub fn overlay() -> Mount {
     m("overlay", ROOT, "overlay", Flags::default(), Some(&data))
 }
 
-/// `/data`, on the computer's own disk, over the root.
-pub fn data() -> Mount {
-    m(disks::DATA, &format!("{ROOT}/data"), "ext4", Flags { nodev: true, ..Flags::default() }, None)
+/// The computer's own disk, over the root at `path` (`/data` by default).
+pub fn data(path: Option<&str>) -> Mount {
+    let path = path.unwrap_or("/data");
+    assert!(path.starts_with('/') && path != "/", "validated by the wire");
+    m(disks::DATA, &format!("{ROOT}{path}"), "ext4", Flags { nodev: true, ..Flags::default() }, None)
 }
 
 pub fn build_target() -> Mount {
@@ -131,7 +133,8 @@ mod tests {
         for m in workload() {
             assert!(m.target.starts_with(ROOT));
         }
-        assert!(data().target.starts_with(ROOT));
+        assert!(data(None).target.starts_with(ROOT) && data(None).target.ends_with("/data"));
+        assert_eq!(data(Some("/opt/data")).target, format!("{ROOT}/opt/data"));
         assert!(basics().iter().any(|m| m.target == "/dev" && m.may_exist));
     }
 }

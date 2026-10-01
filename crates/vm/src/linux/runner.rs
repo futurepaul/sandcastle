@@ -226,9 +226,11 @@ fn serve_control(listener: UnixListener, lifecycle: &Mutex<Lifecycle>, events: &
             Ok(ControlRequest::Resume) => resume(lifecycle, events, krun, handle),
             Ok(ControlRequest::Kill) => {
                 events.emit(json!({"event": "killed"}));
-                // SAFETY: kill(2) on our own process.
-                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
-                unreachable!("SIGKILL is not caught");
+                // The runner is its PID namespace's PID 1, which ignores a
+                // SIGKILL it sends itself; _exit ends it at once, as a
+                // crash would (no destructor, no flush of the guest's).
+                // SAFETY: _exit(2) has no preconditions.
+                unsafe { libc::_exit(137) };
             }
             Ok(ControlRequest::Status) => {
                 let state = lifecycle.lock().expect("lock").state();
