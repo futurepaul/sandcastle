@@ -45,6 +45,8 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                 "fresh-root" => fresh_root(&node)?,
                 "exec" => exec(&node, n)?,
                 "port" => port(&node, n)?,
+                "port-nic" => crate::ports::scenario(layout, &node)?,
+                "dmesg" => dmesg(&node)?,
                 "egress" => crate::egress::scenario(layout, &node)?,
                 "hermes" => crate::hermes::scenario(&node, n)?,
                 "hermes-memory" => crate::hermes::memory_scenario(&node)?,
@@ -111,6 +113,7 @@ fn boot(node: &Node, n: usize) -> Result<Value, Error> {
             "jail_nft": timing_stats(&timings, "jailNftUs"),
             "vmm_built": timing_stats(&timings, "vmmBuiltUs"),
             "guest_hello": timing_stats(&timings, "guestHelloUs"),
+            "guest_kernel_uptime_at_hello": timing_stats(&timings, "guestUptimeUs"),
             "ready": timing_stats(&timings, "readyUs"),
         },
         "first_ping_ms": stats(&ping),
@@ -364,6 +367,17 @@ fn port(node: &Node, n: usize) -> Result<Value, Error> {
 
 /// What of the spike is alive on the node: processes of a VM uid, the
 /// engine's containers, the spike's units.
+/// A diagnostic: the guest kernel's log of one boot, with the engine's
+/// account of the start (for profiling the boot; run with the kernel args
+/// it needs, such as `initcall_debug=1`, in the engine's config).
+fn dmesg(node: &Node) -> Result<Value, Error> {
+    let c = node.start("dmesg", &start(BUSYBOX, SLEEP_FOREVER))?;
+    let (log, _) = c.sh("dmesg")?;
+    let timings = c.timings.clone();
+    c.destroy(None)?;
+    Ok(json!({"timings": timings, "dmesg": log}))
+}
+
 pub fn census(layout: &Layout) -> Result<Value, Error> {
     let ps = std::process::Command::new("ps").args(["-eo", "uid=,pid=,comm="]).output().map_err(Error::io("ps"))?;
     let vm_procs: Vec<String> = String::from_utf8_lossy(&ps.stdout)
@@ -387,7 +401,7 @@ pub fn census(layout: &Layout) -> Result<Value, Error> {
 /// cleared (`sandcastle-engine reset`, as root), the engine and the spike's
 /// scopes stopped; with `--all`, every cache too.
 fn reset(layout: &Layout, all: bool) -> Result<Value, Error> {
-    let cg = "/sys/fs/cgroup/krun.slice/krun-spike.slice/krun-engine.service";
+    let cg = crate::node::ENGINE_CGROUP;
     let mut engine_reset = std::process::Command::new("sudo");
     engine_reset.arg("-n").arg(layout.bin("sandcastle-engine")).args(["reset", "--config"]).arg(layout.engine_config()).args(["--cgroup", cg]);
     if all {

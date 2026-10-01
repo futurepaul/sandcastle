@@ -77,6 +77,9 @@ pub struct Timings {
     pub jail_nft_us: u64,
     pub vmm_built_us: u64,
     pub guest_hello_us: u64,
+    /// The guest kernel's uptime at its init's hello: the kernel's boot,
+    /// apart from the VMM's.
+    pub guest_uptime_us: u64,
     pub ready_us: u64,
 }
 
@@ -94,6 +97,9 @@ pub struct Vm {
     destroy: Mutex<Option<Option<String>>>,
     egress: Arc<Egress>,
     path_env: Option<String>,
+    /// The VM process's network namespace, opened on its first port
+    /// connection.
+    netns: Mutex<Option<Arc<std::os::fd::OwnedFd>>>,
 }
 
 impl Vm {
@@ -155,6 +161,7 @@ pub struct Engine {
     boot_disk: PathBuf,
     inner: Mutex<Inner>,
     builds: tokio::sync::Mutex<()>,
+    sockets: super::ports::NetnsSockets,
 }
 
 /// A spawned jailer and the runner's event lines.
@@ -259,6 +266,7 @@ impl Engine {
             node_addrs,
             boot_disk,
             builds: tokio::sync::Mutex::new(()),
+            sockets: super::ports::NetnsSockets::start().map_err(internal("the sockets thread"))?,
         };
         engine.sweep_snapshots();
         Ok(engine)
@@ -276,6 +284,39 @@ impl Engine {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("no container {name} is running")))
+    }
+
+    /// `getTcpPort(port)`'s connection over the VM's NIC (`crate::ports`).
+    pub async fn connect_port(&self, name: &str, port: u16) -> Result<std::net::TcpStream, (crate::ports::PortFailure, String)> {
+        use crate::ports::PortFailure;
+        let vm = self.get(name).map_err(|e| (PortFailure::NotFound, e.to_string()))?;
+        if !*vm.ready.borrow() {
+            return Err((PortFailure::NotFound, format!("{name} is not ready")));
+        }
+        let netns = self.netns_of(&vm).map_err(|e| (PortFailure::Internal, format!("{name}'s network namespace: {e}")))?;
+        super::ports::connect(&self.sockets, netns, port).await
+    }
+
+    /// The VM process's network namespace: its cgroup's process running as
+    /// the VM's uid (the jailer is root, in the node's namespace).
+    fn netns_of(&self, vm: &Vm) -> std::io::Result<Arc<std::os::fd::OwnedFd>> {
+        let mut cached = vm.netns.lock().expect("never poisoned");
+        if let Some(ns) = cached.as_ref() {
+            return Ok(ns.clone());
+        }
+        let uid = self.config.uid_base + vm.slot;
+        let pid = self
+            .cgroups
+            .procs(vm.slot)
+            .into_iter()
+            .find(|p| {
+                let status = std::fs::read_to_string(format!("/proc/{p}/status")).unwrap_or_default();
+                status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|u| u.split_whitespace().next()?.parse::<u32>().ok()) == Some(uid)
+            })
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no VM process in its cgroup"))?;
+        let ns = Arc::new(std::os::fd::OwnedFd::from(std::fs::File::open(format!("/proc/{pid}/ns/net"))?));
+        *cached = Some(ns.clone());
+        Ok(ns)
     }
 
     pub fn health(&self) -> Value {
@@ -837,6 +878,7 @@ impl Engine {
             destroy: Mutex::new(None),
             egress,
             path_env,
+            netns: Mutex::new(None),
         });
         self.inner.lock().expect("never poisoned").vms.insert(name.into(), vm.clone());
         let engine = self.clone();
@@ -860,7 +902,11 @@ impl Engine {
                     t.jail_nft_us = v["nft_us"].as_u64().unwrap_or(0);
                 }
                 Some("launched") => vm.timings.lock().expect("never poisoned").vmm_built_us = at,
-                Some("hello") => vm.timings.lock().expect("never poisoned").guest_hello_us = at,
+                Some("hello") => {
+                    let mut t = vm.timings.lock().expect("never poisoned");
+                    t.guest_hello_us = at;
+                    t.guest_uptime_us = v["guest_uptime_ms"].as_u64().unwrap_or(0) * 1000;
+                }
                 Some("ready") => {
                     vm.timings.lock().expect("never poisoned").ready_us = at;
                     *vm.phase.lock().expect("never poisoned") = Phase::Running;
@@ -1002,6 +1048,7 @@ impl Engine {
             destroy: Mutex::new(None),
             egress,
             path_env: env.get("PATH").cloned(),
+            netns: Mutex::new(None),
         });
         self.inner.lock().expect("never poisoned").vms.insert(rec.name.clone(), vm.clone());
         let engine = self.clone();

@@ -12,7 +12,11 @@ use crate::api::Resources;
 use crate::config::{PIDS_PER_VM_MAX, VMM_OVERHEAD_MIB};
 
 const ROOT: &str = "/sys/fs/cgroup";
-/// cpu.max's period, in microseconds.
+/// cpu.max's period, in microseconds: long, so a mostly idle VM's request
+/// runs at full speed on its period's quota (and the burst it saved). A
+/// 20 ms period, measured, spread every `lite` request out to sixteen
+/// times its CPU time (a 2.6 ms handler call took 60 ms), where 100 ms
+/// leaves most at 2.6 ms and stalls the rest one period.
 const PERIOD_US: u64 = 100_000;
 
 pub struct Subtree {
@@ -70,9 +74,12 @@ impl Subtree {
         Ok(cg)
     }
 
-    /// The instance's CPU share, once the VM is ready.
+    /// The instance's CPU share, once the VM is ready, and a burst of one
+    /// period's quota saved while idle (the kernel's ceiling for it).
     pub fn throttle(&self, slot: u32, r: &Resources) -> io::Result<()> {
-        write(&self.vm(slot).join("cpu.max"), &cpu_max(r.cpu_milli))
+        let cg = self.vm(slot);
+        write(&cg.join("cpu.max"), &cpu_max(r.cpu_milli))?;
+        write(&cg.join("cpu.max.burst"), &quota_us(r.cpu_milli).to_string())
     }
 
     /// Kills whatever is left in the VM's cgroup and removes it.
@@ -101,6 +108,11 @@ impl Subtree {
     }
 
     /// Every VM cgroup present, by slot (an engine restarting finds them).
+    /// The processes in a VM's cgroup.
+    pub fn procs(&self, slot: u32) -> Vec<u32> {
+        std::fs::read_to_string(self.vm(slot).join("cgroup.procs")).map(|s| s.lines().filter_map(|l| l.parse().ok()).collect()).unwrap_or_default()
+    }
+
     pub fn slots(&self) -> Vec<u32> {
         let Ok(d) = std::fs::read_dir(&self.root) else { return vec![] };
         d.flatten()
@@ -109,17 +121,22 @@ impl Subtree {
     }
 }
 
+/// A period's quota for a share of CPU in thousandths, at least the
+/// kernel's 1 ms.
+fn quota_us(cpu_milli: u32) -> u64 {
+    (cpu_milli as u64 * PERIOD_US / 1000).max(1000)
+}
+
 /// `cpu.max` for a share of CPU in thousandths.
 pub fn cpu_max(cpu_milli: u32) -> String {
-    let quota = (cpu_milli as u64 * PERIOD_US / 1000).max(1000);
-    format!("{quota} {PERIOD_US}")
+    format!("{} {PERIOD_US}", quota_us(cpu_milli))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn cpu_shares() {
-        assert_eq!(super::cpu_max(63), "6300 100000");
+        assert_eq!(super::cpu_max(63), "6300 100000", "lite: 1/16 vCPU");
         assert_eq!(super::cpu_max(2000), "200000 100000");
         assert_eq!(super::cpu_max(1), "1000 100000", "a floor the kernel accepts");
     }

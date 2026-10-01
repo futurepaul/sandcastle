@@ -274,9 +274,11 @@ fn lifecycle_session(
                     return Ok(());
                 }
                 events.emit(json!({"event": "exited", "code": code, "signal": signal}));
+                let _ = write_message(&mut writer, &sandcastle_wire::Recorded {});
             }
             GuestEvent::Failed { message } => {
                 events.emit(json!({"event": "guest_failed", "message": message}));
+                let _ = write_message(&mut writer, &sandcastle_wire::Recorded {});
             }
         }
     }

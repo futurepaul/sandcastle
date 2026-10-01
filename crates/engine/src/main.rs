@@ -66,10 +66,21 @@ fn serve(config: sandcastle_engine::EngineConfig) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let ports_sock = engine.config().ports_socket();
+        let _ = std::fs::remove_file(&ports_sock);
+        let ports = match tokio::net::UnixListener::bind(&ports_sock) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("sandcastle-engine: {}: {e}", ports_sock.display());
+                return ExitCode::FAILURE;
+            }
+        };
         let c = engine.config();
-        let _ = std::os::unix::fs::chown(&sock, Some(c.client_uid), Some(c.client_gid));
-        let _ = std::fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o600));
-        eprintln!("sandcastle-engine: serving on {}", sock.display());
+        for s in [&sock, &ports_sock] {
+            let _ = std::os::unix::fs::chown(s, Some(c.client_uid), Some(c.client_gid));
+            let _ = std::fs::set_permissions(s, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        }
+        eprintln!("sandcastle-engine: serving on {} and {}", sock.display(), ports_sock.display());
         let sweeper = engine.clone();
         tokio::spawn(async move {
             // Unbounded by design: hourly, for the engine's life.
@@ -81,6 +92,7 @@ fn serve(config: sandcastle_engine::EngineConfig) -> ExitCode {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a signal handler");
         tokio::select! {
             _ = sandcastle_engine::linux::server::serve(engine.clone(), listener) => {}
+            _ = sandcastle_engine::linux::ports::serve(engine.clone(), ports) => {}
             _ = term.recv() => {
                 eprintln!("sandcastle-engine: stopping; its VMs keep running");
             }

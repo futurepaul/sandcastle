@@ -50,7 +50,20 @@ impl Lifecycle {
         let mut r = FrameReader::new(&self.stream);
         Ok(r.read_message()?)
     }
+
+    /// Waits, bounded, for the runner to record the last event sent, so
+    /// powering off cannot lose it.
+    fn await_recorded(&mut self) {
+        // The log writer's clone made the shared descriptor non-blocking.
+        let _ = self.stream.set_nonblocking(false);
+        let _ = self.stream.set_read_timeout(Some(std::time::Duration::from_millis(RECORDED_WAIT_MS)));
+        let mut r = FrameReader::new(&self.stream);
+        let _: Result<sandcastle_wire::Recorded, _> = r.read_message();
+    }
 }
+
+/// The longest the guest waits for its last event to be recorded.
+const RECORDED_WAIT_MS: u64 = 2000;
 
 pub fn main() -> ! {
     if std::process::id() != 1 {
@@ -64,7 +77,9 @@ pub fn main() -> ! {
     };
     eprintln!("sandcastle-guest: {e}");
     if let Some(l) = life.as_mut() {
-        let _ = l.send(&Event::Failed { message: e.to_string().chars().take(1000).collect() });
+        if l.send(&Event::Failed { message: e.to_string().chars().take(1000).collect() }).is_ok() {
+            l.await_recorded();
+        }
     }
     sys::poweroff()
 }
@@ -165,6 +180,7 @@ fn run(
     if let Err(e) = result {
         let _ = life.send(&Event::Failed { message: e.to_string().chars().take(1000).collect() });
     }
+    life.await_recorded();
     sys::poweroff()
 }
 

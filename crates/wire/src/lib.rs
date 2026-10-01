@@ -30,7 +30,7 @@ pub const CID_HOST: u32 = 2;
 /// The guest's own address on vsock.
 pub const CID_GUEST: u32 = 3;
 /// Bumped on any change a peer must agree on; a mismatch is refused.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The guest's disks, by the order the runner attaches them (the runner
 /// refuses any other order, so both sides agree without asking).

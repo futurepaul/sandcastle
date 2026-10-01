@@ -14,11 +14,12 @@ use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
 use sandcastle_egress::{Action, Intercept, Placeholder};
+use sandcastle_engine::api::Instance;
 use sandcastle_engine::StartRequest;
 use serde_json::{json, Value};
 
 use crate::layout::Layout;
-use crate::node::{start, Node};
+use crate::node::{start, Ctr, Node};
 use crate::{stats, Error};
 
 pub const CURL: &str = "curlimages/curl:8.22.0";
@@ -106,14 +107,20 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let (spliced, _) = on.sh("curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com/")?;
     let (private, _) = on.sh("curl -sS -m 5 http://10.0.0.1/; echo rc=$?; curl -sS -m 5 http://169.254.169.254/latest/meta-data/; echo rc=$?")?;
     let (node_refused, _) = on.sh("curl -sS -m 5 http://206.223.228.129:22/; echo rc=$?; curl -sS -m 5 http://206.223.228.129:443/; echo rc=$?")?;
-    let mut handler_ms = vec![];
-    for _ in 0..5 {
-        let (t, _) = on.sh(&format!("{curl} -o /dev/null -w '%{{time_total}}' https://{MODEL_HOST}/v1/models"))?;
-        if let Ok(s) = t.trim().parse::<f64>() {
-            handler_ms.push(s * 1000.0);
-        }
-    }
+    // The handler's round trip on `lite` (Cloudflare's default, 1/16 vCPU:
+    // a TLS handshake can spend its 6.25 ms a period and wait out the
+    // rest, which `cpu.stat` shows), and on `standard-1` (1/2 vCPU), where
+    // the path alone is timed.
+    let (periods, usec) = on.throttled();
+    let lite_ms = time_handler(&on, &curl)?;
+    let (periods_after, usec_after) = on.throttled();
     on.destroy(None)?;
+    let mut s1 = curl_start(true, &stand_in.handler());
+    s1.instance = Some(Instance::Named("standard-1".into()));
+    let bigger = node.start("egress-standard-1", &s1)?;
+    let standard_ms = time_handler(&bigger, &curl)?;
+    let (periods_s1, _) = bigger.throttled();
+    bigger.destroy(None)?;
 
     // The internet off: only intercepted names resolve.
     let off = node.start("egress-off", &curl_start(false, &stand_in.handler()))?;
@@ -138,7 +145,12 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     Ok(json!({
         "pass": pass,
         "checks": checks,
-        "handler_request_ms_in_guest": if handler_ms.is_empty() { Value::Null } else { stats(&handler_ms) },
+        "handler_request_ms_in_guest": {
+            "lite": stats(&lite_ms),
+            "lite_throttled": {"periods": periods_after - periods, "ms": (usec_after - usec) / 1000},
+            "standard_1": stats(&standard_ms),
+            "standard_1_throttled_periods": periods_s1,
+        },
         "handled": handled.trim(),
         "substituted": substituted.chars().take(600).collect::<String>(),
         "private": private,
@@ -147,4 +159,14 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
         "off_lookup_model": lookup_model,
         "off_direct_ip": direct_ip,
     }))
+}
+
+/// Five requests to the handler from inside, curl's own clock.
+fn time_handler(c: &Ctr<'_>, curl: &str) -> Result<Vec<f64>, Error> {
+    let mut ms = vec![];
+    for _ in 0..5 {
+        let (t, _) = c.sh(&format!("{curl} -o /dev/null -w '%{{time_total}}' https://{MODEL_HOST}/v1/models"))?;
+        ms.push(t.trim().parse::<f64>().map_err(|_| Error::msg(format!("curl's time: {t}")))? * 1000.0);
+    }
+    Ok(ms)
 }

@@ -93,11 +93,19 @@ pub struct Plan {
     pub owned: Vec<PathBuf>,
     /// Symlinks in the jail's root: (link, target).
     pub links: Vec<(PathBuf, PathBuf)>,
-    pub tap: Option<String>,
+    pub tap: Option<TapPlan>,
     /// The VM network namespace's nftables, when it has a tap.
     pub nft: Option<String>,
     /// The configuration the runner reads inside the jail.
     pub inside: VmConfig,
+}
+
+/// The VM's tap, and the guest's MAC behind it (a permanent neighbor, so
+/// the node's connections to the guest never wait on ARP).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TapPlan {
+    pub name: String,
+    pub guest_mac: [u8; 6],
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -209,9 +217,9 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
     mounts.push(Mount { source: "/dev/urandom".into(), target: "/dev/urandom".into(), kind: MountKind::Device, file: true });
     let tap = match &config.net {
         Net::None => None,
-        Net::Tap { name, .. } => {
+        Net::Tap { name, mac } => {
             mounts.push(Mount { source: "/dev/net/tun".into(), target: "/dev/net/tun".into(), kind: MountKind::Device, file: true });
-            Some(name.clone())
+            Some(TapPlan { name: name.clone(), guest_mac: *mac })
         }
     };
     let mut inside_config = config.clone();
@@ -222,7 +230,7 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
     inside_config.seccomp = Some(settings.seccomp);
     inside_config.validate().map_err(|e| JailError::Config(e.to_string()))?;
 
-    let nft = tap.as_deref().map(nft_ruleset);
+    let nft = tap.as_ref().map(|t| nft_ruleset(&t.name));
     let plan = Plan {
         uid,
         gid: uid,
@@ -388,7 +396,7 @@ mod tests {
             *net = Some(sandcastle_wire::GuestNet { address: "10.0.2.15/24".into(), gateway: "10.0.2.2".into(), dns: "10.0.2.2".into(), mtu: 1500 });
         }
         let p = plan(&c, &settings(), 300_002).unwrap();
-        assert_eq!(p.tap.as_deref(), Some("tap0"));
+        assert_eq!(p.tap, Some(TapPlan { name: "tap0".into(), guest_mac: [0x02, 0, 0, 0, 0, 1] }));
         assert!(p.mounts.iter().any(|m| m.target == Path::new("/dev/net/tun")));
         let nft = p.nft.unwrap();
         // Everything the guest sends is redirected, accepted only at the

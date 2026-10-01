@@ -86,9 +86,37 @@ impl Layer {
     }
 }
 
-fn layer_a() -> Vec<u8> {
+/// `bin/busybox` from busybox's own layer, through its hard link if the
+/// layer stores the data under another applet's name.
+fn busybox_binary(layer_gz: &[u8]) -> Vec<u8> {
+    let mut a = tar::Archive::new(flate2::read::GzDecoder::new(layer_gz));
+    let (mut files, mut link) = (std::collections::HashMap::new(), None);
+    for e in a.entries().expect("busybox's layer") {
+        let mut e = e.expect("an entry");
+        let path = e.path().expect("a path").to_string_lossy().trim_start_matches("./").to_string();
+        match e.header().entry_type() {
+            tar::EntryType::Regular if path.starts_with("bin/") => {
+                let mut data = vec![];
+                std::io::Read::read_to_end(&mut e, &mut data).expect("a file");
+                files.insert(path, data);
+            }
+            tar::EntryType::Link if path == "bin/busybox" => {
+                link = e.link_name().expect("a link").map(|l| l.to_string_lossy().trim_start_matches("./").to_string());
+            }
+            _ => {}
+        }
+    }
+    let name = link.unwrap_or_else(|| "bin/busybox".into());
+    files.remove(&name).expect("busybox's binary")
+}
+
+fn layer_a(busybox: &[u8]) -> Vec<u8> {
     let mut l = Layer::new();
     l.dir("fid");
+    // ping's case: a binary whose file capability a non-root user gains.
+    // Named busybox, which picks its applet from argv[1] by that name.
+    l.dir("fid/caps");
+    l.xattr_file("fid/caps/busybox", 0o755, busybox, "security.capability", &CAP_NET_RAW);
     l.file("fid/keep.txt", 0o644, b"v1\n");
     l.file("fid/gone.txt", 0o644, b"x\n");
     l.dir("fid/opq");
@@ -191,7 +219,8 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
         "rootfs": {"type": "layers", "diff_ids": []},
     }))
     .expect("serializes");
-    let (tar, _) = saved(&config, &[base, gzip(&layer_a()), zstd_chunked(&layer_b())], REFERENCE);
+    let busybox = busybox_binary(&base);
+    let (tar, _) = saved(&config, &[base, gzip(&layer_a(&busybox)), zstd_chunked(&layer_b())], REFERENCE);
     let t = Instant::now();
     let loaded = node.block(node.client.load(REFERENCE, tar)).map_err(engine_err)?;
     let load_ms = ms(t, Instant::now());
@@ -202,6 +231,19 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
                   stat -c '%a' /fid/setuid; ls -l /fid/null | awk '{print substr($1,1,1), $5, $6}'; ls -l /fid/fifo | cut -c1; \
                   readlink /fid/sym; cat /fid/hard; cat /fid/newer/deep/file.txt";
     let (seen, _) = c.sh(script)?;
+    // As uid 1234, the capability its file grants: CapEff holds
+    // CAP_NET_RAW (bit 13), as `ping` needs.
+    let p = sandcastle_wire::Process {
+        argv: vec!["/fid/caps/busybox".into(), "cat".into(), "/proc/self/status".into()],
+        env: c.info.path.iter().map(|p| format!("PATH={p}")).collect(),
+        user: Some("1234:1234".into()),
+        ..Default::default()
+    };
+    let out = c.vm.exec(p, None).map_err(crate::node::agent_err)?;
+    let status = String::from_utf8_lossy(&out.stdout).into_owned();
+    let status_err = format!("code {:?}: {}", out.code, String::from_utf8_lossy(&out.stderr).trim());
+    let (bounding, _) = c.sh("grep -E 'Cap|NoNewPrivs' /proc/self/status; mount | grep -E ' / |fid|overlay' | head -5")?;
+    let cap_eff = status.lines().find_map(|l| l.strip_prefix("CapEff:")).map(|v| v.trim().to_string()).unwrap_or_default();
     c.destroy(None)?;
     let expected = "v2\ngone=1\nnew.txt\n1234:5678 640\n4755\nc 1, 3\np\nkeep.txt\nv1\ndeep\n";
     let ea = |path: &str| -> String {
@@ -216,6 +258,7 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
         "layers_as_docker": seen == expected,
         "file_capability": cap.contains("security.capability") && cap.contains("(20)"),
         "user_xattr": user.contains("user.test") && user.contains("hello"),
+        "file_capability_granted_to_non_root": cap_eff == "0000000000002000",
         "loaded_as_reference": loaded["reference"] == REFERENCE,
     });
     let pass = checks.as_object().expect("an object").values().all(|v| v == true);
@@ -225,6 +268,9 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
         "seen": seen,
         "expected": expected,
         "xattrs": {"cap_file": cap.trim(), "user_xattr": user.trim()},
+        "non_root_cap_eff": cap_eff,
+        "non_root_exec": status_err,
+        "exec_caps_and_mounts": bounding,
         "load_and_build_ms": (load_ms * 10.0).round() / 10.0,
         "layers": ["busybox (gzip, from the registry)", "made here (gzip)", "made here (zstd, two frames and a skippable frame)"],
     }))

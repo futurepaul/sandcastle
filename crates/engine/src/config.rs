@@ -87,6 +87,10 @@ impl EngineConfig {
     pub fn socket(&self) -> PathBuf {
         self.state_dir.join("engine.sock")
     }
+    /// Guest ports' connections, handed over as sockets (`ports`).
+    pub fn ports_socket(&self) -> PathBuf {
+        self.state_dir.join("ports.sock")
+    }
     pub fn vms(&self) -> PathBuf {
         self.state_dir.join("vms")
     }

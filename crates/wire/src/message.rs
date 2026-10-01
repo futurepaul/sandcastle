@@ -192,6 +192,19 @@ pub enum Event {
     Failed { message: String },
 }
 
+/// The runner's answer to the guest's last event (`Exited` or `Failed`):
+/// written down, so the guest may power off. A guest that powered off at
+/// once could take its last event down with the VM (libkrun ends the
+/// process on the guest's reboot, racing the runner's read).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {}
+
+impl Validate for Recorded {
+    fn check(&self) -> Result<(), Invalid> {
+        Ok(())
+    }
+}
+
 impl Event {
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {

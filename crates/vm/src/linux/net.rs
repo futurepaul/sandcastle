@@ -87,6 +87,34 @@ pub fn set_address(name: &str, addr: [u8; 4], prefix: u8) -> io::Result<()> {
     Ok(())
 }
 
+// <net/if_arp.h>: a complete, permanent entry.
+const ATF_COM: libc::c_int = 0x02;
+const ATF_PERM: libc::c_int = 0x04;
+
+/// A permanent neighbor on `name`: `addr` is at `mac`. The node's
+/// connections to the guest then never wait on ARP, nor lose a request
+/// sent before libkrun attaches the tap (it does so lazily).
+pub fn set_neighbor(name: &str, addr: [u8; 4], mac: [u8; 6]) -> io::Result<()> {
+    let ifr = ifreq(name)?;
+    let sock = inet_socket()?;
+    // SAFETY: arpreq is plain data; all zeroes is a valid value.
+    let mut req: libc::arpreq = unsafe { std::mem::zeroed() };
+    // SAFETY: a sockaddr_in fits in a sockaddr; SIOCSARP reads it as one.
+    unsafe {
+        let pa = &mut req.arp_pa as *mut libc::sockaddr as *mut libc::sockaddr_in;
+        (*pa).sin_family = libc::AF_INET as libc::sa_family_t;
+        (*pa).sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(addr) };
+    }
+    req.arp_ha.sa_family = libc::ARPHRD_ETHER;
+    for (i, b) in mac.iter().enumerate() {
+        req.arp_ha.sa_data[i] = *b as libc::c_char;
+    }
+    req.arp_flags = ATF_COM | ATF_PERM;
+    req.arp_dev = ifr.ifr_name;
+    // SAFETY: SIOCSARP reads `req`.
+    check(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSARP, &req) })
+}
+
 /// Creates a persistent tap named `name`, owned by `uid` and `gid`, so the
 /// VM process opens it after the drop with no capability.
 pub fn make_tap(name: &str, uid: u32, gid: u32) -> io::Result<()> {

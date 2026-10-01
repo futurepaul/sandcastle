@@ -20,6 +20,8 @@ mod node;
 #[cfg(target_os = "linux")]
 mod parity;
 #[cfg(target_os = "linux")]
+mod ports;
+#[cfg(target_os = "linux")]
 mod scenarios;
 
 use std::process::ExitCode;

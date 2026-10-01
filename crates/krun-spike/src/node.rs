@@ -74,6 +74,10 @@ impl Node {
     }
 }
 
+/// The engine's cgroup (`krun.slice/krun-spike.slice` as systemd nests
+/// it), its VMs' cgroups `vm-<slot>` beneath.
+pub const ENGINE_CGROUP: &str = "/sys/fs/cgroup/krun.slice/krun-spike.slice/krun-engine.service";
+
 /// A running container.
 pub struct Ctr<'a> {
     pub name: String,
@@ -117,6 +121,14 @@ impl Ctr<'_> {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         Ok((text, out.code))
+    }
+
+    /// `cpu.stat`'s throttling: periods throttled, and for how long (µs).
+    pub fn throttled(&self) -> (u64, u64) {
+        let slot = self.run_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let stat = std::fs::read_to_string(format!("{ENGINE_CGROUP}/vm-{slot}/cpu.stat")).unwrap_or_default();
+        let field = |name: &str| stat.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        (field("nr_throttled "), field("throttled_usec "))
     }
 
     pub fn memory_mib(&self) -> Option<u64> {

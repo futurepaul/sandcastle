@@ -55,4 +55,7 @@ impl Layout {
     pub fn engine_socket(&self) -> PathBuf {
         self.engine_state().join("engine.sock")
     }
+    pub fn ports_socket(&self) -> PathBuf {
+        self.engine_state().join("ports.sock")
+    }
 }

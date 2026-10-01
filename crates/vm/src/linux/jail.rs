@@ -6,6 +6,7 @@
 //! wait, then hands the VM's files back to the node's user.
 
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -57,12 +58,12 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, cgroup: Option<&Pa
     if unsafe { libc::geteuid() } != 0 {
         return Err(JailerError::NotRoot);
     }
-    // Into the VM's cgroup before the fork, so the VM is born in it.
-    if let Some(cg) = cgroup {
-        let procs = cg.join("cgroup.procs");
-        std::fs::write(&procs, std::process::id().to_string()).map_err(sys("joining the cgroup", &procs))?;
-    }
     let t0 = std::time::Instant::now();
+    // The VM's cgroup, which its process is born in (`fork_into`).
+    let cgroup = match cgroup {
+        Some(cg) => Some(std::fs::File::open(cg).map(OwnedFd::from).map_err(sys("opening the cgroup", cg))?),
+        None => None,
+    };
     let config = read_config(config_path)?;
     let plan = jail::plan(&config, settings, uid)?;
     for p in &plan.owned {
@@ -91,11 +92,7 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, cgroup: Option<&Pa
     };
     // SAFETY: unshare with a namespace flag; this process is single-threaded.
     check(unsafe { libc::unshare(libc::CLONE_NEWPID) }).map_err(sys("unshare pid", "/"))?;
-    // SAFETY: single-threaded, so the child may run arbitrary code before exec.
-    let pid = unsafe { libc::fork() };
-    if pid == -1 {
-        return Err(sys("fork", "/")(std::io::Error::last_os_error()));
-    }
+    let pid = fork_into(cgroup.as_ref()).map_err(sys("fork", "/"))?;
     if pid == 0 {
         // SAFETY: restores the mask the jailer was started with.
         unsafe { libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
@@ -128,6 +125,48 @@ pub fn run(config_path: &Path, settings: &Settings, uid: u32, cgroup: Option<&Pa
     }
     let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
     Ok(code)
+}
+
+/// `fork(2)`, the child born in `cgroup` when one is given. A write to
+/// `cgroup.procs` migrates a process, which waits out an RCU grace period
+/// (13.7 ms of a 14.4 ms jail, measured); `clone3` with
+/// `CLONE_INTO_CGROUP` (Linux 5.7) starts the child there instead. The
+/// jailer itself stays in the engine's cgroup.
+fn fork_into(cgroup: Option<&OwnedFd>) -> std::io::Result<libc::pid_t> {
+    // <linux/sched.h>'s struct clone_args, CLONE_ARGS_SIZE_VER2.
+    #[repr(C)]
+    #[derive(Default)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    let pid = match cgroup {
+        // SAFETY: the jailer is single-threaded, so the child may run any
+        // code before it execs.
+        None => unsafe { libc::fork() as libc::c_long },
+        Some(cg) => {
+            let args = CloneArgs { flags: CLONE_INTO_CGROUP, exit_signal: libc::SIGCHLD as u64, cgroup: cg.as_raw_fd() as u64, ..CloneArgs::default() };
+            // SAFETY: clone3 with no new stack or shared memory is fork(2):
+            // the child runs on a copy of this single-threaded process.
+            // glibc's fork bookkeeping is skipped; only its cached thread id
+            // goes stale, which nothing before the exec reads.
+            unsafe { libc::syscall(libc::SYS_clone3, &args as *const CloneArgs, std::mem::size_of::<CloneArgs>()) }
+        }
+    };
+    if pid == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid as libc::pid_t)
 }
 
 fn chown(p: &Path, uid: u32, gid: u32) -> Result<(), JailerError> {
@@ -169,10 +208,13 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload, 
     mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
     super::net::loopback_up().map_err(sys("bringing up lo", "lo"))?;
     if let Some(tap) = &plan.tap {
-        super::net::make_tap(tap, plan.uid, plan.gid).map_err(sys("creating the tap", tap))?;
+        let name = tap.name.as_str();
+        super::net::make_tap(name, plan.uid, plan.gid).map_err(sys("creating the tap", name))?;
         let gw = sandcastle_wire::egress::GATEWAY_ADDR.octets();
-        super::net::set_address(tap, gw, sandcastle_wire::egress::PREFIX).map_err(sys("addressing the tap", tap))?;
-        super::net::set_up(tap).map_err(sys("bringing up the tap", tap))?;
+        super::net::set_address(name, gw, sandcastle_wire::egress::PREFIX).map_err(sys("addressing the tap", name))?;
+        super::net::set_up(name).map_err(sys("bringing up the tap", name))?;
+        let guest = sandcastle_wire::egress::GUEST_ADDR.octets();
+        super::net::set_neighbor(name, guest, tap.guest_mac).map_err(sys("the guest's neighbor entry", name))?;
     }
     let t_net = t0.elapsed();
     if let Some(rules) = &plan.nft {

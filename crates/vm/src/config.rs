@@ -196,7 +196,9 @@ impl VmConfig {
     /// disk is the kernel's root, read-only, and our init runs from it.
     /// Later arguments win, so these replace libkrun's virtio-fs root.
     pub fn kernel_cmdline(&self) -> String {
-        let mut c = format!("root={} rootfstype=ext4 ro init=/init", sandcastle_wire::disks::BOOT);
+        // pci=off: libkrun's devices are all virtio-mmio, and probing PCI
+        // configuration space that is not there costs 7 ms of every boot.
+        let mut c = format!("root={} rootfstype=ext4 ro init=/init pci=off", sandcastle_wire::disks::BOOT);
         for a in &self.kernel_args {
             c.push(' ');
             c.push_str(a);
