@@ -1,0 +1,17 @@
+[package]
+name = "sandcastle-vm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "One microVM per process on libkrun: its validated configuration, a pure lifecycle, the libkrun gate, the runner, its jail, and a client."
+
+[[bin]]
+name = "sandcastle-vm"
+path = "src/main.rs"
+
+[dependencies]
+sandcastle-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+libc.workspace = true

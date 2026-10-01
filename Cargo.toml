@@ -4,7 +4,7 @@
 # already vetted where they overlap; new ones passed the two-week cooldown.
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e"]
+members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e", "crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/krun-spike"]
 
 [workspace.package]
 edition = "2021"
@@ -15,6 +15,9 @@ sandcastle-proto = { path = "crates/proto" }
 sandcastle-nip98 = { path = "crates/nip98" }
 sandcastle-core = { path = "crates/core" }
 sandcastle-node = { path = "crates/node" }
+sandcastle-wire = { path = "crates/wire" }
+sandcastle-vm = { path = "crates/vm" }
+sandcastle-rootfs = { path = "crates/rootfs" }
 aes-gcm = "=0.10.3"
 base64 = "=0.22.1"
 clap = { version = "=4.6.6", features = ["derive", "env"] }
@@ -24,6 +27,13 @@ hmac = "=0.12.1"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
+# The libkrun spike's (docs/krun-spike.md): libc for namespaces, dlopen,
+# vsock, and seccomp; the guest's layer decoders, pure Rust so the guest
+# links statically against musl.
+libc = "=0.2.189"
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+tar = { version = "=0.4.46", default-features = false }
+ruzstd = "=0.9.0"
 k256 = { version = "=0.13.4", default-features = false, features = ["schnorr"] }
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 rcgen = "=0.14.10"

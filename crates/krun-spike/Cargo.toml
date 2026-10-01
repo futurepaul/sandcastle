@@ -1,0 +1,21 @@
+[package]
+name = "sandcastle-krun-spike"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The libkrun spike's driver (docs/krun-spike.md): each scenario, its evidence as JSON, and reset. A lower-rung diagnostic, not the product."
+
+[[bin]]
+name = "sandcastle-krun-spike"
+path = "src/main.rs"
+
+[dependencies]
+sandcastle-wire.workspace = true
+sandcastle-vm.workspace = true
+sandcastle-rootfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio.workspace = true
+libc.workspace = true
