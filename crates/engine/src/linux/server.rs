@@ -151,7 +151,7 @@ pub async fn route(engine: Arc<Engine>, mut req: Request<Incoming>) -> Result<Re
         (&Method::DELETE, ["v1", "snapshots", id]) => engine.delete_snapshot(id).map(|()| empty(204)),
         (&Method::GET, ["v1", "images"]) => Ok(json(200, &engine.images())),
         (&Method::POST, ["v1", "images", "load"]) => {
-            let reference = query.split('&').find_map(|q| q.strip_prefix("reference=")).map(str::to_string);
+            let reference = query.split('&').find_map(|q| q.strip_prefix("reference=")).map(crate::api::percent_decode);
             match save_body(&engine, req).await {
                 Ok(path) => engine.load(reference, path).await.map(|m| json(200, &m)),
                 Err(e) => Err(e),

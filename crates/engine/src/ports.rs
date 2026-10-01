@@ -4,12 +4,14 @@
 //! `ports.sock` (SCM_RIGHTS). Nothing relays the bytes.
 //!
 //! One request per connection: the client sends a line of JSON,
-//! `{"name", "port"}`; the engine answers one message, `{"ok": true}` with
-//! the socket attached, or `{"ok": false, "kind", "error"}`. A `refused`
-//! port may be a server on the guest's loopback only, which the client
-//! reaches over vsock instead (the agent's `Connect`).
+//! `{"name", "port"}`; the engine answers one message, `{"ok": true,
+//! "transport"}` with the socket attached, or `{"ok": false, "kind",
+//! "error"}`. Nothing listening on the guest's NIC falls back to the
+//! guest's loopback over vsock (the agent's `Connect`), so a server bound
+//! to 127.0.0.1 is reached too; the socket handed over is then a unix
+//! socket, as `transport: "vsock"` says.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -49,7 +51,7 @@ pub enum PortFailure {
     Invalid,
     /// No such container is running.
     NotFound,
-    /// Nothing listens on the guest's NIC there (maybe on its loopback).
+    /// Nothing listens on that port, on the guest's NIC or its loopback.
     Refused,
     /// The guest did not answer within `CONNECT_WAIT`.
     Timeout,
@@ -57,9 +59,21 @@ pub enum PortFailure {
     Internal,
 }
 
+/// What the handed-over socket is.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    /// TCP over the VM's NIC.
+    Nic,
+    /// A unix socket to the agent, relaying to the guest's loopback.
+    Vsock,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PortReply {
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<PortFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,8 +179,40 @@ pub fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<Ow
     Ok((n as usize, fd))
 }
 
-/// The client: a TCP socket connected to `port` on `name`'s NIC.
-pub fn connect(ports_sock: &Path, name: &str, port: u16) -> Result<TcpStream, PortError> {
+/// A guest port's connection, as handed over.
+#[derive(Debug)]
+pub enum PortStream {
+    Nic(TcpStream),
+    Vsock(UnixStream),
+}
+
+impl Read for PortStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            PortStream::Nic(s) => s.read(buf),
+            PortStream::Vsock(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for PortStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            PortStream::Nic(s) => s.write(buf),
+            PortStream::Vsock(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            PortStream::Nic(s) => s.flush(),
+            PortStream::Vsock(s) => s.flush(),
+        }
+    }
+}
+
+/// The client: a connection to `port` on `name`, over its NIC, or its
+/// loopback when only that listens.
+pub fn connect(ports_sock: &Path, name: &str, port: u16) -> Result<PortStream, PortError> {
     let req = PortRequest { name: name.into(), port };
     req.validate().map_err(|kind| PortError::Failed { kind, error: "a container's name and a port from 1".into() })?;
     let mut s = UnixStream::connect(ports_sock)?;
@@ -179,10 +225,12 @@ pub fn connect(ports_sock: &Path, name: &str, port: u16) -> Result<TcpStream, Po
     let mut buf = vec![0u8; REPLY_BYTES_MAX];
     let (n, fd) = recv_with_fd(s.as_raw_fd(), &mut buf)?;
     let reply: PortReply = serde_json::from_slice(&buf[..n]).map_err(|_| PortError::Protocol("a reply that is not JSON"))?;
-    match (reply.ok, fd) {
-        (true, Some(fd)) => Ok(TcpStream::from(fd)),
-        (true, None) => Err(PortError::Protocol("ok without a socket")),
-        (false, _) => Err(PortError::Failed { kind: reply.kind.unwrap_or(PortFailure::Internal), error: reply.error.unwrap_or_default() }),
+    match (reply.ok, fd, reply.transport) {
+        (true, Some(fd), Some(Transport::Nic)) => Ok(PortStream::Nic(TcpStream::from(fd))),
+        (true, Some(fd), Some(Transport::Vsock)) => Ok(PortStream::Vsock(UnixStream::from(fd))),
+        (true, Some(_), None) => Err(PortError::Protocol("ok without a transport")),
+        (true, None, _) => Err(PortError::Protocol("ok without a socket")),
+        (false, _, _) => Err(PortError::Failed { kind: reply.kind.unwrap_or(PortFailure::Internal), error: reply.error.unwrap_or_default() }),
     }
 }
 
@@ -199,7 +247,6 @@ pub fn parse_request(line: &[u8]) -> Result<PortRequest, PortFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     // Goal: a descriptor sent with a reply arrives as a working descriptor
     // of the receiver's own, the message whole.
@@ -228,6 +275,7 @@ mod tests {
         assert!(fd.is_none());
         let r: PortReply = serde_json::from_slice(&buf[..n]).unwrap();
         assert_eq!(r.kind, Some(PortFailure::Refused));
+        assert_eq!(r.transport, None);
     }
 
     // Goal: requests are bounded and checked, valid and invalid.

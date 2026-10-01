@@ -3,14 +3,14 @@
 //! network namespace) against vsock through the agent, and the guest's
 //! loopback as the server's ceiling. One server for all three: Python
 //! sending 256 MiB in 1 MiB writes (busybox `nc`'s small writes cap every
-//! path near 180 MiB/s). A server on the guest's loopback alone is refused
-//! on the NIC and reached over vsock.
+//! path near 180 MiB/s). A server on the guest's loopback alone is reached
+//! through `ports.sock` too, which then hands over the agent's socket.
 
 use std::io::Read;
 use std::time::{Duration, Instant};
 
 use sandcastle_engine::api::Instance;
-use sandcastle_engine::ports::{PortError, PortFailure};
+use sandcastle_engine::ports::{PortError, PortFailure, PortStream};
 use serde_json::{json, Value};
 
 use crate::launch::ms;
@@ -64,7 +64,7 @@ fn drain(s: &mut impl Read, t0: Instant, mut got: usize) -> Result<Read1, Error>
 
 /// `getTcpPort(port)` over the NIC, as a client does it: retried while the
 /// guest's server is not yet listening.
-fn nic(layout: &Layout, c: &Ctr<'_>, port: u16) -> Result<(std::net::TcpStream, Instant), Error> {
+fn nic(layout: &Layout, c: &Ctr<'_>, port: u16) -> Result<(PortStream, Instant), Error> {
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_secs(10);
     // Bounded by the deadline.
@@ -87,6 +87,7 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     // The first connection to a fresh VM: ready to first byte, the
     // server's start included.
     let (mut st, t0) = nic(layout, &c, PORT)?;
+    let fresh_over_nic = matches!(st, PortStream::Nic(_));
     let fresh = drain(&mut st, t0, 0)?;
 
     let (mut nic_first, mut nic_mib) = (vec![], vec![]);
@@ -119,20 +120,21 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
         }
     }
 
-    // A server on the guest's loopback alone: refused on the NIC, reached
-    // over vsock.
+    // A server on the guest's loopback alone: `ports.sock` hands over the
+    // agent's socket to it.
     let lo = server("127.0.0.1", LOOPBACK_PORT).replace('\'', "'\\''");
     c.sh(&format!("python3 -c '{lo}' >/dev/null 2>&1 &"))?;
-    let (mut vs, got) = connect_retry(&c, LOOPBACK_PORT)?;
-    let vsock_reached = drain(&mut vs, Instant::now(), got.len()).is_ok();
-    let refused = matches!(sandcastle_engine::ports::connect(&layout.ports_socket(), &c.name, LOOPBACK_PORT), Err(PortError::Failed { kind: PortFailure::Refused, .. }));
+    let (mut lo_stream, t0) = nic(layout, &c, LOOPBACK_PORT)?;
+    let loopback_over_vsock = matches!(lo_stream, PortStream::Vsock(_));
+    let loopback_read = drain(&mut lo_stream, t0, 0).is_ok();
+    let closed = sandcastle_engine::ports::connect(&layout.ports_socket(), &c.name, 9999).err().and_then(|e| e.kind());
     let missing = sandcastle_engine::ports::connect(&layout.ports_socket(), "no-such-container", PORT).err().and_then(|e| e.kind());
     c.destroy(None)?;
 
     let checks = json!({
         "nic_at_least_1_gib_s": stats(&nic_mib)["median"].as_f64().is_some_and(|m| m >= 1024.0),
-        "loopback_only_refused_on_nic": refused,
-        "loopback_only_reached_over_vsock": vsock_reached,
+        "loopback_only_handed_over_as_vsock": loopback_over_vsock && loopback_read,
+        "closed_port_refused": closed == Some(PortFailure::Refused),
         "unknown_container_not_found": missing == Some(PortFailure::NotFound),
     });
     Ok(json!({
@@ -141,7 +143,9 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
         "instance": {"vcpu": 2, "memoryMib": 6144},
         "bytes": BYTES,
         "nic": {"first_byte_ms": stats(&nic_first), "mib_s": stats(&nic_mib)},
-        "nic_fresh_vm": {"ready_to_first_byte_ms": (fresh.first_ms * 1000.0).round() / 1000.0, "mib_s": fresh.mib_s.round()},
+        // A connection made while the server starts can land on vsock: the
+        // NIC refused, and by the loopback's turn it listened.
+        "nic_fresh_vm": {"ready_to_first_byte_ms": (fresh.first_ms * 1000.0).round() / 1000.0, "mib_s": fresh.mib_s.round(), "transport": if fresh_over_nic { "nic" } else { "vsock" }},
         "vsock": {"first_byte_ms": stats(&vs_first), "mib_s": stats(&vs_mib)},
         "guest_loopback_mib_s": if loopback.is_empty() { Value::Null } else { stats(&loopback) },
     }))

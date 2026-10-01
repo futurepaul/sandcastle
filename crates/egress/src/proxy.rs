@@ -292,6 +292,9 @@ impl Egress {
                 h.insert("x-sandcastle-host", HeaderValue::from_str(host).unwrap_or(HeaderValue::from_static("invalid")));
                 h.insert("x-sandcastle-scheme", HeaderValue::from_static(if tls { "https" } else { "http" }));
                 h.insert("x-sandcastle-container", HeaderValue::from_str(&self.container).unwrap_or(HeaderValue::from_static("invalid")));
+                // Which intercept matched: its index in the start's list
+                // (intercepts are only ever appended while a VM runs).
+                h.insert("x-sandcastle-intercept", HeaderValue::from(i));
                 match self.to_handler(req).await {
                     Ok(r) => r,
                     Err(e) => text(502, &format!("the handler: {e}")),
@@ -405,8 +408,8 @@ mod tests {
             let (s, _) = handler.accept().await.unwrap();
             let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
                 let header = |n: &str| req.headers().get_all(n).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
-                let (host, container) = (header("x-sandcastle-host"), header("x-sandcastle-container"));
-                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!("stand-in for {host}{} from {container}", req.uri().path())))))
+                let (host, container, index) = (header("x-sandcastle-host"), header("x-sandcastle-container"), header("x-sandcastle-intercept"));
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!("stand-in for {host}{} from {container} by {index}", req.uri().path())))))
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
         });
@@ -451,7 +454,7 @@ mod tests {
         let resp = send.send_request(req).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"stand-in for model.example.com/v1/chat from c-1");
+        assert_eq!(&body[..], b"stand-in for model.example.com/v1/chat from c-1 by 0");
         let d = eg.decisions();
         assert!(d.iter().any(|d| d.decision == "Intercept(0)"));
         let _ = std::fs::remove_dir_all(&dir);

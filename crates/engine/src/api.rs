@@ -414,6 +414,29 @@ pub struct ErrorBody {
     pub kind: String,
 }
 
+/// A query value with its `%XX` escapes decoded (a reference's `:` and
+/// `/` arrive escaped); an escape that is not two hex digits stays as it is.
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    // Bounded by the input's length.
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn validate_signal(s: i32) -> Result<(), ApiError> {
     if (1..=64).contains(&s) {
         Ok(())
@@ -558,4 +581,12 @@ mod tests {
         parsed.validate().unwrap();
         assert!(serde_json::from_str::<ExecRequest>(r#"{"cmd":["ls"],"tty":true}"#).is_err(), "an unknown option");
     }
+    #[test]
+    fn query_values_decode() {
+        assert_eq!(percent_decode("celld-image%3Aabc"), "celld-image:abc");
+        assert_eq!(percent_decode("docker.io%2Flibrary%2Fbusybox%3A1.37"), "docker.io/library/busybox:1.37");
+        assert_eq!(percent_decode("plain:ref"), "plain:ref");
+        assert_eq!(percent_decode("bad%zz%4"), "bad%zz%4");
+    }
+
 }

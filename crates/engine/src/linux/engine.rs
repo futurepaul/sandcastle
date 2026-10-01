@@ -288,15 +288,28 @@ impl Engine {
             .ok_or_else(|| ApiError::NotFound(format!("no container {name} is running")))
     }
 
-    /// `getTcpPort(port)`'s connection over the VM's NIC (`crate::ports`).
-    pub async fn connect_port(&self, name: &str, port: u16) -> Result<std::net::TcpStream, (crate::ports::PortFailure, String)> {
-        use crate::ports::PortFailure;
+    /// `getTcpPort(port)`'s connection (`crate::ports`): over the VM's NIC,
+    /// or, when nothing listens there, to the guest's loopback over vsock.
+    pub async fn connect_port(&self, name: &str, port: u16) -> Result<(std::os::fd::OwnedFd, crate::ports::Transport), (crate::ports::PortFailure, String)> {
+        use crate::ports::{PortFailure, Transport};
         let vm = self.get(name).map_err(|e| (PortFailure::NotFound, e.to_string()))?;
         if !*vm.ready.borrow() {
             return Err((PortFailure::NotFound, format!("{name} is not ready")));
         }
         let netns = self.netns_of(&vm).map_err(|e| (PortFailure::Internal, format!("{name}'s network namespace: {e}")))?;
-        super::ports::connect(&self.sockets, netns, port).await
+        match super::ports::connect(&self.sockets, netns, port).await {
+            Ok(tcp) => Ok((tcp.into(), Transport::Nic)),
+            Err((PortFailure::Refused, _)) => {
+                let agent = vm.agent();
+                let looped = tokio::task::spawn_blocking(move || agent.connect_exact(port)).await.map_err(|e| (PortFailure::Internal, e.to_string()))?;
+                match looped {
+                    Ok(unix) => Ok((unix.into(), Transport::Vsock)),
+                    Err(sandcastle_vm::client::ClientError::Refused(_)) => Err((PortFailure::Refused, format!("nothing listens on {port} in {name}"))),
+                    Err(e) => Err((PortFailure::Internal, format!("the guest's loopback: {e}"))),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The VM process's network namespace: its cgroup's process running as
@@ -400,9 +413,17 @@ impl Engine {
         Ok(m)
     }
 
+    /// Every reference the node holds, each with its image: one image
+    /// built once can go by several names.
     pub fn images(&self) -> Vec<ImageMeta> {
         let refs = self.inner.lock().expect("never poisoned").refs.clone();
-        refs.values().filter_map(|d| self.image_by_digest(d).ok()).collect()
+        refs.iter()
+            .filter_map(|(reference, d)| {
+                let mut m = self.image_by_digest(d).ok()?;
+                m.reference = reference.clone();
+                Some(m)
+            })
+            .collect()
     }
 
     /// The image `reference` names, from the node if it has it, else
@@ -524,10 +545,12 @@ impl Engine {
         let reference = reference
             .or_else(|| saved.repo_tags.as_ref().and_then(|t| t.first().cloned()))
             .unwrap_or_else(|| digest.clone());
-        let meta = match self.image_by_digest(&digest) {
+        let mut meta = match self.image_by_digest(&digest) {
             Ok(m) => m,
             Err(_) => self.build(&reference, &digest, config, &layers, &blobs).await?,
         };
+        // An image built before under another name answers to this one too.
+        meta.reference = reference.clone();
         let refs = {
             let mut i = self.inner.lock().expect("never poisoned");
             i.refs.insert(reference, digest);

@@ -1,12 +1,13 @@
 //! The engine's half of `ports.sock` (`crate::ports`): a TCP socket made in
 //! the VM's network namespace, connected to the guest, and handed to the
-//! client. One thread makes every such socket: it enters a VM's namespace,
+//! client (or the agent's socket to the guest's loopback, see
+//! `Engine::connect_port`). One thread makes every such socket: it enters a VM's namespace,
 //! makes the socket, and returns, so no other thread ever leaves the
 //! node's namespace.
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -117,10 +118,10 @@ async fn handle(engine: &Engine, mut stream: UnixStream) {
         _ => Err((PortFailure::Invalid, "a request: {\"name\", \"port\"} on one line".into())),
     };
     let (reply, fd) = match result {
-        Ok(s) => (PortReply { ok: true, kind: None, error: None }, Some(s)),
-        Err((kind, error)) => (PortReply { ok: false, kind: Some(kind), error: Some(error) }, None),
+        Ok((fd, transport)) => (PortReply { ok: true, transport: Some(transport), kind: None, error: None }, Some(fd)),
+        Err((kind, error)) => (PortReply { ok: false, transport: None, kind: Some(kind), error: Some(error) }, None),
     };
     let body = serde_json::to_vec(&reply).expect("serializes");
-    let raw = fd.as_ref().map(|s| s.as_fd().as_raw_fd());
+    let raw = fd.as_ref().map(|f| f.as_raw_fd());
     let _ = stream.async_io(Interest::WRITABLE, || send_with_fd(stream.as_raw_fd(), &body, raw)).await;
 }

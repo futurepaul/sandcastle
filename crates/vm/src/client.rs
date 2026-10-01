@@ -255,6 +255,31 @@ impl Vm {
         Ok((w, leftover))
     }
 
+    /// `connect`, reading the guest's answer exactly (its frame's length,
+    /// then the frame), so nothing of the raw stream after it is read and
+    /// the socket can be handed on as it is.
+    pub fn connect_exact(&self, port: u16) -> Result<UnixStream, ClientError> {
+        let mut s = self.dial(paths::AGENT_SOCK)?;
+        write_message(&mut s, &Request::Connect { port })?;
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).map_err(WireError::Io)?;
+        let n = u32::from_be_bytes(len) as usize;
+        if n == 0 || n > sandcastle_wire::frame::FRAME_BYTES_MAX {
+            return Err(ClientError::Protocol(format!("a frame of {n} bytes for a connect")));
+        }
+        let mut rest = vec![0u8; n];
+        s.read_exact(&mut rest).map_err(WireError::Io)?;
+        let mut d = sandcastle_wire::Decoder::new();
+        d.push(&len);
+        d.push(&rest);
+        let frame = d.next_frame().map_err(|e| ClientError::Protocol(e.to_string()))?.ok_or_else(|| ClientError::Protocol("half a frame".into()))?;
+        match sandcastle_wire::decode_message::<Reply>(&frame)? {
+            Reply::Connected => Ok(s),
+            Reply::Error { message, .. } => Err(ClientError::Refused(message)),
+            other => Err(ClientError::Protocol(format!("{other:?} for a connect"))),
+        }
+    }
+
     /// Asks the guest to drop its page cache; free-page reporting then
     /// hands the pages back.
     pub fn reclaim(&self) -> Result<(u64, u64), ClientError> {
