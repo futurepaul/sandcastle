@@ -63,6 +63,7 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                         vcpu: flag(args, "--vcpu").and_then(|v| v.parse().ok()),
                         after: flag(args, "--after").map(String::from),
                         ready: flag(args, "--ready").and_then(|p| p.parse().ok()),
+                        image: flag(args, "--image").map(String::from),
                     };
                     crate::hermes::trace_scenario(&node, &t)?
                 }

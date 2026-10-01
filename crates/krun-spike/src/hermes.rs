@@ -140,7 +140,8 @@ pub fn scenario(node: &Node, n: usize) -> Result<Value, Error> {
 /// replaces the main program after `/init`, `vcpu` the instance's vCPUs;
 /// `after` is a script each run execs once it serves, its output kept;
 /// `ready` is a port to wait for instead of the dashboard (with
-/// `HERMES_DASHBOARD=0`, the gateway's API).
+/// `HERMES_DASHBOARD=0`, the gateway's API); `image` replaces upstream's
+/// with one already loaded (the bytecode image, `images/hermes-bytecode`).
 pub struct Trace {
     pub snoop: Option<std::path::PathBuf>,
     pub runs: usize,
@@ -149,12 +150,15 @@ pub struct Trace {
     pub vcpu: Option<f64>,
     pub after: Option<String>,
     pub ready: Option<u16>,
+    pub image: Option<String>,
 }
 
 /// The gateway's loopback API (`API_SERVER_PORT`'s default), and how long
 /// after the dashboard serves it may take to listen.
 const GATEWAY_API: u16 = 8642;
 const GATEWAY_S: u64 = 20;
+/// How much of a failed run's output its error carries.
+const LOG_TAIL_CHARS: usize = 4000;
 
 /// The instant `port` in the guest first takes a connection, within `limit`.
 fn listening_within(c: &Ctr<'_>, port: u16, limit: Duration) -> Option<Instant> {
@@ -177,9 +181,14 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
     let layout = crate::layout::Layout::from_env();
     let stand_in = StandIn::new(&layout)?;
     let binary = t.snoop.as_ref().map(std::fs::read).transpose().map_err(Error::io("reading the sampler"))?;
-    node.block(node.client.pull(HERMES)).map_err(engine_err)?;
+    if t.image.is_none() {
+        node.block(node.client.pull(HERMES)).map_err(engine_err)?;
+    }
     node.delete_data("hermes-trace");
     let mut s = hermes_start(&stand_in.handler());
+    if let Some(image) = &t.image {
+        s.image = Some(image.clone());
+    }
     s.data.as_mut().expect("hermes has a data disk").name = "hermes-trace".into();
     for (k, v) in &t.env {
         s.env.insert(k.clone(), v.clone());
@@ -217,9 +226,19 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
             }
             None => None,
         };
-        let serving = match t.ready {
-            Some(port) => ms(t0, until_listening(&c, port)?),
-            None => ms(t0, until_serving(&c)?),
+        let waited = match t.ready {
+            Some(port) => until_listening(&c, port),
+            None => until_serving(&c),
+        };
+        let serving = match waited {
+            Ok(at) => ms(t0, at),
+            Err(e) => {
+                // The run's own output says why; it goes with the container.
+                let logs = node.block(node.client.logs("hermes-trace")).unwrap_or_default();
+                let text = format!("{}{}", logs["stdout"].as_str().unwrap_or(""), logs["stderr"].as_str().unwrap_or(""));
+                let tail: String = text.chars().rev().take(LOG_TAIL_CHARS).collect::<Vec<_>>().into_iter().rev().collect();
+                return Err(Error::msg(format!("run {i}: {e}\n{tail}")));
+            }
         };
         let gateway = listening_within(&c, GATEWAY_API, Duration::from_secs(GATEWAY_S)).map(|at| ms(t0, at));
         let trace = match sampler {
@@ -249,7 +268,7 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
     let kept: Vec<f64> = out.iter().skip(1).filter_map(|r| r["start_to_serving_ms"].as_f64()).collect();
     let kept_gw: Vec<f64> = out.iter().skip(1).filter_map(|r| r["start_to_gateway_api_ms"].as_f64()).collect();
     Ok(json!({
-        "image": HERMES,
+        "image": t.image.as_deref().unwrap_or(HERMES),
         "env": t.env,
         "argv": t.argv,
         "vcpu": t.vcpu.unwrap_or(2.0),
