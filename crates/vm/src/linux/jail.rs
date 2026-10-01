@@ -196,7 +196,20 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload) 
     check(unsafe { libc::sethostname(hostname.as_ptr() as *const libc::c_char, hostname.len()) })
         .map_err(sys("sethostname", hostname))?;
 
-    // The drop: groups, then gid, then uid; after it, no capability is left.
+    // Every capability out of the bounding set and the ambient set first,
+    // so nothing exec'd later can regain one even through a file
+    // capability; then the drop: groups, then gid, then uid.
+    let last_cap: libc::c_ulong = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(40);
+    // SAFETY: prctl with plain values; bounded by the kernel's last capability.
+    unsafe {
+        for cap in 0..=last_cap {
+            check(libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0)).map_err(sys("dropping the bounding set", "/"))?;
+        }
+        check(libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)).map_err(sys("clearing ambient capabilities", "/"))?;
+    }
     // SAFETY: plain values and a borrowed array.
     unsafe {
         check(libc::setgroups(plan.groups.len(), plan.groups.as_ptr())).map_err(sys("setgroups", "/"))?;

@@ -40,6 +40,9 @@ pub struct Spec {
     pub jail: Jail,
     /// The jail's uid slot.
     pub slot: u32,
+    /// Run the escape probe in the jail instead of the VM, with these
+    /// targets (paths and `tcp:ip:port`).
+    pub probe: Option<Vec<String>>,
 }
 
 pub struct Running {
@@ -172,6 +175,9 @@ pub fn start(layout: &Layout, spec: Spec) -> Result<Running, Error> {
                 .arg(layout.jail_settings())
                 .arg("--uid")
                 .arg((UID_BASE + spec.slot).to_string());
+            if let Some(targets) = &spec.probe {
+                c.arg("--probe").args(targets);
+            }
             c
         }
     };
@@ -202,4 +208,20 @@ pub fn remove_run_dir(layout: &Layout, id: &str) {
     let d = layout.vms().join(id);
     assert!(d.starts_with(layout.vms()) && !id.contains('/') && !id.is_empty());
     let _ = std::fs::remove_dir_all(d);
+}
+
+impl Running {
+    /// The next JSON object the payload printed (the probe's report).
+    pub fn wait_for_any(&mut self, timeout: Duration) -> Result<(Instant, Value), Error> {
+        let deadline = Instant::now() + timeout;
+        // Bounded by `timeout`.
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.events.recv_timeout(left) {
+                Ok((at, v)) if v.is_object() => return Ok((at, v)),
+                Ok((at, v)) => self.seen.push((at, v)),
+                Err(_) => return Err(Error::msg(format!("{}: nothing within {timeout:?}; saw {:?}", self.id, self.seen))),
+            }
+        }
+    }
 }
