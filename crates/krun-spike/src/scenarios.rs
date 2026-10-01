@@ -62,6 +62,7 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                         argv: flag(args, "--argv").map(|a| a.split_whitespace().map(String::from).collect()),
                         vcpu: flag(args, "--vcpu").and_then(|v| v.parse().ok()),
                         after: flag(args, "--after").map(String::from),
+                        ready: flag(args, "--ready").and_then(|p| p.parse().ok()),
                     };
                     crate::hermes::trace_scenario(&node, &t)?
                 }

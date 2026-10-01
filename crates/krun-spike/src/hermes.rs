@@ -138,7 +138,9 @@ pub fn scenario(node: &Node, n: usize) -> Result<Value, Error> {
 /// reads, on the guest's boot clock; the sampler costs the guest some CPU,
 /// so its runs are slower. `env` adds to the start's environment, `argv`
 /// replaces the main program after `/init`, `vcpu` the instance's vCPUs;
-/// `after` is a script each run execs once it serves, its output kept.
+/// `after` is a script each run execs once it serves, its output kept;
+/// `ready` is a port to wait for instead of the dashboard (with
+/// `HERMES_DASHBOARD=0`, the gateway's API).
 pub struct Trace {
     pub snoop: Option<std::path::PathBuf>,
     pub runs: usize,
@@ -146,12 +148,30 @@ pub struct Trace {
     pub argv: Option<Vec<String>>,
     pub vcpu: Option<f64>,
     pub after: Option<String>,
+    pub ready: Option<u16>,
 }
 
 /// The gateway's loopback API (`API_SERVER_PORT`'s default), and how long
 /// after the dashboard serves it may take to listen.
 const GATEWAY_API: u16 = 8642;
 const GATEWAY_S: u64 = 20;
+
+/// The instant `port` in the guest first takes a connection, within `limit`.
+fn listening_within(c: &Ctr<'_>, port: u16, limit: Duration) -> Option<Instant> {
+    let deadline = Instant::now() + limit;
+    // Bounded by `limit`.
+    while Instant::now() < deadline {
+        if c.vm.connect(port).is_ok() {
+            return Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    None
+}
+
+fn until_listening(c: &Ctr<'_>, port: u16) -> Result<Instant, Error> {
+    listening_within(c, port, Duration::from_secs(SERVING_S)).ok_or_else(|| Error::msg(format!("{}: nothing on {port} within {SERVING_S} s", c.name)))
+}
 
 pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
     let layout = crate::layout::Layout::from_env();
@@ -197,18 +217,11 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
             }
             None => None,
         };
-        let serving = ms(t0, until_serving(&c)?);
-        let deadline = Instant::now() + Duration::from_secs(GATEWAY_S);
-        // Bounded by GATEWAY_S.
-        let gateway = loop {
-            if c.vm.connect(GATEWAY_API).is_ok() {
-                break Some(ms(t0, Instant::now()));
-            }
-            if Instant::now() > deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        let serving = match t.ready {
+            Some(port) => ms(t0, until_listening(&c, port)?),
+            None => ms(t0, until_serving(&c)?),
         };
+        let gateway = listening_within(&c, GATEWAY_API, Duration::from_secs(GATEWAY_S)).map(|at| ms(t0, at));
         let trace = match sampler {
             Some(h) => {
                 let o = h.join().map_err(|_| Error::msg("the sampler thread panicked"))?.map_err(agent_err)?;
@@ -241,6 +254,7 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
         "argv": t.argv,
         "vcpu": t.vcpu.unwrap_or(2.0),
         "sampled": t.snoop.is_some(),
+        "ready_port": t.ready.unwrap_or(PORT),
         "fresh_start_to_serving_ms": out.first().map(|r| r["start_to_serving_ms"].clone()),
         "kept_start_to_serving_ms": (!kept.is_empty()).then(|| stats(&kept)),
         "kept_start_to_gateway_api_ms": (!kept_gw.is_empty()).then(|| stats(&kept_gw)),
