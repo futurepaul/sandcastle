@@ -24,3 +24,4 @@ http-body-util.workspace = true
 libc.workspace = true
 sha2.workspace = true
 hex.workspace = true
+tar.workspace = true

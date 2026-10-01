@@ -33,6 +33,10 @@ pub struct EngineConfig {
     /// that only loads tars (celld) sets none.
     #[serde(default = "yes")]
     pub pull: bool,
+    /// The VMs' seccomp filter: enforce (the default), or audit to log what
+    /// the allowlist misses.
+    #[serde(default)]
+    pub seccomp: sandcastle_vm::jail::SeccompMode,
 }
 
 fn yes() -> bool {
@@ -135,6 +139,7 @@ pub(crate) mod tests {
             memory_mib_max: 7168,
             kernel_args: vec![],
             pull: true,
+            seccomp: sandcastle_vm::jail::SeccompMode::Enforce,
         }
     }
 

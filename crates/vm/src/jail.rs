@@ -28,6 +28,16 @@ pub mod inside {
     pub const CONFIG: &str = "/config.json";
 }
 
+/// The seccomp filter's default: log what the allowlist misses (to build
+/// the list), or kill the process that calls it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeccompMode {
+    Audit,
+    #[default]
+    Enforce,
+}
+
 /// What the host allows, fixed for a node.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
@@ -48,6 +58,8 @@ pub struct Settings {
     /// The C library's directories, bound read-only (the runner is a
     /// glibc binary, so it can load libkrun).
     pub system_libs: Vec<PathBuf>,
+    #[serde(default)]
+    pub seccomp: SeccompMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +219,7 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
     inside_config.disks = inside_disks;
     inside_config.libkrun = Path::new(inside::LIB).join(krun_name);
     inside_config.libkrunfw = Path::new(inside::LIB).join(krunfw_name);
+    inside_config.seccomp = Some(settings.seccomp);
     inside_config.validate().map_err(|e| JailError::Config(e.to_string()))?;
 
     let nft = tap.as_deref().map(nft_ruleset);
@@ -308,6 +321,7 @@ mod tests {
             owner_uid: 1000,
             owner_gid: 1000,
             system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
+            seccomp: SeccompMode::Enforce,
         }
     }
 

@@ -93,6 +93,9 @@ fn bind(path: &Path) -> Result<UnixListener, RunError> {
 pub fn run(config_path: &Path) -> Result<std::convert::Infallible, RunError> {
     let t0 = Instant::now();
     let config = read_config(config_path)?;
+    if config.seccomp.is_some() {
+        super::seccomp::install(config.seccomp).map_err(io("the runner's seccomp filter"))?;
+    }
     let events_file = OpenOptions::new().create(true).append(true).open(config.run_dir.join(paths::EVENTS)).ok();
     let events = Events { t0, out: Arc::new(Mutex::new((std::io::stdout(), events_file))), run_dir: config.run_dir.clone() };
 

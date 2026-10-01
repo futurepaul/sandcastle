@@ -135,6 +135,18 @@ struct Inner {
     refs: BTreeMap<String, String>,
 }
 
+impl Inner {
+    /// An ended container's exit, kept for `monitor()` and `inspect()`
+    /// within `ENDED_MAX`.
+    fn note_ended(&mut self, name: &str, exit: Exit) {
+        if self.ended.len() >= ENDED_MAX && !self.ended.contains_key(name) {
+            let first = self.ended.keys().next().cloned().expect("not empty");
+            self.ended.remove(&first);
+        }
+        self.ended.insert(name.into(), exit);
+    }
+}
+
 pub struct Engine {
     config: EngineConfig,
     cgroups: Subtree,
@@ -225,6 +237,7 @@ impl Engine {
             owner_uid: c.client_uid,
             owner_gid: c.client_gid,
             system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
+            seccomp: c.seccomp,
         };
         settings.validate().map_err(|e| ApiError::Internal(e.to_string()))?;
         write_atomic(&c.jail_settings(), &serde_json::to_vec_pretty(&settings).expect("serializes")).map_err(internal("jail.json"))?;
@@ -247,27 +260,12 @@ impl Engine {
             boot_disk,
             builds: tokio::sync::Mutex::new(()),
         };
-        engine.clear_leftovers();
         engine.sweep_snapshots();
         Ok(engine)
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
-    }
-
-    /// A previous engine's VMs, which this one does not adopt yet: killed,
-    /// and their files cleared.
-    fn clear_leftovers(&self) {
-        for slot in self.cgroups.slots() {
-            let _ = self.cgroups.remove(slot);
-        }
-        if let Ok(d) = std::fs::read_dir(self.config.vms()) {
-            for e in d.flatten() {
-                let p = e.path();
-                let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
-            }
-        }
     }
 
     fn get(&self, name: &str) -> Result<Arc<Vm>, ApiError> {
@@ -405,6 +403,97 @@ impl Engine {
         Ok(meta)
     }
 
+    /// A `docker save` tar (at `tar_path`) loaded and built, under
+    /// `reference` (or its own tag, or its digest).
+    pub async fn load(&self, reference: Option<String>, tar_path: PathBuf) -> Result<ImageMeta, ApiError> {
+        let _one_build = self.builds.lock().await;
+        let dir = self.config.tmp().join(format!("load-{}", state::snapshot_id(&random16().map_err(internal("an id"))?)));
+        std::fs::create_dir_all(&dir).map_err(internal("a load directory"))?;
+        let result = self.load_in(reference, &tar_path, &dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&tar_path);
+        result
+    }
+
+    async fn load_in(&self, reference: Option<String>, tar_path: &Path, dir: &Path) -> Result<ImageMeta, ApiError> {
+        let (tp, d) = (tar_path.to_path_buf(), dir.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let f = std::fs::File::open(&tp)?;
+            crate::load::unpack(f, &d).map_err(|e| std::io::Error::other(e.to_string()))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map_err(|e| ApiError::Invalid(e.to_string()))?;
+        let manifest_bytes = std::fs::read(dir.join("manifest.json")).map_err(|_| ApiError::Invalid("no manifest.json".into()))?;
+        let saved = crate::load::manifest(&manifest_bytes).map_err(|e| ApiError::Invalid(e.to_string()))?;
+        let config_bytes = std::fs::read(dir.join(&saved.config)).map_err(|_| ApiError::Invalid("the config it names is missing".into()))?;
+        if config_bytes.len() as u64 > crate::load::MANIFEST_BYTES_MAX {
+            return Err(ApiError::Invalid("the config is too large".into()));
+        }
+        let config = sandcastle_rootfs::manifest::parse_config(&config_bytes, "linux", "amd64").map_err(|e| ApiError::Invalid(e.to_string()))?;
+        let config_digest = sandcastle_rootfs::Digest::of(&config_bytes);
+        let blobs_dir = self.config.blobs().join("sha256");
+        std::fs::create_dir_all(&blobs_dir).map_err(internal("the blob store"))?;
+        let mut layers = Vec::new();
+        let mut blobs = Vec::new();
+        for l in &saved.layers {
+            let p = dir.join(l);
+            let (digest, size, head) = tokio::task::spawn_blocking(move || -> std::io::Result<(sandcastle_rootfs::Digest, u64, Vec<u8>)> {
+                let mut f = std::fs::File::open(&p)?;
+                let mut h = sha2::Sha256::default();
+                let mut buf = vec![0u8; 1 << 20];
+                let mut head = Vec::new();
+                let mut size = 0u64;
+                // Bounded by the layer's length.
+                loop {
+                    let n = std::io::Read::read(&mut f, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    if head.len() < 8 {
+                        head.extend_from_slice(&buf[..n.min(8)]);
+                    }
+                    sha2::Digest::update(&mut h, &buf[..n]);
+                    size += n as u64;
+                }
+                let d = sandcastle_rootfs::Digest::parse(&format!("sha256:{}", hex::encode(sha2::Digest::finalize(h)))).expect("a sha256");
+                Ok((d, size, head))
+            })
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .map_err(internal("hashing a layer"))?;
+            let to = blobs_dir.join(digest.hex());
+            if !to.exists() {
+                std::fs::rename(dir.join(l), &to).map_err(internal("storing a layer"))?;
+            }
+            layers.push(sandcastle_rootfs::Descriptor { media_type: crate::load::media_type(&head).into(), digest, size, platform: None });
+            blobs.push(to);
+        }
+        // The image's identity, as a registry would give it: the digest of
+        // an OCI manifest naming its config and layers.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest.to_string(), "size": config_bytes.len()},
+            "layers": layers,
+        });
+        let digest = sandcastle_rootfs::Digest::of(&serde_json::to_vec(&manifest).expect("serializes")).to_string();
+        let reference = reference
+            .or_else(|| saved.repo_tags.as_ref().and_then(|t| t.first().cloned()))
+            .unwrap_or_else(|| digest.clone());
+        let meta = match self.image_by_digest(&digest) {
+            Ok(m) => m,
+            Err(_) => self.build(&reference, &digest, config, &layers, &blobs).await?,
+        };
+        let refs = {
+            let mut i = self.inner.lock().expect("never poisoned");
+            i.refs.insert(reference, digest);
+            i.refs.clone()
+        };
+        write_atomic(&self.config.images().join("refs.json"), &serde_json::to_vec_pretty(&refs).expect("serializes")).map_err(internal("refs.json"))?;
+        Ok(meta)
+    }
+
     async fn build(
         &self,
         reference: &str,
@@ -438,6 +527,7 @@ impl Engine {
                 net: Net::None,
                 balloon: false,
                 kernel_args: vec![],
+                seccomp: None,
                 start: Start::Build,
             };
             let mut l = self.launch(slot, &vm_config, &cg).await?;
@@ -699,6 +789,7 @@ impl Engine {
             net: Net::Tap { name: "tap0".into(), mac: [0x02, 0x53, 0x43, (slot >> 16) as u8, (slot >> 8) as u8, slot as u8] },
             balloon: true,
             kernel_args: self.config.kernel_args.clone(),
+            seccomp: None,
             start: Start::Run {
                 entrypoint,
                 hostname: hostname_of(name),
@@ -756,7 +847,7 @@ impl Engine {
 
     /// Follows a VM from its runner's events to its end, then clears it.
     async fn supervise(self: Arc<Self>, vm: Arc<Vm>, mut l: Launched, egress_task: tokio::task::JoinHandle<()>) {
-        let mut guest_exit: Option<(Option<i32>, Option<i32>)> = None;
+        let mut ending = Ending::default();
         // Bounded by the runner's life: its stdout ends when it does.
         while let Ok(Some(line)) = l.lines.next_line().await {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -777,37 +868,145 @@ impl Engine {
                     let _ = self.cgroups.throttle(vm.slot, &res);
                     vm.ready.send_replace(true);
                 }
-                Some("exited") => {
-                    guest_exit = Some((v["code"].as_i64().map(|c| c as i32), v["signal"].as_i64().map(|s| s as i32)));
-                }
-                _ => {}
+                _ => ending.note(&v),
             }
         }
         let status = l.child.wait().await.ok();
+        self.finish(&vm, ending, format!("{status:?}"), egress_task);
+    }
+
+    /// An adopted VM, whose runner's stdout went with the engine that
+    /// started it: its jailer's exit through a pidfd, then the runner's
+    /// events from its file.
+    async fn supervise_adopted(self: Arc<Self>, vm: Arc<Vm>, jailer: i32, egress_task: tokio::task::JoinHandle<()>) {
+        // SAFETY: pidfd_open(2) on a pid; the fd is ours.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, jailer, 0) };
+        if fd >= 0 {
+            // SAFETY: a fresh descriptor we own.
+            let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
+            if let Ok(afd) = tokio::io::unix::AsyncFd::new(fd) {
+                let _ = afd.readable().await;
+            }
+        }
+        let ending = Ending::read(&vm.run_dir);
+        self.finish(&vm, ending, "adopted".into(), egress_task);
+    }
+
+    /// A VM's end: its exit as `monitor()` gives it, and everything it held
+    /// handed back.
+    fn finish(&self, vm: &Arc<Vm>, ending: Ending, status: String, egress_task: tokio::task::JoinHandle<()>) {
         egress_task.abort();
         let destroy = vm.destroy.lock().expect("never poisoned").clone();
-        let exit = match (destroy, guest_exit) {
-            (Some(error), g) => Exit { code: g.and_then(|g| g.0), signal: g.and_then(|g| g.1).or(Some(9)), destroyed: true, error },
-            (None, Some((code, signal))) => Exit { code, signal, destroyed: false, error: None },
-            (None, None) => Exit {
-                code: None,
-                signal: None,
-                destroyed: false,
-                error: Some(format!("the VM ended without its entrypoint's exit ({status:?})")),
-            },
-        };
+        let exit = ending.exit(destroy, &status);
         let res = vm.record.lock().expect("never poisoned").resources;
         self.release(&vm.name, vm.slot, &res);
         {
             let mut i = self.inner.lock().expect("never poisoned");
             i.vms.remove(&vm.name);
-            if i.ended.len() >= ENDED_MAX {
-                let first = i.ended.keys().next().cloned().expect("not empty");
-                i.ended.remove(&first);
-            }
-            i.ended.insert(vm.name.clone(), exit.clone());
+            i.note_ended(&vm.name, exit.clone());
         }
         vm.exit.send_replace(Some(exit));
+    }
+
+    // ---- adoption ----
+
+    /// What a previous engine left: VMs whose jailers still run are
+    /// adopted (their records, cgroups, and run directories kept); the rest
+    /// is cleared.
+    pub fn recover(self: &Arc<Self>) -> Value {
+        let (mut adopted, mut cleared) = (vec![], vec![]);
+        let mut kept = std::collections::BTreeSet::new();
+        let records: Vec<PathBuf> = std::fs::read_dir(self.config.vms())
+            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect())
+            .unwrap_or_default();
+        for p in records {
+            let rec: Option<Record> = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            let Some(rec) = rec else {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            };
+            let alive = std::fs::read_to_string(format!("/proc/{}/stat", rec.jailer_pid)).ok().and_then(|s| state::start_ticks(&s));
+            match state::adopt(&rec, alive) {
+                state::Adopt::Adopt => match self.adopt(rec.clone()) {
+                    Ok(()) => {
+                        kept.insert(rec.slot);
+                        adopted.push(rec.name);
+                    }
+                    Err(e) => cleared.push(format!("{}: {e}", rec.name)),
+                },
+                // It ended while no engine watched: its exit from its
+                // events, for `monitor()`.
+                state::Adopt::Gone => {
+                    let ending = Ending::read(&self.config.run_dir(rec.slot));
+                    let exit = ending.exit(None, "it ended while the engine was down");
+                    self.inner.lock().expect("never poisoned").note_ended(&rec.name, exit);
+                    cleared.push(rec.name.clone());
+                }
+            }
+        }
+        for slot in self.cgroups.slots() {
+            if !kept.contains(&slot) {
+                let _ = self.cgroups.remove(slot);
+            }
+        }
+        if let Ok(d) = std::fs::read_dir(self.config.vms()) {
+            for e in d.flatten() {
+                let p = e.path();
+                let slot = p.file_stem().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok());
+                if slot.is_none_or(|s| !kept.contains(&s)) {
+                    let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+                }
+            }
+        }
+        serde_json::json!({"adopted": adopted, "cleared": cleared})
+    }
+
+    fn adopt(self: &Arc<Self>, rec: Record) -> Result<(), ApiError> {
+        let image = self.image_by_digest(&rec.image_digest)?;
+        {
+            let mut i = self.inner.lock().expect("never poisoned");
+            if !i.slots.adopt(&rec.name, rec.slot) {
+                return Err(ApiError::Conflict(format!("slot {} is taken", rec.slot)));
+            }
+            i.memory_mib += rec.resources.memory_mib as u64;
+        }
+        let run_dir = self.config.run_dir(rec.slot);
+        let req = &rec.request;
+        let policy = Policy { internet: req.enable_internet, allow: req.allow.clone(), deny: req.deny.clone(), intercept: req.intercepts.clone() };
+        let rules = policy.compile(&self.node_addrs).map_err(|e| ApiError::Invalid(e.to_string()))?;
+        let handler = req.handler.as_deref().and_then(|h| h.strip_prefix("unix:")).unwrap_or("/nonexistent").into();
+        let egress = Arc::new(Egress::new(rules, self.ca.clone(), handler));
+        let sock = run_dir.join(EGRESS_SOCK);
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("rebinding the egress socket"))?;
+        mode(&sock, 0o777).map_err(internal("the egress socket's mode"))?;
+        let egress_task = tokio::spawn(egress.clone().serve(listener));
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        for e in image.config.env.clone().unwrap_or_default() {
+            if let Some((k, v)) = e.split_once('=') {
+                env.insert(k.into(), v.into());
+            }
+        }
+        env.extend(req.env.clone());
+        let jailer = rec.jailer_pid;
+        let vm = Arc::new(Vm {
+            name: rec.name.clone(),
+            t0: Instant::now(),
+            timings: Mutex::new(Timings::default()),
+            slot: rec.slot,
+            record: Mutex::new(rec.clone()),
+            run_dir,
+            phase: Mutex::new(Phase::Running),
+            ready: watch::Sender::new(true),
+            exit: watch::Sender::new(None),
+            destroy: Mutex::new(None),
+            egress,
+            path_env: env.get("PATH").cloned(),
+        });
+        self.inner.lock().expect("never poisoned").vms.insert(rec.name.clone(), vm.clone());
+        let engine = self.clone();
+        tokio::spawn(async move { engine.supervise_adopted(vm, jailer, egress_task).await });
+        Ok(())
     }
 
     // ---- the running container's calls ----
@@ -1002,6 +1201,54 @@ impl Engine {
         let names: Vec<String> = self.inner.lock().expect("never poisoned").vms.keys().cloned().collect();
         for n in names {
             let _ = self.destroy(&n, Some("the engine stopped".into())).await;
+        }
+    }
+}
+
+/// What a runner's events say about how its VM ended.
+#[derive(Default)]
+struct Ending {
+    guest_exit: Option<(Option<i32>, Option<i32>)>,
+    failure: Option<String>,
+}
+
+impl Ending {
+    /// From the runner's events file, for a VM no engine read live.
+    fn read(run_dir: &Path) -> Ending {
+        let mut ending = Ending::default();
+        let events = std::fs::read_to_string(run_dir.join(sandcastle_vm::paths::EVENTS)).unwrap_or_default();
+        for line in events.lines() {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                ending.note(&v);
+            }
+        }
+        ending
+    }
+
+    /// The exit as `monitor()` gives it; `destroy` is `destroy()`'s error,
+    /// when it was called.
+    fn exit(self, destroy: Option<Option<String>>, status: &str) -> Exit {
+        match (destroy, self.guest_exit) {
+            (Some(error), g) => Exit { code: g.and_then(|g| g.0), signal: g.and_then(|g| g.1).or(Some(9)), destroyed: true, error },
+            (None, Some((code, signal))) => Exit { code, signal, destroyed: false, error: None },
+            (None, None) => Exit {
+                code: None,
+                signal: None,
+                destroyed: false,
+                error: Some(match self.failure {
+                    Some(f) => format!("the container failed: {f}"),
+                    None => format!("the VM ended without its entrypoint's exit ({status})"),
+                }),
+            },
+        }
+    }
+
+    fn note(&mut self, v: &Value) {
+        match v["event"].as_str() {
+            Some("exited") => self.guest_exit = Some((v["code"].as_i64().map(|c| c as i32), v["signal"].as_i64().map(|s| s as i32))),
+            Some("guest_failed") => self.failure = v["message"].as_str().map(str::to_string),
+            Some("failed") => self.failure = v["reason"].as_str().map(str::to_string),
+            _ => {}
         }
     }
 }

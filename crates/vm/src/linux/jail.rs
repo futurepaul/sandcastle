@@ -276,7 +276,9 @@ fn child_inner(plan: &Plan, jail_root: &Path, hostname: &str, payload: Payload, 
     // cannot say whether it is still there.)
     // SAFETY: prctl with plain values.
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }).map_err(sys("pdeathsig", "/"))?;
-    super::seccomp::install().map_err(sys("seccomp", "/"))?;
+    // The refusals now; the runner adds its allowlist as its first act,
+    // once the exec this needs is done.
+    super::seccomp::install(None).map_err(sys("seccomp", "/"))?;
 
     // Where the jail's time went, for the supervisor (the runner's stdout
     // is this process's).

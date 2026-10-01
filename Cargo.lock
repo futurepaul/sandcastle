@@ -1247,6 +1247,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "thiserror",
  "tokio",
 ]
@@ -1269,11 +1270,13 @@ dependencies = [
 name = "sandcastle-krun-spike"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "ruzstd",
  "sandcastle-egress",
  "sandcastle-engine",
  "sandcastle-rootfs",
@@ -1282,6 +1285,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tokio",
 ]
 

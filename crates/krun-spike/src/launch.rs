@@ -40,14 +40,15 @@ pub struct Running {
 }
 
 impl Running {
-    /// The next JSON object the payload printed (the probe's report).
-    pub fn wait_for_any(&mut self, timeout: Duration) -> Result<(Instant, Value), Error> {
+    /// The next JSON object the payload printed (the probe's report), past
+    /// the jailer's own events.
+    pub fn wait_for_report(&mut self, timeout: Duration) -> Result<(Instant, Value), Error> {
         let deadline = Instant::now() + timeout;
         // Bounded by `timeout`.
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.events.recv_timeout(left) {
-                Ok((at, v)) if v.is_object() => return Ok((at, v)),
+                Ok((at, v)) if v.is_object() && v.get("event").is_none() => return Ok((at, v)),
                 Ok((at, v)) => self.seen.push((at, v)),
                 Err(_) => return Err(Error::msg(format!("{}: nothing within {timeout:?}; saw {:?}", self.id, self.seen))),
             }
@@ -117,6 +118,7 @@ pub fn start_probe(layout: &Layout, spec: Spec) -> Result<Running, Error> {
         net: Net::None,
         balloon: true,
         kernel_args: vec![],
+        seccomp: None,
         start: spec.start,
     };
     config.validate().map_err(|e| Error::msg(format!("{}: {e}", spec.id)))?;

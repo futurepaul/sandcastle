@@ -24,3 +24,6 @@ sha2.workspace = true
 hex.workspace = true
 tokio.workspace = true
 libc.workspace = true
+tar.workspace = true
+flate2 = { workspace = true, features = ["rust_backend"] }
+ruzstd.workspace = true

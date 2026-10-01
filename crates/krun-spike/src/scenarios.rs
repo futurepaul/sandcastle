@@ -50,6 +50,8 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                 "hermes-memory" => crate::hermes::memory_scenario(&node)?,
                 "crash" => crash(layout, &node)?,
                 "parity" => crate::parity::scenario(layout, &node)?,
+                "fidelity" => crate::fidelity::scenario(&node)?,
+                "corpus" => crate::corpus::scenario(&node)?,
                 other => return Err(Error::msg(format!("no scenario {other}"))),
             }
         }
@@ -467,7 +469,7 @@ fn probe(layout: &Layout) -> Result<Value, Error> {
             probe: targets,
         },
     )?;
-    let (_, report) = run.wait_for_any(Duration::from_secs(30))?;
+    let (_, report) = run.wait_for_report(Duration::from_secs(30))?;
     run.wait_exit(Duration::from_secs(10))?;
     other.destroy(None)?;
     launch::remove_run_dir(layout, "probe");
@@ -481,7 +483,8 @@ fn probe(layout: &Layout) -> Result<Value, Error> {
         && report["cap_bnd"] == "0000000000000000"
         && uid >= launch::UID_BASE as u64
         && report["cap_eff"] == "0000000000000000"
-        && report["no_new_privs"] == "1";
+        && report["no_new_privs"] == "1"
+        && report["allowlist"] == json!({"getpid": "exit 0", "execve": "signal 31"});
     Ok(json!({"pass": pass, "reached": reached, "report": report}))
 }
 
@@ -503,21 +506,68 @@ fn crash(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let after_crash = census(layout)?;
     let again = node.start("crash-2", &s)?;
     let (reread, _) = again.sh("sha256sum /data/blob | cut -d' ' -f1; cat /data/blob.sha")?;
-    // The engine killed outright: its VMs run on (KillMode=process).
+    let lines: Vec<&str> = reread.lines().collect();
+    let intact = lines.len() == 2 && lines[0] == lines[1] && lines[0] == written.trim();
+
+    // The engine killed outright: its VMs run on (KillMode=process). One
+    // keeps running; the other ends by itself while no engine watches.
+    let ends = node.start("crash-3", &start(BUSYBOX, &["/bin/sh", "-c", "sleep 2; exit 5"]))?;
     let killed = std::process::Command::new("sudo")
         .args(["-n", "systemctl", "kill", "--kill-whom=main", "--signal=KILL", "krun-engine"])
         .output()
         .map_err(Error::io("systemctl kill"))?;
-    std::thread::sleep(Duration::from_millis(500));
-    let while_down = census(layout)?;
-    std::mem::forget(again);
-    let lines: Vec<&str> = reread.lines().collect();
-    let intact = lines.len() == 2 && lines[0] == lines[1] && lines[0] == written.trim();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // Bounded by the deadline: crash-3's runner ends within its 2 s.
+    let while_down = loop {
+        let c = census(layout)?;
+        if c["vm_processes"].as_array().is_some_and(|v| v.len() == 1) || Instant::now() > deadline {
+            break c;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let t = Instant::now();
+    let restarted = std::process::Command::new("sudo").args(["-n", "systemctl", "start", "krun-engine"]).output().map_err(Error::io("systemctl start"))?;
+    // Bounded: the engine answers within 10 s or the scenario fails.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while node.block(node.client.health()).is_err() {
+        if Instant::now() > deadline {
+            return Err(Error::msg("the engine did not come back"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let restart_ms = ms(t, Instant::now());
+
+    // The survivor: listed, running, its exec straight to the same agent,
+    // its slot kept from new starts, and destroyed as any other.
+    let seen = node.inspect("crash-2")?;
+    let running = seen.as_ref().is_some_and(|i| i.running && i.agent_socket == again.info.agent_socket);
+    let (still, _) = again.sh("cat /data/blob.sha")?;
+    let fresh = node.start("crash-4", &start(BUSYBOX, SLEEP_FOREVER))?;
+    let own_slot = fresh.info.agent_socket != again.info.agent_socket;
+    fresh.destroy(None)?;
+    let exit_while_down = ends.wait()?;
+    let destroyed = again.destroy(Some("the crash scenario is done"))?;
+    let after = census(layout)?;
+    let adoption = json!({
+        "restart_to_serving_ms": (restart_ms * 10.0).round() / 10.0,
+        "survivor_running": running,
+        "survivor_exec": still.trim() == written.trim(),
+        "new_start_own_slot": own_slot,
+        "survivor_destroyed": destroyed.destroyed,
+        "ended_while_down": exit_while_down,
+        "census_after": after,
+    });
+    let adopted = running
+        && still.trim() == written.trim()
+        && own_slot
+        && destroyed.destroyed
+        && exit_while_down.code == Some(5)
+        && after["vm_processes"].as_array().is_some_and(|v| v.is_empty());
     Ok(json!({
-        "pass": intact && !exit.clean() && exit.error.is_some(),
+        "pass": intact && !exit.clean() && exit.error.is_some() && adopted,
         "vm_crash": {"monitor": exit, "kill_to_monitored_ms": (crash_ms * 10.0).round() / 10.0, "census": after_crash},
         "data_after_crash": {"written_sha256": written.trim(), "reread": reread, "intact": intact},
-        "engine_killed": {"systemctl_kill_ok": killed.status.success(), "census_while_down": while_down},
-        "next": "restart the engine and run `census`: the VM it finds is cleared (adopted, from E5)",
+        "engine_killed": {"systemctl_kill_ok": killed.status.success(), "census_while_down": while_down, "restarted_ok": restarted.status.success()},
+        "adoption": adoption,
     }))
 }

@@ -155,6 +155,12 @@ impl EngineClient {
         Ok((info, timings))
     }
 
+    /// Loads a `docker save` tar under `reference`.
+    pub async fn load(&self, reference: &str, tar: Vec<u8>) -> Result<serde_json::Value, EngineError> {
+        let (_, bytes) = self.call("POST", &format!("/v1/images/load?reference={reference}"), Some(tar)).await?;
+        serde_json::from_slice(&bytes).map_err(|e| EngineError::Decode(e.to_string()))
+    }
+
     pub async fn pull(&self, reference: &str) -> Result<serde_json::Value, EngineError> {
         self.json("POST", "/v1/images/pull", Some(&serde_json::json!({"reference": reference}))).await
     }

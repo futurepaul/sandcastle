@@ -4,7 +4,11 @@
 //! this node, not the product's.
 
 #[cfg(target_os = "linux")]
+mod corpus;
+#[cfg(target_os = "linux")]
 mod egress;
+#[cfg(target_os = "linux")]
+mod fidelity;
 #[cfg(target_os = "linux")]
 mod hermes;
 #[cfg(target_os = "linux")]

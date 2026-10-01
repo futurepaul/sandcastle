@@ -6,6 +6,7 @@
 pub mod api;
 pub mod client;
 pub mod config;
+pub mod load;
 pub mod state;
 
 #[cfg(target_os = "linux")]

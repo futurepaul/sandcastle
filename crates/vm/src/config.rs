@@ -74,6 +74,10 @@ pub struct VmConfig {
     /// characters only (a tuning, never a root or an init).
     #[serde(default)]
     pub kernel_args: Vec<String>,
+    /// The runner's own seccomp allowlist, installed as its first act; the
+    /// jailer sets it (an unjailed runner has none).
+    #[serde(default)]
+    pub seccomp: Option<crate::jail::SeccompMode>,
     pub start: Start,
 }
 
@@ -226,6 +230,7 @@ pub(crate) mod tests {
             net: Net::None,
             balloon: true,
             kernel_args: vec![],
+            seccomp: None,
             start: Start::Run {
                 entrypoint: Process { argv: vec!["/bin/sh".into()], ..Process::default() },
                 hostname: "t1".into(),

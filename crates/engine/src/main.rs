@@ -56,6 +56,7 @@ fn serve(config: sandcastle_engine::EngineConfig) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        eprintln!("sandcastle-engine: recovered {}", engine.recover());
         let sock = engine.config().socket();
         let _ = std::fs::remove_file(&sock);
         let listener = match tokio::net::UnixListener::bind(&sock) {

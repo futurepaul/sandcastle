@@ -29,6 +29,34 @@ fn reach(p: &Path) -> Value {
     }
 }
 
+/// The runner's allowlist, enforced in a child that then makes one call:
+/// how the child ended.
+fn under_allowlist(prog: &[libc::sock_filter], call: impl FnOnce()) -> Value {
+    // SAFETY: fork(2) in the single-threaded probe; the child installs a
+    // program made before the fork, makes its call, and `_exit`s.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        if super::seccomp::install_program(prog).is_err() {
+            // SAFETY: ends the child.
+            unsafe { libc::_exit(2) };
+        }
+        call();
+        // SAFETY: ends the child.
+        unsafe { libc::_exit(0) };
+    }
+    if pid < 0 {
+        return json!(std::io::Error::last_os_error().to_string());
+    }
+    let mut status = 0;
+    // SAFETY: waits for our own child.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    if libc::WIFSIGNALED(status) {
+        json!(format!("signal {}", libc::WTERMSIG(status)))
+    } else {
+        json!(format!("exit {}", libc::WEXITSTATUS(status)))
+    }
+}
+
 pub fn run(must_not_reach: &[String]) -> i32 {
     // SAFETY: getres*id write to locals.
     let (mut ruid, mut euid, mut suid, mut rgid, mut egid, mut sgid) = (0, 0, 0, 0, 0, 0);
@@ -92,6 +120,21 @@ pub fn run(must_not_reach: &[String]) -> i32 {
     for p in host_files {
         host.insert(p.into(), reach(Path::new(p)));
     }
+    // The runner's own filter: a call it allows, and execve, which no
+    // runner makes (SIGSYS is 31).
+    let allowlist = super::seccomp::program(Some(crate::jail::SeccompMode::Enforce));
+    let sh = CString::new("/bin/sh").expect("no NUL");
+    let allowlist = json!({
+        "getpid": under_allowlist(&allowlist, || {
+            // SAFETY: getpid(2) has no arguments.
+            unsafe { libc::getpid() };
+        }),
+        "execve": under_allowlist(&allowlist, || {
+            // SAFETY: the filter ends the process at the call; the
+            // arguments are valid either way.
+            unsafe { libc::syscall(libc::SYS_execve, sh.as_ptr(), std::ptr::null::<*const libc::c_char>(), std::ptr::null::<*const libc::c_char>()) };
+        }),
+    });
     let mut root = Vec::new();
     if let Ok(d) = std::fs::read_dir("/") {
         for e in d.flatten() {
@@ -112,6 +155,7 @@ pub fn run(must_not_reach: &[String]) -> i32 {
         "must_not_reach": reached,
         "host_paths": host,
         "syscalls": syscalls,
+        "allowlist": allowlist,
         "write_root": format!("{write_root:?}"),
         "write_libkrun": format!("{write_lib:?}"),
         "write_boot_disk": format!("{write_boot:?}"),

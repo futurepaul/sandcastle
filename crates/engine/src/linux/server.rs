@@ -44,6 +44,31 @@ async fn body<T: DeserializeOwned>(req: Request<Incoming>) -> Result<T, ApiError
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Invalid(format!("the body: {e}")))
 }
 
+/// A large body (an image) streamed to a file under the engine's tmp,
+/// bounded by `load::IMAGE_BYTES_MAX`.
+async fn save_body(engine: &Engine, req: Request<Incoming>) -> Result<std::path::PathBuf, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    let dir = engine.config().tmp();
+    let path = dir.join(format!("upload-{}-{}.tar", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    let mut f = tokio::fs::File::create(&path).await.map_err(|e| ApiError::Internal(format!("an upload: {e}")))?;
+    let mut body = req.into_body();
+    let mut total = 0u64;
+    // Bounded by IMAGE_BYTES_MAX.
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| ApiError::Invalid(format!("the upload: {e}")))?;
+        if let Ok(data) = frame.into_data() {
+            total += data.len() as u64;
+            if total > crate::load::IMAGE_BYTES_MAX {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(ApiError::Invalid("the image passes its size limit".into()));
+            }
+            f.write_all(&data).await.map_err(|e| ApiError::Internal(format!("an upload: {e}")))?;
+        }
+    }
+    f.flush().await.map_err(|e| ApiError::Internal(format!("an upload: {e}")))?;
+    Ok(path)
+}
+
 pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let path: Vec<String> = req.uri().path().trim_matches('/').split('/').map(str::to_string).collect();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -100,6 +125,13 @@ pub async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> Result<Respon
         (&Method::GET, ["v1", "snapshots"]) => Ok(json(200, &engine.snapshots())),
         (&Method::DELETE, ["v1", "snapshots", id]) => engine.delete_snapshot(id).map(|()| empty(204)),
         (&Method::GET, ["v1", "images"]) => Ok(json(200, &engine.images())),
+        (&Method::POST, ["v1", "images", "load"]) => {
+            let reference = query.split('&').find_map(|q| q.strip_prefix("reference=")).map(str::to_string);
+            match save_body(&engine, req).await {
+                Ok(path) => engine.load(reference, path).await.map(|m| json(200, &m)),
+                Err(e) => Err(e),
+            }
+        }
         (&Method::DELETE, ["v1", "data", disk]) => engine.delete_data(disk).map(|()| empty(204)),
         (&Method::POST, ["v1", "images", "pull"]) => match body::<serde_json::Value>(req).await {
             Ok(v) => match v["reference"].as_str() {
