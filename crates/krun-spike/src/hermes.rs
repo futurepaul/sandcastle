@@ -262,6 +262,60 @@ pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
     }))
 }
 
+/// A diagnostic: Hermes the way Cloudflare keeps it, with no data disk and
+/// each start from the snapshot the run before took of its writable root
+/// (`/opt/data` included). Run 0 starts from the image. `env` adds to the
+/// start's environment, as in `hermes-trace`.
+pub fn snapshot_scenario(node: &Node, runs: usize, env: &[(String, String)]) -> Result<Value, Error> {
+    let layout = crate::layout::Layout::from_env();
+    let stand_in = StandIn::new(&layout)?;
+    node.block(node.client.pull(HERMES)).map_err(engine_err)?;
+    let mut s = hermes_start(&stand_in.handler());
+    s.data = None;
+    for (k, v) in env {
+        s.env.insert(k.clone(), v.clone());
+    }
+    let mut out = vec![];
+    let mut from: Option<sandcastle_engine::api::Snapshot> = None;
+    // Bounded by `runs`.
+    for i in 0..runs.max(2) {
+        let req = match &from {
+            Some(snap) => StartRequest { image: None, container_snapshot: Some(sandcastle_engine::api::SnapshotRef { id: snap.id.clone() }), ..s.clone() },
+            None => s.clone(),
+        };
+        let t0 = Instant::now();
+        let c = node.start("hermes-snap", &req)?;
+        let serving = ms(t0, until_serving(&c)?);
+        let gateway = listening_within(&c, GATEWAY_API, Duration::from_secs(GATEWAY_S)).map(|at| ms(t0, at));
+        let t = Instant::now();
+        let snap = node.block(node.client.snapshot("hermes-snap", Some(format!("hermes-snap-{i}")))).map_err(engine_err)?;
+        let snapshot_ms = ms(t, Instant::now());
+        out.push(json!({
+            "run": i,
+            "from": if from.is_some() { "snapshot" } else { "image" },
+            "start_to_ready_ms": c.start_ms,
+            "start_to_serving_ms": serving,
+            "start_to_gateway_api_ms": gateway,
+            "snapshot_taken_ms": snapshot_ms,
+            "snapshot_bytes": snap.size,
+        }));
+        c.destroy(None)?;
+        if let Some(old) = from.replace(snap) {
+            let _ = node.block(node.client.delete_snapshot(&old.id));
+        }
+    }
+    if let Some(last) = from {
+        let _ = node.block(node.client.delete_snapshot(&last.id));
+    }
+    let later: Vec<f64> = out.iter().skip(2).filter_map(|r| r["start_to_serving_ms"].as_f64()).collect();
+    Ok(json!({
+        "image": HERMES,
+        "env": env,
+        "steady_start_to_serving_ms": (!later.is_empty()).then(|| stats(&later)),
+        "runs": out,
+    }))
+}
+
 /// Acceptance 6: one Hermes, its memory (its cgroup's charge) as it
 /// serves and idles, then after a reclaim.
 pub fn memory_scenario(node: &Node) -> Result<Value, Error> {

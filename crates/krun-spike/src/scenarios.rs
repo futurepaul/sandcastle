@@ -27,7 +27,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
     let Some(cmd) = args.first() else {
-        return Err(Error::msg("a scenario: boot, fresh-root, exec, port, egress, hermes, hermes-memory, hermes-trace, crash, parity, probe, census, reset, pull"));
+        return Err(Error::msg("a scenario: boot, fresh-root, exec, port, egress, hermes, hermes-memory, hermes-trace, hermes-snapshot, crash, parity, probe, census, reset, pull"));
     };
     let n: usize = flag(args, "--n").map(|s| s.parse().unwrap_or(10)).unwrap_or(10);
     let v = match cmd.as_str() {
@@ -65,6 +65,15 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                         ready: flag(args, "--ready").and_then(|p| p.parse().ok()),
                     };
                     crate::hermes::trace_scenario(&node, &t)?
+                }
+                "hermes-snapshot" => {
+                    let env: Vec<(String, String)> = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| *a == "--env")
+                        .filter_map(|(i, _)| args.get(i + 1)?.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                        .collect();
+                    crate::hermes::snapshot_scenario(&node, n, &env)?
                 }
                 "crash" => crash(layout, &node)?,
                 "parity" => crate::parity::scenario(layout, &node)?,
