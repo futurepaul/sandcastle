@@ -126,6 +126,22 @@ pub struct Serve {
     /// changed value is swapped in without touching the guest.
     #[arg(long, default_value_t = 900)]
     pub credentials_every_s: u64,
+    /// The iroh relay (`https://host[:port]/`) each computer's key is
+    /// reached through (fragment-next docs/runtime-seam.md): the node holds
+    /// an endpoint per computer, its key derived from the node's own, and
+    /// lets in a peer an admission names. Needs `--node-key-file`.
+    #[arg(long)]
+    pub iroh_relay: Option<String>,
+    /// A public key (64 hex) whose admissions the node takes. Repeatable;
+    /// with none, each computer's owner admits to it. A person's own node
+    /// lists their key here, so the platform that manages its computers
+    /// cannot admit itself.
+    #[arg(long = "admitter")]
+    pub admitters: Vec<String>,
+    /// Iroh with no relay, reached only at the endpoints' own addresses:
+    /// the daemon's tests.
+    #[arg(skip)]
+    pub iroh_without_relay: bool,
 }
 
 /// The engine and the disks: what `serve` and `reset` both drive.
@@ -416,7 +432,27 @@ impl Serve {
         if !(60..=86_400).contains(&self.credentials_every_s) {
             return Err("--credentials-every-s is 60 to 86400".into());
         }
+        if let Some(r) = &self.iroh_relay {
+            let bare = url::Url::parse(r).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some() && u.path() == "/" && u.query().is_none() && u.username().is_empty());
+            if !bare {
+                return Err(format!("--iroh-relay {r:?} is https://host[:port]/, nothing more"));
+            }
+            if self.node_key_file.is_none() {
+                return Err("--iroh-relay needs --node-key-file: computers' keys are derived from the node's".into());
+            }
+        }
+        for a in &self.admitters {
+            sandcastle_proto::validate_pubkey(a).map_err(|e| format!("--admitter {a}: {e}"))?;
+        }
+        if !self.admitters.is_empty() && !self.iroh() {
+            return Err("--admitter needs --iroh-relay: admissions are iroh's".into());
+        }
         Ok(())
+    }
+
+    /// Whether computers are reached by their keys.
+    pub fn iroh(&self) -> bool {
+        self.iroh_relay.is_some() || self.iroh_without_relay
     }
 }
 
@@ -461,6 +497,11 @@ mod tests {
             &["--reserve-memory-gib", "0"],
             &["--snapshot-headroom-pct", "401"],
             &["--layer-gib", "0"],
+            &["--iroh-relay", "https://relay.example/"],
+            &["--node-key-file", "/n", "--iroh-relay", "http://relay.example/"],
+            &["--node-key-file", "/n", "--iroh-relay", "https://relay.example/relay"],
+            &["--admitter", "a38bc6abf2e9933e3d73741806c9b92cbd9453070845266e69f36d444c8a6bd4"],
+            &["--node-key-file", "/n", "--iroh-relay", "https://relay.example/", "--admitter", "nope"],
         ] {
             assert!(serve(bad).is_err(), "{bad:?}");
         }
@@ -470,6 +511,9 @@ mod tests {
         assert!(!with.credentials_origin_allowed("http://fragment.club/x"));
         let ships = serve(&["--backup-bucket", "b", "--backup-credentials", "/c", "--backup-key-file", "/k"]).unwrap();
         assert!(ships.policy().ships);
+        assert!(!ok.iroh());
+        let iroh = serve(&["--node-key-file", "/n", "--iroh-relay", "https://relay.example:8443/", "--admitter", "a38bc6abf2e9933e3d73741806c9b92cbd9453070845266e69f36d444c8a6bd4"]).unwrap();
+        assert!(iroh.iroh() && iroh.admitters.len() == 1);
     }
 
     #[test]

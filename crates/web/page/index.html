@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>sandcastle by its key</title>
+</head>
+<body>
+  <pre id="log">starting…</pre>
+  <script type="module">
+    // The e2e's `web` section serves this page and answers /config, /admit,
+    // /sleep, /login, and /report (sandcastle/crates/e2e/src/web.rs): the
+    // page does what a chat page would, over the WASM client, and times it.
+    import init, { Peer } from "./pkg/sandcastle_web.js";
+
+    const log = (line) => { document.getElementById("log").textContent += "\n" + line; };
+    const ask = async (path, body) => {
+      const r = await fetch(path, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) });
+      const text = await r.text();
+      if (!r.ok) throw new Error(`${path}: ${r.status} ${text}`);
+      return text;
+    };
+    const now = () => performance.now();
+    const results = {};
+    const get = (c) => c.fetch("GET", "/api/status", "{}", new Uint8Array());
+
+    try {
+      let t = now();
+      await init();
+      results.init_ms = now() - t;
+      const cfg = JSON.parse(await ask("/config"));
+      t = now();
+      const peer = new Peer();
+      results.peer_ms = now() - t;
+      const admission = await ask(`/admit?peer=${peer.id()}`);
+      t = now();
+      const c = await peer.connect(cfg.endpoint, cfg.relay, admission, cfg.host);
+      results.connect_ms = now() - t;
+      t = now();
+      const first = await get(c);
+      results.first_ms = now() - t;
+      results.first_status = first.status;
+      results.path = c.path();
+      log(`connected (${results.path}), first answer ${first.status}`);
+
+      results.awake_ms = [];
+      for (let i = 0; i < 10; i++) {
+        t = now();
+        await get(c);
+        results.awake_ms.push(now() - t);
+      }
+      results.warm_ms = [];
+      for (let i = 0; i < 5; i++) {
+        await ask("/sleep?tier=warm");
+        t = now();
+        const a = await get(c);
+        results.warm_ms.push(now() - t);
+        if (a.status !== 200) throw new Error(`a warm wake answered ${a.status}`);
+      }
+      results.cold_ms = [];
+      for (let i = 0; i < 2; i++) {
+        await ask("/sleep?tier=cold");
+        t = now();
+        const a = await get(c);
+        results.cold_ms.push(now() - t);
+        if (a.status >= 500) throw new Error(`a cold wake answered ${a.status}`);
+      }
+      log("wakes measured");
+
+      // A chat turn over Hermes' socket, as the chat page takes one.
+      const login = await ask("/login");
+      t = now();
+      const signedIn = await c.fetch("POST", "/auth/password-login", JSON.stringify({ "content-type": "application/json" }), new TextEncoder().encode(login));
+      results.login_ms = now() - t;
+      // A cookie's value may itself hold "=": split at the first only.
+      const cookies = JSON.parse(signedIn.headers)["set-cookie"] ?? "";
+      const token = cookies
+        .split("\n")
+        .map((c) => c.split(";")[0])
+        .map((c) => [c.slice(0, c.indexOf("=")), c.slice(c.indexOf("=") + 1)])
+        .find(([k]) => k.endsWith("hermes_session_at"))?.[1];
+      if (signedIn.status !== 200 || !token) throw new Error(`no session from Hermes' login (${signedIn.status})`);
+      const bearer = JSON.stringify({ authorization: `Bearer ${token}` });
+      const minted = await c.fetch("POST", "/api/auth/ws-ticket", bearer, new Uint8Array());
+      if (minted.status !== 200) throw new Error(`the socket ticket answered ${minted.status}`);
+      const ticket = JSON.parse(new TextDecoder().decode(minted.body)).ticket;
+      t = now();
+      const s = await c.websocket("/api/ws", ["hermes-gateway-v1", `hermes-gateway-ticket.${ticket}`]);
+      const ready = await s.next();
+      results.socket_ms = now() - t;
+      if (!ready?.includes("gateway.ready")) throw new Error(`the gateway said ${ready}`);
+      const call = async (id, method, params) => {
+        await s.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+        const events = [];
+        for (;;) {
+          const next = await s.next();
+          if (next === undefined) throw new Error(`the socket closed before ${method} was answered`);
+          const m = JSON.parse(next);
+          if (m.id === id) return [m.result, events];
+          events.push(m);
+        }
+      };
+      const [made] = await call(1, "session.create", { title: "browser over iroh" });
+      t = now();
+      const [, events] = await call(2, "prompt.submit", { session_id: made.session_id, text: "Reply with exactly: from the browser by its key" });
+      let text = "";
+      for (;;) {
+        let m = events.shift();
+        if (m === undefined) {
+          const next = await s.next();
+          if (next === undefined) throw new Error("the socket closed mid-turn");
+          m = JSON.parse(next);
+        }
+        const p = m.params ?? {};
+        if (p.session_id !== made.session_id) continue;
+        if (p.type === "message.delta") {
+          results.first_words_ms ??= now() - t;
+          text += p.payload?.text ?? "";
+        }
+        if (p.type === "message.complete") {
+          results.turn_ms = now() - t;
+          results.reply = p.payload?.text ?? text;
+          break;
+        }
+      }
+      await s.close();
+      log(`turn: ${results.reply}`);
+      await ask("/report", results);
+    } catch (e) {
+      results.error = String(e?.message ?? e);
+      log(`failed: ${results.error}`);
+      await ask("/report", results);
+    }
+  </script>
+</body>
+</html>

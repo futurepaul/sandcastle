@@ -32,6 +32,10 @@ pub enum AuthError {
     PayloadMismatch,
     IdMismatch,
     BadSignature,
+    /// An admission past its `expiration`.
+    Expired,
+    /// An admission meant to last longer than its verifier allows.
+    TooLong { lifetime_s: i64 },
 }
 
 impl std::fmt::Display for AuthError {
@@ -40,7 +44,7 @@ impl std::fmt::Display for AuthError {
             AuthError::MissingHeader => write!(f, "missing `Authorization: Nostr` header"),
             AuthError::TooLarge => write!(f, "auth header is over {HEADER_BYTES_MAX} bytes"),
             AuthError::Malformed(what) => write!(f, "malformed auth event: {what}"),
-            AuthError::WrongKind => write!(f, "auth event is not kind {KIND}"),
+            AuthError::WrongKind => write!(f, "event is not the kind expected ({KIND} for a request, {ADMISSION_KIND} for an admission)"),
             AuthError::BadPubkey => write!(f, "auth event pubkey is not 64 hex characters"),
             AuthError::Stale { skew_s } => write!(f, "auth event created_at is {skew_s} s from now"),
             AuthError::UrlMismatch => write!(f, "auth event `u` tag does not match the request URL"),
@@ -48,6 +52,8 @@ impl std::fmt::Display for AuthError {
             AuthError::PayloadMismatch => write!(f, "auth event `payload` tag does not match the body"),
             AuthError::IdMismatch => write!(f, "auth event id does not match its content"),
             AuthError::BadSignature => write!(f, "auth event signature does not verify"),
+            AuthError::Expired => write!(f, "admission has expired"),
+            AuthError::TooLong { lifetime_s } => write!(f, "admission would last {lifetime_s} s, longer than allowed"),
         }
     }
 }
@@ -134,8 +140,17 @@ pub fn verify(header: Option<&str>, method: &str, url: &str, body: &[u8], now_s:
     if !body.is_empty() && tag(tags, "payload") != Some(hex::encode(Sha256::digest(body)).as_str()) {
         return Err(AuthError::PayloadMismatch);
     }
+    let id = authentic(&ev, pubkey, created_at, KIND)?;
+    let verified = Verified { pubkey: pubkey.to_string(), event_id: id, created_at };
+    assert!(is_lower_hex(&verified.event_id, 64));
+    Ok(verified)
+}
+
+/// The event's id, once it matches the event and `pubkey`'s signature over
+/// it verifies.
+fn authentic(ev: &serde_json::Value, pubkey: &str, created_at: i64, kind: u64) -> Result<String, AuthError> {
     let content = ev["content"].as_str().unwrap_or("");
-    let id = hex::encode(event_id(pubkey, created_at, KIND, tags, content));
+    let id = hex::encode(event_id(pubkey, created_at, kind, &ev["tags"], content));
     if ev["id"].as_str() != Some(id.as_str()) {
         return Err(AuthError::IdMismatch);
     }
@@ -151,9 +166,73 @@ pub fn verify(header: Option<&str>, method: &str, url: &str, body: &[u8], now_s:
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| AuthError::BadPubkey)?;
     let id_bytes: [u8; 32] = hex::decode(&id).ok().and_then(|b| b.try_into().ok()).expect("an id this function hex-encoded decodes");
     key.verify_raw(&id_bytes, &sig).map_err(|_| AuthError::BadSignature)?;
-    let verified = Verified { pubkey: pubkey.to_string(), event_id: id, created_at };
-    assert!(is_lower_hex(&verified.event_id, 64));
-    Ok(verified)
+    Ok(id)
+}
+
+/// An admission (fragment-next's docs/runtime-seam.md): a signed note that
+/// one iroh peer may reach one computer on one node until a time. The
+/// node decides who may sign one; this only reads and verifies it.
+pub const ADMISSION_KIND: u64 = 27237;
+
+/// The largest admission this reads: four short tags are far below it.
+pub const ADMISSION_BYTES_MAX: usize = 4 * 1024;
+
+/// A verified admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// Who signed it (64 hex).
+    pub signer: String,
+    pub event_id: String,
+    /// The iroh endpoint it admits (64 hex).
+    pub peer: String,
+    /// The computer, by name.
+    pub computer: String,
+    /// The node's public key (64 hex): an admission names one node.
+    pub node: String,
+    pub created_at: i64,
+    /// Its NIP-40 `expiration`, seconds since the epoch.
+    pub expires_at: i64,
+}
+
+/// Verifies an admission (the event as JSON) at `now_s`: not made more than
+/// `window_s` ahead of now, not yet expired, and meant to last no longer
+/// than `lifetime_max_s`.
+pub fn verify_admission(raw: &[u8], now_s: i64, window_s: i64, lifetime_max_s: i64) -> Result<Admission, AuthError> {
+    assert!(window_s > 0 && lifetime_max_s > 0, "a zero window or lifetime would refuse every admission");
+    if raw.len() > ADMISSION_BYTES_MAX {
+        return Err(AuthError::TooLarge);
+    }
+    let ev: serde_json::Value = serde_json::from_slice(raw).map_err(|_| AuthError::Malformed("not JSON"))?;
+    if ev["kind"].as_u64() != Some(ADMISSION_KIND) {
+        return Err(AuthError::WrongKind);
+    }
+    let pubkey = ev["pubkey"].as_str().ok_or(AuthError::BadPubkey)?;
+    if !is_lower_hex(pubkey, 64) {
+        return Err(AuthError::BadPubkey);
+    }
+    let created_at = ev["created_at"].as_i64().ok_or(AuthError::Malformed("created_at"))?;
+    // Made in the future beyond the window: a clock that is off, or a note
+    // meant to outlast its lifetime by starting late.
+    if created_at.saturating_sub(now_s) > window_s {
+        return Err(AuthError::Stale { skew_s: created_at.saturating_sub(now_s) });
+    }
+    let tags = &ev["tags"];
+    let expires_at = tag(tags, "expiration").and_then(|e| e.parse::<i64>().ok()).ok_or(AuthError::Malformed("expiration"))?;
+    let lifetime_s = expires_at.saturating_sub(created_at);
+    if lifetime_s <= 0 {
+        return Err(AuthError::Malformed("expiration before created_at"));
+    }
+    if lifetime_s > lifetime_max_s {
+        return Err(AuthError::TooLong { lifetime_s });
+    }
+    if expires_at <= now_s {
+        return Err(AuthError::Expired);
+    }
+    let peer = tag(tags, "peer").filter(|p| is_lower_hex(p, 64)).ok_or(AuthError::Malformed("peer"))?;
+    let node = tag(tags, "node").filter(|n| is_lower_hex(n, 64)).ok_or(AuthError::Malformed("node"))?;
+    let computer = tag(tags, "computer").filter(|c| !c.is_empty() && c.len() <= 63).ok_or(AuthError::Malformed("computer"))?;
+    let event_id = authentic(&ev, pubkey, created_at, ADMISSION_KIND)?;
+    Ok(Admission { signer: pubkey.to_string(), event_id, peer: peer.to_string(), computer: computer.to_string(), node: node.to_string(), created_at, expires_at })
 }
 
 /// A signing identity.
@@ -212,6 +291,19 @@ impl Keys {
             "kind": KIND, "tags": tags, "content": "", "sig": hex::encode(sig.to_bytes()),
         });
         format!("Nostr {}", base64::engine::general_purpose::STANDARD.encode(ev.to_string()))
+    }
+
+    /// An admission of `peer` to `computer` on `node`, made at `created_at`
+    /// and good until `expires_at`: the event, as JSON.
+    pub fn admission(&self, peer: &str, computer: &str, node: &str, created_at: i64, expires_at: i64) -> String {
+        let tags = serde_json::json!([["peer", peer], ["computer", computer], ["node", node], ["expiration", expires_at.to_string()]]);
+        let id = event_id(&self.pubkey_hex, created_at, ADMISSION_KIND, &tags, "");
+        let sig = self.key.sign_raw(&id, &[0u8; 32]).expect("BIP-340 signing a 32-byte digest");
+        serde_json::json!({
+            "id": hex::encode(id), "pubkey": self.pubkey_hex, "created_at": created_at,
+            "kind": ADMISSION_KIND, "tags": tags, "content": "", "sig": hex::encode(sig.to_bytes()),
+        })
+        .to_string()
     }
 }
 
@@ -330,6 +422,51 @@ mod signed {
         ev["id"] = serde_json::json!(hex::encode(id));
         let stolen = format!("Nostr {}", base64::engine::general_purpose::STANDARD.encode(ev.to_string()));
         assert_eq!(verify(Some(&stolen), "GET", URL, b"", NOW, 60), Err(AuthError::BadSignature));
+    }
+
+    const PEER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const NODE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// Goal: an admission verifies, and each thing it binds refuses a
+    /// change (valid, invalid, expired, too long, forged). Method: one
+    /// admission, then each field changed or each limit crossed.
+    #[test]
+    fn an_admission_verifies_and_refuses_what_it_should() {
+        let k = Keys::generate();
+        let a = k.admission(PEER, "hermes", NODE, NOW, NOW + 300);
+        let v = verify_admission(a.as_bytes(), NOW + 10, 60, 600).expect("a fresh admission verifies");
+        assert_eq!((v.signer.as_str(), v.peer.as_str(), v.computer.as_str(), v.node.as_str(), v.expires_at), (k.pubkey_hex(), PEER, "hermes", NODE, NOW + 300));
+        assert_eq!(verify_admission(a.as_bytes(), NOW + 300, 60, 600), Err(AuthError::Expired));
+        assert_eq!(verify_admission(a.as_bytes(), NOW - 61, 60, 600), Err(AuthError::Stale { skew_s: 61 }), "made too far ahead of now");
+        let long = k.admission(PEER, "hermes", NODE, NOW, NOW + 601);
+        assert_eq!(verify_admission(long.as_bytes(), NOW, 60, 600), Err(AuthError::TooLong { lifetime_s: 601 }));
+        let backwards = k.admission(PEER, "hermes", NODE, NOW, NOW);
+        assert_eq!(verify_admission(backwards.as_bytes(), NOW - 1, 60, 600), Err(AuthError::Malformed("expiration before created_at")));
+        // a request's header is not an admission, nor the other way round
+        let header = k.header("GET", URL, b"", NOW);
+        let raw = base64::engine::general_purpose::STANDARD.decode(&header[6..]).unwrap();
+        assert_eq!(verify_admission(&raw, NOW, 60, 600), Err(AuthError::WrongKind));
+        assert_eq!(verify_admission(format!("{}{}", a, " ".repeat(ADMISSION_BYTES_MAX)).as_bytes(), NOW, 60, 600), Err(AuthError::TooLarge));
+        // each tag, changed after signing
+        for (name, to) in [("peer", NODE), ("computer", "other"), ("node", PEER)] {
+            let mut ev: serde_json::Value = serde_json::from_str(&a).unwrap();
+            for t in ev["tags"].as_array_mut().unwrap() {
+                if t[0] == name {
+                    t[1] = serde_json::json!(to);
+                }
+            }
+            assert_eq!(verify_admission(ev.to_string().as_bytes(), NOW, 60, 600), Err(AuthError::IdMismatch), "{name}");
+        }
+        // someone else's key over the same tags
+        let mut ev: serde_json::Value = serde_json::from_str(&a).unwrap();
+        let other = Keys::generate();
+        ev["pubkey"] = serde_json::json!(other.pubkey_hex());
+        ev["id"] = serde_json::json!(hex::encode(event_id(other.pubkey_hex(), NOW, ADMISSION_KIND, &ev["tags"], "")));
+        assert_eq!(verify_admission(ev.to_string().as_bytes(), NOW, 60, 600), Err(AuthError::BadSignature));
+        // malformed tags
+        for bad in [k.admission("short", "hermes", NODE, NOW, NOW + 60), k.admission(PEER, "", NODE, NOW, NOW + 60), k.admission(PEER, "hermes", "nope", NOW, NOW + 60)] {
+            assert!(matches!(verify_admission(bad.as_bytes(), NOW, 60, 600), Err(AuthError::Malformed(_))), "{bad}");
+        }
     }
 
     #[test]

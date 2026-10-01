@@ -74,14 +74,34 @@ async fn serve(config: Serve) -> Result<(), String> {
     let mut node = Node::new(store, world, config.policy(), backup_key, part_bytes).map_err(|e| format!("the node's state: {e}"))?;
     node.floors = config.sleep.floors();
     let node = Arc::new(node);
+    let iroh = match (&config.iroh_relay, &config.node_key_file) {
+        (Some(relay), Some(path)) => {
+            let hex = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let relay = relay.parse().map_err(|e| format!("--iroh-relay {relay}: {e}"))?;
+            let iroh = sandcastled::iroh::Iroh::new(&hex, Some(relay)).ok_or_else(|| format!("{}: not a 64-hex secret key", path.display()))?;
+            eprintln!("sandcastled: computers reached by their keys through {}; admissions from {}", config.iroh_relay.as_deref().unwrap_or(""), if config.admitters.is_empty() { "each computer's owner".to_string() } else { format!("{:?}", config.admitters) });
+            Some(iroh)
+        }
+        _ => None,
+    };
     eprintln!("sandcastled: serving api.{} and *.{} on {from}", config.domain, config.domain);
-    let daemon = Arc::new(Daemon::new(config, node.clone()));
+    let daemon = Arc::new(Daemon::new(config, node.clone(), iroh));
+    let iroh_task = {
+        let daemon = daemon.clone();
+        async move {
+            match daemon.iroh {
+                Some(_) => sandcastled::iroh::run(daemon.clone()).await,
+                None => std::future::pending().await,
+            }
+        }
+    };
     // Computers keep running when the daemon stops: a restart picks them
     // up from the store and the engine's listing.
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| format!("a SIGTERM handler: {e}"))?;
     tokio::select! {
         () = sandcastle_node::schedule::run(node) => unreachable!("the schedule runs until the process ends"),
         e = sandcastled::router::serve(daemon, listener, tls) => Err(format!("the listener failed: {e}")),
+        () = iroh_task => unreachable!("iroh's endpoints are kept until the process ends"),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("sandcastled: interrupted; computers keep running");
             Ok(())

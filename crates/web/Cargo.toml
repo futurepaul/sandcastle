@@ -1,0 +1,24 @@
+[package]
+name = "sandcastle-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A browser's way to a sandcastle computer by its key: HTTP and WebSockets over iroh, from WASM (fragment-next docs/runtime-seam.md)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Built for the browser only (scripts in its README); on the host it is empty.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+serde_json.workspace = true
+tokio = { version = "=1.53.1", default-features = false, features = ["io-util", "sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }

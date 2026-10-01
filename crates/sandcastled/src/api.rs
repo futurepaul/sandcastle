@@ -13,12 +13,12 @@ use std::time::Duration;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use sandcastle_core::model::{ComputerId, Desired, SnapshotName};
+use sandcastle_core::model::{Computer, ComputerId, Desired, SnapshotName};
 use sandcastle_core::step::GateError;
 use sandcastle_node::commands::{self, CommandError, Put, RestorePlan};
 use sandcastle_node::gates::{Disks, Source, World};
 use sandcastle_node::store::StoreError;
-use sandcastle_proto::{BackupList, BackupView, ComputerList, ComputerSpec, GrantSpec, SleepAsk, SnapshotList, SnapshotView, Storage, Ticket, TICKET_TTL_S};
+use sandcastle_proto::{BackupList, BackupView, ComputerList, ComputerSpec, ComputerView, GrantSpec, SleepAsk, SnapshotList, SnapshotView, Storage, Ticket, TICKET_TTL_S};
 
 use crate::daemon::{token_hash, Daemon};
 use crate::http::{error, json, Body};
@@ -118,14 +118,14 @@ pub async fn handle<W: World>(d: &Daemon<W>, req: Request<Incoming>) -> Resp {
             Err(e) => command_error(e),
         },
         (&Method::GET, ["v1", "computers"]) => match store.of_owner(&signer) {
-            Ok(cs) => json(StatusCode::OK, &ComputerList { computers: cs.iter().map(|c| commands::view(c, d.config.computer_url(&c.name))).collect() }),
+            Ok(cs) => json(StatusCode::OK, &ComputerList { computers: cs.iter().map(|c| view(d, c)).collect() }),
             Err(e) => store_error(&e),
         },
         (&Method::PUT, ["v1", "computers", name]) => put_computer(d, &signer, name, &query, &body).await,
         // A computer being deleted can still be read (desired: deleted), so
         // a caller polls until 404 rather than trusting the 202.
         (&Method::GET, ["v1", "computers", name]) => match store.by_name(name) {
-            Ok(Some(c)) if c.owner == signer => json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name))),
+            Ok(Some(c)) if c.owner == signer => json(StatusCode::OK, &view(d, &c)),
             Ok(_) => not_found(),
             Err(e) => store_error(&e),
         },
@@ -143,7 +143,7 @@ pub async fn handle<W: World>(d: &Daemon<W>, req: Request<Incoming>) -> Resp {
             Ok(ask) => match commands::sleep_now(store, grantors, &signer, name, ask.tier, &d.node.policy, now) {
                 Ok(c) => {
                     d.node.nudges.nudge(c.id);
-                    json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name)))
+                    json(StatusCode::OK, &view(d, &c))
                 }
                 Err(e) => command_error(e),
             },
@@ -225,7 +225,7 @@ fn desire<W: World>(d: &Daemon<W>, signer: &str, name: &str, desired: Desired) -
     match commands::set_desired(&d.node.store, signer, name, desired, d.now()) {
         Ok(c) => {
             d.node.nudges.nudge(c.id);
-            json(StatusCode::OK, &commands::view(&c, d.config.computer_url(&c.name)))
+            json(StatusCode::OK, &view(d, &c))
         }
         Err(e) => command_error(e),
     }
@@ -241,7 +241,7 @@ fn wake<W: World>(d: &Daemon<W>, signer: &str, name: &str) -> Resp {
         Ok(c) => {
             d.node.activity.touch(c.id, d.now());
             d.node.nudges.nudge(c.id);
-            json(StatusCode::ACCEPTED, &commands::view(&c, d.config.computer_url(&c.name)))
+            json(StatusCode::ACCEPTED, &view(d, &c))
         }
         Err(e) => command_error(e),
     }
@@ -281,7 +281,7 @@ async fn put_computer<W: World>(d: &Daemon<W>, signer: &str, name: &str, query: 
         Ok((c, put)) => {
             d.node.nudges.nudge(c.id);
             let status = if put == Put::Created { StatusCode::CREATED } else { StatusCode::OK };
-            json(status, &commands::view(&c, d.config.computer_url(&c.name)))
+            json(status, &view(d, &c))
         }
         Err(e) => command_error(e),
     }
@@ -354,4 +354,12 @@ fn ticket<W: World>(d: &Daemon<W>, signer: &str, name: &str) -> Resp {
         }
         Err(e) => command_error(e),
     }
+}
+
+/// A computer as its owner reads it: its URL, and its key when the node
+/// serves computers over iroh.
+fn view<W: World>(d: &Daemon<W>, c: &Computer) -> ComputerView {
+    let mut v = commands::view(c, d.config.computer_url(&c.name));
+    v.iroh = d.iroh.as_ref().map(|i| i.view(c.id));
+    v
 }

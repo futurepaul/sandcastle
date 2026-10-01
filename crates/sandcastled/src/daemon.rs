@@ -18,11 +18,14 @@ pub struct Daemon<W: World> {
     pub config: Serve,
     pub node: Arc<Node<W>>,
     pub slots: Arc<tokio::sync::Semaphore>,
+    /// Computers reached by their keys, when the node serves them so.
+    pub iroh: Option<crate::iroh::Iroh>,
 }
 
 impl<W: World> Daemon<W> {
-    pub fn new(config: Serve, node: Arc<Node<W>>) -> Daemon<W> {
-        Daemon { config, node, slots: Arc::new(tokio::sync::Semaphore::new(CONNECTIONS_MAX)) }
+    pub fn new(config: Serve, node: Arc<Node<W>>, iroh: Option<crate::iroh::Iroh>) -> Daemon<W> {
+        assert_eq!(iroh.is_some(), config.iroh(), "iroh is configured, and its keys are given, or neither");
+        Daemon { config, node, slots: Arc::new(tokio::sync::Semaphore::new(CONNECTIONS_MAX)), iroh }
     }
 
     pub fn now(&self) -> Millis {

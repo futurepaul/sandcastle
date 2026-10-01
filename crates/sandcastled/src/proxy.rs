@@ -136,6 +136,23 @@ async fn admit<W: World>(d: &Arc<Daemon<W>>, computer: Computer, peer: SocketAdd
     forward(d, &computer, peer, req, flight).await
 }
 
+/// Where a request that came over iroh says it came from: nowhere the
+/// service could reach (the peer is a key, not an address).
+const IROH_PEER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
+/// A request its computer's iroh admission let in (`crate::iroh`): the
+/// admission is its gate, and a peer that dials a key has no origin to
+/// admit, so the owner's cookie and the router's CORS are not this path's.
+/// The rest is the router's: activity, wake, hold, forward.
+pub async fn pass<W: World>(d: &Arc<Daemon<W>>, id: ComputerId, req: Request<Incoming>) -> Resp {
+    let flight = InFlight::begin(d, id);
+    let computer = match serving(d, id).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    forward(d, &computer, IROH_PEER, req, flight).await
+}
+
 /// Whether a request goes to its computer now: one meant to run goes once
 /// it is awake and serving (or failed: then it answers or not); one
 /// stopped goes as it is.
