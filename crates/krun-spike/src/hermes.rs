@@ -130,6 +130,124 @@ pub fn scenario(node: &Node, n: usize) -> Result<Value, Error> {
     }))
 }
 
+/// A diagnostic, not acceptance: where Hermes's start goes, and what each
+/// change to it buys. The first start has a fresh `/opt/data`, the rest keep
+/// it. With `snoop` (a static sampler, copied into each guest as soon as it
+/// is ready) each run carries every process (start, parent, argv, CPU when
+/// last seen), each port as it first listens, and the machine's CPU and disk
+/// reads, on the guest's boot clock; the sampler costs the guest some CPU,
+/// so its runs are slower. `env` adds to the start's environment, `argv`
+/// replaces the main program after `/init`, `vcpu` the instance's vCPUs;
+/// `after` is a script each run execs once it serves, its output kept.
+pub struct Trace {
+    pub snoop: Option<std::path::PathBuf>,
+    pub runs: usize,
+    pub env: Vec<(String, String)>,
+    pub argv: Option<Vec<String>>,
+    pub vcpu: Option<f64>,
+    pub after: Option<String>,
+}
+
+/// The gateway's loopback API (`API_SERVER_PORT`'s default), and how long
+/// after the dashboard serves it may take to listen.
+const GATEWAY_API: u16 = 8642;
+const GATEWAY_S: u64 = 20;
+
+pub fn trace_scenario(node: &Node, t: &Trace) -> Result<Value, Error> {
+    let layout = crate::layout::Layout::from_env();
+    let stand_in = StandIn::new(&layout)?;
+    let binary = t.snoop.as_ref().map(std::fs::read).transpose().map_err(Error::io("reading the sampler"))?;
+    node.block(node.client.pull(HERMES)).map_err(engine_err)?;
+    node.delete_data("hermes-trace");
+    let mut s = hermes_start(&stand_in.handler());
+    s.data.as_mut().expect("hermes has a data disk").name = "hermes-trace".into();
+    for (k, v) in &t.env {
+        s.env.insert(k.clone(), v.clone());
+    }
+    if let Some(argv) = &t.argv {
+        let mut e = vec!["/init".to_string(), "/opt/hermes/docker/main-wrapper.sh".into()];
+        e.extend(argv.iter().cloned());
+        s.entrypoint = Some(e);
+    }
+    if let Some(vcpu) = t.vcpu {
+        // The engine's floor is 3 GiB a vCPU.
+        let memory_mib = ((vcpu * 3072.0).ceil() as u32).max(6144);
+        s.instance = Some(Instance::Custom { vcpu, memory_mib, disk_mb: 16_000 });
+    }
+    let mut out = vec![];
+    // Bounded by `runs`.
+    for i in 0..t.runs.max(1) {
+        let t0 = Instant::now();
+        let c = node.start("hermes-trace", &s)?;
+        let mut issued = None;
+        let sampler = match &binary {
+            Some(binary) => {
+                let copied = c.exec(&["/bin/sh", "-c", "cat > /tmp/snoop && chmod +x /tmp/snoop"], Some(binary))?;
+                if copied.code != Some(0) {
+                    return Err(Error::msg(format!("copying the sampler: exit {:?}", copied.code)));
+                }
+                issued = Some(ms(t0, Instant::now()));
+                let vm = sandcastle_vm::client::Vm::new(&c.run_dir);
+                let path = c.info.path.clone();
+                Some(std::thread::spawn(move || {
+                    let env = path.map(|p| vec![format!("PATH={p}")]).unwrap_or_default();
+                    let argv = ["/tmp/snoop", "9000", "2000"].map(String::from).to_vec();
+                    vm.exec(sandcastle_wire::Process { argv, env, ..Default::default() }, None)
+                }))
+            }
+            None => None,
+        };
+        let serving = ms(t0, until_serving(&c)?);
+        let deadline = Instant::now() + Duration::from_secs(GATEWAY_S);
+        // Bounded by GATEWAY_S.
+        let gateway = loop {
+            if c.vm.connect(GATEWAY_API).is_ok() {
+                break Some(ms(t0, Instant::now()));
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let trace = match sampler {
+            Some(h) => {
+                let o = h.join().map_err(|_| Error::msg("the sampler thread panicked"))?.map_err(agent_err)?;
+                String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect::<Vec<_>>()
+            }
+            None => vec![],
+        };
+        let after = t.after.as_deref().map(|script| c.sh(script)).transpose()?.map(|(text, code)| json!({"code": code, "output": text}));
+        let logs = node.block(node.client.logs("hermes-trace")).map_err(engine_err)?;
+        out.push(json!({
+            "run": i,
+            "data": if i == 0 { "fresh" } else { "kept" },
+            "start_to_ready_ms": c.start_ms,
+            "sampler_issued_ms": issued,
+            "start_to_serving_ms": serving,
+            "start_to_gateway_api_ms": gateway,
+            "timings": c.timings,
+            "trace": trace,
+            "after": after,
+            "logs": logs,
+        }));
+        c.destroy(None)?;
+    }
+    node.delete_data("hermes-trace");
+    let kept: Vec<f64> = out.iter().skip(1).filter_map(|r| r["start_to_serving_ms"].as_f64()).collect();
+    let kept_gw: Vec<f64> = out.iter().skip(1).filter_map(|r| r["start_to_gateway_api_ms"].as_f64()).collect();
+    Ok(json!({
+        "image": HERMES,
+        "env": t.env,
+        "argv": t.argv,
+        "vcpu": t.vcpu.unwrap_or(2.0),
+        "sampled": t.snoop.is_some(),
+        "fresh_start_to_serving_ms": out.first().map(|r| r["start_to_serving_ms"].clone()),
+        "kept_start_to_serving_ms": (!kept.is_empty()).then(|| stats(&kept)),
+        "kept_start_to_gateway_api_ms": (!kept_gw.is_empty()).then(|| stats(&kept_gw)),
+        "runs": out,
+    }))
+}
+
 /// Acceptance 6: one Hermes, its memory (its cgroup's charge) as it
 /// serves and idles, then after a reclaim.
 pub fn memory_scenario(node: &Node) -> Result<Value, Error> {

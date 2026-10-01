@@ -27,7 +27,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
     let Some(cmd) = args.first() else {
-        return Err(Error::msg("a scenario: boot, fresh-root, exec, port, egress, hermes, hermes-memory, crash, parity, probe, census, reset, pull"));
+        return Err(Error::msg("a scenario: boot, fresh-root, exec, port, egress, hermes, hermes-memory, hermes-trace, crash, parity, probe, census, reset, pull"));
     };
     let n: usize = flag(args, "--n").map(|s| s.parse().unwrap_or(10)).unwrap_or(10);
     let v = match cmd.as_str() {
@@ -51,6 +51,20 @@ pub fn dispatch(layout: &Layout, args: &[String]) -> Result<Value, Error> {
                 "egress" => crate::egress::scenario(layout, &node)?,
                 "hermes" => crate::hermes::scenario(&node, n)?,
                 "hermes-memory" => crate::hermes::memory_scenario(&node)?,
+                "hermes-trace" => {
+                    let all = |name: &str| -> Vec<&str> {
+                        args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).map(String::as_str)).collect()
+                    };
+                    let t = crate::hermes::Trace {
+                        snoop: flag(args, "--snoop").map(PathBuf::from),
+                        runs: n,
+                        env: all("--env").into_iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect(),
+                        argv: flag(args, "--argv").map(|a| a.split_whitespace().map(String::from).collect()),
+                        vcpu: flag(args, "--vcpu").and_then(|v| v.parse().ok()),
+                        after: flag(args, "--after").map(String::from),
+                    };
+                    crate::hermes::trace_scenario(&node, &t)?
+                }
                 "crash" => crash(layout, &node)?,
                 "parity" => crate::parity::scenario(layout, &node)?,
                 "fidelity" => crate::fidelity::scenario(&node)?,

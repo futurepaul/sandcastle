@@ -9,6 +9,13 @@ description = "The libkrun spike's driver (docs/krun-spike.md): each scenario, i
 name = "sandcastle-krun-spike"
 path = "src/main.rs"
 
+# hermes-trace's sampler, run inside a guest: std and libc only, linked
+# static (`RUSTFLAGS="-C target-feature=+crt-static"` with an explicit
+# `--target x86_64-unknown-linux-gnu`).
+[[bin]]
+name = "sandcastle-snoop"
+path = "src/bin/snoop.rs"
+
 [dependencies]
 sandcastle-wire.workspace = true
 sandcastle-vm.workspace = true
