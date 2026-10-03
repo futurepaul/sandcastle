@@ -245,7 +245,7 @@ impl Engine {
             kvm_gid: kvm_gid().ok_or_else(|| ApiError::Internal("no kvm group".into()))?,
             owner_uid: c.client_uid,
             owner_gid: c.client_gid,
-            system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
+            system_libs: c.system_libs.clone(),
             seccomp: c.seccomp,
         };
         settings.validate().map_err(|e| ApiError::Internal(e.to_string()))?;

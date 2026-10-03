@@ -1,0 +1,30 @@
+[package]
+name = "sandcastle-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A node on the network (docs/node.md): the engine's API for a platform elsewhere, its calls signed; exec over a WebSocket; guest ports over HTTP; and each intercepted request handed to the platform, signed. Unprivileged: it reaches the engine only through its sockets."
+
+[[bin]]
+name = "sandcastle-node"
+path = "src/main.rs"
+
+[dependencies]
+sandcastle-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
+hmac.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

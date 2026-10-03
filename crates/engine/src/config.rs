@@ -37,6 +37,15 @@ pub struct EngineConfig {
     /// the allowlist misses.
     #[serde(default)]
     pub seccomp: sandcastle_vm::jail::SeccompMode,
+    /// The host's shared libraries a VM's runner loads libkrun's
+    /// dependencies from, each bound read-only into its jail, under `/usr`:
+    /// Debian's layout by default; Arch's is `/usr/lib`.
+    #[serde(default = "debian_libs")]
+    pub system_libs: Vec<PathBuf>,
+}
+
+fn debian_libs() -> Vec<PathBuf> {
+    vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()]
 }
 
 fn yes() -> bool {
@@ -144,6 +153,7 @@ pub(crate) mod tests {
             kernel_args: vec![],
             pull: true,
             seccomp: sandcastle_vm::jail::SeccompMode::Enforce,
+            system_libs: debian_libs(),
         }
     }
 
