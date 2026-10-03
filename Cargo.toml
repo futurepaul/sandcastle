@@ -16,9 +16,9 @@ sandcastle-rootfs = { path = "crates/rootfs" }
 sandcastle-egress = { path = "crates/egress" }
 sandcastle-engine = { path = "crates/engine" }
 sandcastle-node = { path = "crates/node" }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
 hex = "=0.4.3"
-hmac = "0.12"
+hmac = "=0.12.1"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
@@ -36,7 +36,7 @@ sha2 = "=0.10.9"
 thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "time", "io-util", "sync", "signal", "fs"] }
 # the node's exec over a WebSocket (docs/node.md)
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 url = "=2.5.8"
 webpki-roots = "=1.0.9"
