@@ -1,0 +1,63 @@
+{
+  "evidence": {
+    "bytes": 268435456,
+    "checks": {
+      "closed_port_refused": true,
+      "loopback_only_handed_over_as_vsock": true,
+      "nic_at_least_1_gib_s": true,
+      "unknown_container_not_found": true
+    },
+    "guest_loopback_mib_s": {
+      "max": 7660.159,
+      "median": 7488.772,
+      "min": 4780.062,
+      "n": 3
+    },
+    "instance": {
+      "memoryMib": 6144,
+      "vcpu": 2
+    },
+    "nic": {
+      "first_byte_ms": {
+        "max": 0.42,
+        "median": 0.415,
+        "min": 0.273,
+        "n": 3
+      },
+      "mib_s": {
+        "max": 6757.421,
+        "median": 6303.696,
+        "min": 6288.893,
+        "n": 3
+      }
+    },
+    "nic_fresh_vm": {
+      "mib_s": 2290.0,
+      "ready_to_first_byte_ms": 51.504,
+      "transport": "vsock"
+    },
+    "pass": true,
+    "vsock": {
+      "first_byte_ms": {
+        "max": 3.602,
+        "median": 2.328,
+        "min": 1.219,
+        "n": 3
+      },
+      "mib_s": {
+        "max": 2858.554,
+        "median": 2567.593,
+        "min": 2544.702,
+        "n": 3
+      }
+    }
+  },
+  "scenario": "port-nic",
+  "versions": {
+    "engine_sha256_16": "bb125a0375086607",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "173a31b4853d5612"
+  }
+}

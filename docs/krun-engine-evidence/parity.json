@@ -1,0 +1,54 @@
+{
+  "evidence": {
+    "checks": {
+      "ca_at_cloudflares_path": true,
+      "deleted_snapshot_gone": true,
+      "exec_env_inherits_path_only": true,
+      "exec_stderr_combined": true,
+      "exec_stdout_ignored": true,
+      "guest_sees_the_instance": true,
+      "inspect_image_empty_when_restored": true,
+      "inspect_labels_and_image": true,
+      "inspect_null_after_destroy": true,
+      "inspect_resources": true,
+      "intercept_added_while_running": true,
+      "intercepts_past_cloudflares_count_refused": true,
+      "logs_carry_stdout_and_stderr": true,
+      "monitor_after_end": true,
+      "monitor_clean_on_destroy": true,
+      "monitor_clean_on_exit_0": true,
+      "monitor_rejects_destroy_with_error": true,
+      "monitor_rejects_exit_3": true,
+      "refuses_11_labels": true,
+      "refuses_2_vcpu_4_gib": true,
+      "refuses_image_and_snapshot": true,
+      "refuses_past_the_node_budget": true,
+      "refuses_unknown_instance": true,
+      "restored_from_snapshot": true,
+      "running_after_snapshot": true,
+      "second_start_conflicts": true,
+      "signal_reaches_the_entrypoint": true,
+      "snapshot_listed": true,
+      "snapshot_shape": true
+    },
+    "pass": true,
+    "restore_start_ms": 213.0,
+    "snapshot": {
+      "createdAtMs": 1790834004310,
+      "expiresAtMs": 1793426004310,
+      "id": "36ffbf45342403a760fc4fed50b990f1",
+      "image": "busybox:1.37.0",
+      "name": "parity-snap",
+      "size": 4100096
+    },
+    "snapshot_ms": 46.5
+  },
+  "scenario": "parity",
+  "versions": {
+    "engine_sha256_16": "bb125a0375086607",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "173a31b4853d5612"
+  }
+}

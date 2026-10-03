@@ -1,0 +1,70 @@
+{
+  "evidence": {
+    "adoption": {
+      "census_after": {
+        "engine_containers": [],
+        "units": [
+          "krun-engine.service",
+          "krun-spike.slice"
+        ],
+        "vm_processes": []
+      },
+      "ended_while_down": {
+        "code": 5,
+        "destroyed": false,
+        "error": null,
+        "signal": null
+      },
+      "new_start_own_slot": true,
+      "restart_to_serving_ms": 39.2,
+      "survivor_destroyed": true,
+      "survivor_exec": true,
+      "survivor_running": true
+    },
+    "data_after_crash": {
+      "intact": true,
+      "reread": "b52a30d1b2cfa5bde623880985ec2f06ac0810950fe0132e2ebec998900f8a8c\nb52a30d1b2cfa5bde623880985ec2f06ac0810950fe0132e2ebec998900f8a8c\n",
+      "written_sha256": "b52a30d1b2cfa5bde623880985ec2f06ac0810950fe0132e2ebec998900f8a8c"
+    },
+    "engine_killed": {
+      "census_while_down": {
+        "engine_containers": null,
+        "units": [
+          "krun-engine.service",
+          "krun-spike.slice"
+        ],
+        "vm_processes": [
+          "300000 1317464 sandcastle-vm"
+        ]
+      },
+      "restarted_ok": true,
+      "systemctl_kill_ok": true
+    },
+    "pass": true,
+    "vm_crash": {
+      "census": {
+        "engine_containers": [],
+        "units": [
+          "krun-engine.service",
+          "krun-spike.slice"
+        ],
+        "vm_processes": []
+      },
+      "kill_to_monitored_ms": 313.0,
+      "monitor": {
+        "code": null,
+        "destroyed": false,
+        "error": "the VM ended without its entrypoint's exit (Some(ExitStatus(unix_wait_status(35072))))",
+        "signal": null
+      }
+    }
+  },
+  "scenario": "crash",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

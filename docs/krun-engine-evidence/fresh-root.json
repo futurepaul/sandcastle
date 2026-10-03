@@ -1,0 +1,15 @@
+{
+  "evidence": {
+    "first_start_wrote": "first\nkept\n",
+    "pass": true,
+    "second_start_saw": "root-fresh\nkept\n"
+  },
+  "scenario": "fresh-root",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

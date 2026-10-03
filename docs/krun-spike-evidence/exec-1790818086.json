@@ -1,0 +1,36 @@
+{
+  "evidence": {
+    "checks": {
+      "entrypoint_exit_code": true,
+      "kill": true,
+      "missing_binary_refused": true,
+      "process_limit": true,
+      "pty_resize": true,
+      "slots_returned": true,
+      "stdin": true,
+      "streams": true,
+      "ten_megabytes": true
+    },
+    "entrypoint_exited_to_runner_gone_ms": 20.256,
+    "kill_to_exit_ms": 2.052,
+    "missing": "Err(Refused(\"/no/such/binary: No such file or directory (os error 2)\"))",
+    "over_limit": "Err(Refused(\"64 processes at once\"))",
+    "pass": true,
+    "round_trip_ms": {
+      "max": 4.123,
+      "median": 3.999,
+      "min": 1.83,
+      "n": 20
+    },
+    "runner_exit_status": 0
+  },
+  "jail": true,
+  "scenario": "exec",
+  "versions": {
+    "guest_sha256_16": "4eb2364f8b94e375",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "727bf50d563118a5"
+  }
+}

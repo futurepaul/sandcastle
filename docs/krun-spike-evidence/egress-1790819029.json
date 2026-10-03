@@ -1,0 +1,222 @@
+{
+  "evidence": {
+    "checks": {
+      "handler_answered": true,
+      "node_refused": true,
+      "off_direct_ip_refused": true,
+      "off_handler_answered": true,
+      "off_intercepted_name_resolved": true,
+      "off_public_name_unresolved": true,
+      "placeholder_substituted": true,
+      "private_refused": true,
+      "spliced_with_real_tls": true
+    },
+    "decisions_off": [
+      {
+        "decision": "Refuse",
+        "host": "example.com",
+        "to": "dns example.com type 28"
+      },
+      {
+        "decision": "Refuse",
+        "host": "example.com",
+        "to": "dns example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Refuse(\"the internet is off\")",
+        "host": null,
+        "to": "1.1.1.1:443"
+      }
+    ],
+    "decisions_on": [
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Intercept(1)",
+        "host": "httpbin.org",
+        "to": "dns httpbin.org type 28"
+      },
+      {
+        "decision": "Intercept(1)",
+        "host": "httpbin.org",
+        "to": "dns httpbin.org type 1"
+      },
+      {
+        "decision": "Intercept(1)",
+        "host": "httpbin.org",
+        "to": "198.18.0.2:443"
+      },
+      {
+        "decision": "Resolve",
+        "host": "example.com",
+        "to": "dns example.com type 28"
+      },
+      {
+        "decision": "Resolve",
+        "host": "example.com",
+        "to": "dns example.com type 1"
+      },
+      {
+        "decision": "Splice",
+        "host": "example.com",
+        "to": "198.18.0.3:443"
+      },
+      {
+        "decision": "Refuse(\"not a public address\")",
+        "host": null,
+        "to": "10.0.0.1:80"
+      },
+      {
+        "decision": "Refuse(\"not a public address\")",
+        "host": null,
+        "to": "169.254.169.254:80"
+      },
+      {
+        "decision": "Refuse(\"the node's own address\")",
+        "host": null,
+        "to": "<node-ip>:22"
+      },
+      {
+        "decision": "Refuse(\"the node's own address\")",
+        "host": null,
+        "to": "<node-ip>:443"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 28"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "dns model.example.com type 1"
+      },
+      {
+        "decision": "Intercept(0)",
+        "host": "model.example.com",
+        "to": "198.18.0.1:443"
+      }
+    ],
+    "handled": "{\"authorization\":\"Bearer SC_PLACEHOLDER_TEST_0001\",\"host\":\"model.example.com\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"scheme\":\"https\",\"stand_in\":\"the spike's stand-in for celld's callback route\"}",
+    "handler_request_ms_in_guest": {
+      "max": 2.748,
+      "median": 2.731,
+      "min": 2.67,
+      "n": 5
+    },
+    "node": "rc=52\nrc=52\ncurl: (52) Empty reply from server\ncurl: (52) Empty reply from server\n",
+    "off_direct_ip": "rc=35\ncurl: (35) TLS connect error: error:0A000126:SSL routines::unexpected eof while reading\n",
+    "off_lookup_model": "Server:\t\t10.0.2.2\nAddress:\t10.0.2.2:53\n\nNon-authoritative answer:\nName:\tmodel.example.com\nAddress: 198.18.0.1\n\nNon-authoritative answer:\n\n",
+    "off_lookup_public": "Server:\t\t10.0.2.2\nAddress:\t10.0.2.2:53\n\n** server can't find example.com: NXDOMAIN\n\n** server can't find example.com: NXDOMAIN\n\n",
+    "pass": true,
+    "private": "rc=52\nrc=52\ncurl: (52) Empty reply from server\ncurl: (52) Empty reply from server\n",
+    "substituted": "{\n  \"headers\": {\n    \"Accept\": \"*/*\", \n    \"Authorization\": \"Bearer sk-test-not-a-real-secret\", \n    \"Host\": \"httpbin.org\", \n    \"User-Agent\": \"curl/8.22.0\", \n    \"X-Amzn-Trace-Id\": \"Root=1-6abdbad4-14fbd61b69db264d096211f2\"\n  }\n}\n"
+  },
+  "jail": true,
+  "scenario": "egress",
+  "versions": {
+    "guest_sha256_16": "f5e540a2086ab166",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "62791c40372266fb"
+  }
+}

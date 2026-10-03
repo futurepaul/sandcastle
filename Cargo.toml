@@ -1,48 +1,31 @@
-# sandcastle: self-hosted computers (docs/sandbox.md in fragment-next).
-# A workspace of its own that depends on nothing in fragment-next, so it can
-# move to Finite unchanged. Versions are the ones fragment-next's lockfile
-# already vetted where they overlap; new ones passed the two-week cooldown.
+# sandcastle: Cloudflare's container API on libkrun microVMs (README.md).
+# Versions are pinned exactly; each was vetted when it came in
+# (docs/krun-spike.md, Dependencies).
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/nip98", "crates/core", "crates/node", "crates/sim", "crates/sandcastled", "crates/cli", "crates/e2e", "crates/web", "crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/krun-spike"]
+members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/krun-spike"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-sandcastle-proto = { path = "crates/proto" }
-sandcastle-nip98 = { path = "crates/nip98" }
-sandcastle-core = { path = "crates/core" }
-sandcastle-node = { path = "crates/node" }
 sandcastle-wire = { path = "crates/wire" }
 sandcastle-vm = { path = "crates/vm" }
 sandcastle-rootfs = { path = "crates/rootfs" }
 sandcastle-egress = { path = "crates/egress" }
 sandcastle-engine = { path = "crates/engine" }
-aes-gcm = "=0.10.3"
-base64 = "=0.22.1"
-clap = { version = "=4.6.6", features = ["derive", "env"] }
 hex = "=0.4.3"
-hkdf = "=0.12.4"
-hmac = "=0.12.1"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
-# The libkrun spike's (docs/krun-spike.md): libc for namespaces, dlopen,
-# vsock, and seccomp; the guest's layer decoders, pure Rust so the guest
-# links statically against musl.
+# libc for namespaces, dlopen, vsock, and seccomp; the guest's layer
+# decoders, pure Rust so the guest links statically against musl.
 libc = "=0.2.189"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 tar = { version = "=0.4.46", default-features = false }
 ruzstd = "=0.9.0"
-# A computer reached by its key (fragment-next docs/runtime-seam.md): ring
-# for TLS as the node's own listener, and no UPnP or NAT-PMP port mapping.
-iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
-k256 = { version = "=0.13.4", default-features = false, features = ["schnorr"] }
-rand_core = { version = "=0.6.4", features = ["getrandom"] }
 rcgen = "=0.14.10"
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
@@ -53,25 +36,10 @@ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["rin
 url = "=2.5.8"
 webpki-roots = "=1.0.9"
 
-# The seatbelt stays on, and a failed assertion takes the whole node down
-# (systemd restarts it; its machines keep running), never one task of it
-# while the rest carries on.
+# The seatbelt stays on: a failed assertion takes the whole process down,
+# never one task of it while the rest carries on.
 [profile.dev]
 panic = "abort"
-
-# The simulator's seeds are mostly SQLite and the core: optimized, a
-# debug run of the default seeds takes seconds, not minutes.
-[profile.dev.package."*"]
-opt-level = 2
-
-[profile.dev.package.sandcastle-core]
-opt-level = 2
-
-[profile.dev.package.sandcastle-node]
-opt-level = 2
-
-[profile.dev.package.sandcastle-sim]
-opt-level = 2
 
 [profile.release]
 strip = true

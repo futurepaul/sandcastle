@@ -1,0 +1,46 @@
+{
+  "evidence": {
+    "first_ping_ms": {
+      "max": 3.782,
+      "median": 1.403,
+      "min": 1.138,
+      "n": 3
+    },
+    "guest_uptime_at_ready_ms": {
+      "max": 56.0,
+      "median": 54.0,
+      "min": 54.0,
+      "n": 3
+    },
+    "image": "busybox:1.37.0",
+    "memory_mib": 512,
+    "runner_clock_ready_ms": {
+      "max": 107.163,
+      "median": 104.471,
+      "min": 104.359,
+      "n": 3
+    },
+    "scratch_disk_ms": {
+      "max": 4.691,
+      "median": 4.495,
+      "min": 4.215,
+      "n": 3
+    },
+    "spawn_to_ready_ms": {
+      "max": 130.089,
+      "median": 124.277,
+      "min": 122.91,
+      "n": 3
+    },
+    "vcpus": 1
+  },
+  "jail": true,
+  "scenario": "boot",
+  "versions": {
+    "guest_sha256_16": "7253e7966932f432",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "e2da83d9af52b62a"
+  }
+}

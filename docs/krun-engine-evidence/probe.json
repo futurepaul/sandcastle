@@ -1,0 +1,87 @@
+{
+  "evidence": {
+    "pass": true,
+    "reached": [],
+    "report": {
+      "allowlist": {
+        "execve": "signal 31",
+        "getpid": "exit 0"
+      },
+      "cap_bnd": "0000000000000000",
+      "cap_eff": "0000000000000000",
+      "connect_public": "Network is unreachable (os error 101)",
+      "gid": [
+        300040,
+        300040,
+        300040
+      ],
+      "groups": "994",
+      "host_paths": {
+        "/dev/zvol": "No such file or directory (os error 2)",
+        "/etc/shadow": "No such file or directory (os error 2)",
+        "/home": "No such file or directory (os error 2)",
+        "/root": "No such file or directory (os error 2)",
+        "/sys": "No such file or directory (os error 2)",
+        "/tank": "No such file or directory (os error 2)",
+        "/var/lib": "No such file or directory (os error 2)"
+      },
+      "must_not_reach": {
+        "/etc/sandcastle": "No such file or directory (os error 2)",
+        "/etc/sandcastle/node.key": "No such file or directory (os error 2)",
+        "/home/ubuntu": "No such file or directory (os error 2)",
+        "/home/ubuntu/.microsandbox": "No such file or directory (os error 2)",
+        "/home/ubuntu/.ssh": "No such file or directory (os error 2)",
+        "/home/ubuntu/krun-spike": "No such file or directory (os error 2)",
+        "/home/ubuntu/krun-spike/e/ca/ca.key": "No such file or directory (os error 2)",
+        "/home/ubuntu/krun-spike/e/vms/0/scratch.ext4": "No such file or directory (os error 2)",
+        "/var/lib/sandcastle": "No such file or directory (os error 2)",
+        "tcp:127.0.0.1:3340": "Connection refused (os error 111)",
+        "tcp:127.0.0.53:53": "Connection refused (os error 111)",
+        "tcp:<node-ip>:22": "Network is unreachable (os error 101)",
+        "tcp:<node-ip>:443": "Network is unreachable (os error 101)"
+      },
+      "no_new_privs": "1",
+      "open_kvm": "Ok(\"opened\")",
+      "root_entries": [
+        "config.json",
+        "dev",
+        "disks",
+        "krun",
+        "lib",
+        "lib64",
+        "proc",
+        "usr",
+        "vm"
+      ],
+      "seccomp": "2",
+      "syscalls": {
+        "bpf": "Operation not permitted (os error 1)",
+        "chroot": "Operation not permitted (os error 1)",
+        "clone3": "Function not implemented (os error 38)",
+        "mount": "Operation not permitted (os error 1)",
+        "ptrace_traceme": "Operation not permitted (os error 1)",
+        "setuid_0": "Operation not permitted (os error 1)",
+        "unshare_user": "Operation not permitted (os error 1)"
+      },
+      "uid": [
+        300040,
+        300040,
+        300040
+      ],
+      "visible_pids": [
+        "1"
+      ],
+      "write_boot_disk": "Err(\"Permission denied (os error 13)\")",
+      "write_libkrun": "Err(\"Permission denied (os error 13)\")",
+      "write_root": "Err(\"Read-only file system (os error 30)\")"
+    }
+  },
+  "scenario": "probe",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

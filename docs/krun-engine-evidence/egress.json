@@ -1,0 +1,50 @@
+{
+  "evidence": {
+    "checks": {
+      "handler_answered": true,
+      "node_refused": true,
+      "off_direct_ip_refused": true,
+      "off_handler_answered": true,
+      "off_intercepted_name_resolved": true,
+      "off_public_name_unresolved": true,
+      "placeholder_substituted": true,
+      "private_refused": true,
+      "spliced_with_real_tls": true
+    },
+    "handled": "{\"authorization\":\"Bearer SC_PLACEHOLDER_TEST_0001\",\"host\":\"model.example.com\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"scheme\":\"https\",\"stand_in\":\"the spike's stand-in for celld's callback route\"}",
+    "handler_request_ms_in_guest": {
+      "lite": {
+        "max": 98.596,
+        "median": 94.691,
+        "min": 2.614,
+        "n": 5
+      },
+      "lite_throttled": {
+        "ms": 560,
+        "periods": 6
+      },
+      "standard_1": {
+        "max": 6.031,
+        "median": 2.871,
+        "min": 2.612,
+        "n": 5
+      },
+      "standard_1_throttled_periods": 0
+    },
+    "node": "rc=52\nrc=52\ncurl: (52) Empty reply from server\ncurl: (52) Empty reply from server\n",
+    "off_direct_ip": "rc=35\ncurl: (35) TLS connect error: error:0A000126:SSL routines::unexpected eof while reading\n",
+    "off_lookup_model": "Server:\t\t10.0.2.2\nAddress:\t10.0.2.2:53\n\nNon-authoritative answer:\nName:\tmodel.example.com\nAddress: 198.18.0.1\n\nNon-authoritative answer:\n\n",
+    "off_lookup_public": "Server:\t\t10.0.2.2\nAddress:\t10.0.2.2:53\n\n** server can't find example.com: NXDOMAIN\n\n** server can't find example.com: NXDOMAIN\n\n",
+    "pass": true,
+    "private": "rc=52\nrc=52\ncurl: (52) Empty reply from server\ncurl: (52) Empty reply from server\n",
+    "substituted": "{\n  \"headers\": {\n    \"Accept\": \"*/*\", \n    \"Authorization\": \"Bearer sk-test-not-a-real-secret\", \n    \"Host\": \"httpbin.org\", \n    \"User-Agent\": \"curl/8.22.0\", \n    \"X-Amzn-Trace-Id\": \"Root=1-6abdf551-546b11551978cfe010abe885\"\n  }\n}\n"
+  },
+  "scenario": "egress",
+  "versions": {
+    "engine_sha256_16": "bb125a0375086607",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "173a31b4853d5612"
+  }
+}

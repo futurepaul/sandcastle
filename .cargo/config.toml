@@ -1,3 +1,0 @@
-# sandcastle-web in the browser (crates/web): getrandom from WebCrypto.
-[target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

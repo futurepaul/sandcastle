@@ -1,0 +1,41 @@
+{
+  "evidence": {
+    "bytes_each": 104857600,
+    "declared_ports": 0,
+    "exec_stdout_mib_s": 216.6,
+    "http_ok": true,
+    "http_request_ms": {
+      "max": 26.688,
+      "median": 3.744,
+      "min": 3.195,
+      "n": 3
+    },
+    "nc_first_byte_ms": {
+      "max": 27.914,
+      "median": 26.705,
+      "min": 25.488,
+      "n": 3
+    },
+    "nc_throughput_mib_s": {
+      "max": 197.923,
+      "median": 197.003,
+      "min": 191.708,
+      "n": 3
+    },
+    "pass": true,
+    "vcpus": 2,
+    "ws_echo_ms": 0.269,
+    "ws_greeting": "Request served by port-echo",
+    "ws_handshake": "HTTP/1.1 101 Switching Protocols",
+    "ws_ok": true
+  },
+  "jail": true,
+  "scenario": "port",
+  "versions": {
+    "guest_sha256_16": "f415e80e4305ba9b",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "831009d02e630c9f"
+  }
+}

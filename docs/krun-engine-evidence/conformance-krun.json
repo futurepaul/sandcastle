@@ -1,0 +1,168 @@
+{
+ "summary": {
+  "passed": 25,
+  "failed": 0,
+  "unsupported": 0
+ },
+ "results": {
+  "images": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "base": "celld-image:2f41ad791d8347a25c26168dddbabe4fac275e4eb4772fa3eddd47af50e1db38"
+   }
+  },
+  "not_running_at_first": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "running": false
+   }
+  },
+  "start": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "running": true
+   }
+  },
+  "getTcpPort_fetch": {
+   "ok": true,
+   "ms": 4974,
+   "detail": "listening"
+  },
+  "inspect": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "image": "celld-image:2f41ad791d8347a25c26168dddbabe4fac275e4eb4772fa3eddd47af50e1db38",
+    "labels": {
+     "suite": "conformance"
+    }
+   }
+  },
+  "start_env": {
+   "ok": true,
+   "ms": 0,
+   "detail": "GREETING=hi"
+  },
+  "getTcpPort_connect": {
+   "ok": true,
+   "ms": 1,
+   "detail": "HTTP/1.0 200 OK"
+  },
+  "exec_output": {
+   "ok": true,
+   "ms": 97,
+   "detail": {
+    "out": "out\n",
+    "err": "err\n",
+    "code": 3
+   }
+  },
+  "exec_env_inherits_path_only": {
+   "ok": true,
+   "ms": 4,
+   "detail": "|/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  },
+  "exec_stdin": {
+   "ok": true,
+   "ms": 4,
+   "detail": "piped"
+  },
+  "exec_stderr_combined": {
+   "ok": true,
+   "ms": 4,
+   "detail": "a\nb\n"
+  },
+  "exec_pty_and_resize": {
+   "ok": true,
+   "ms": 289,
+   "detail": "20 50\n\n30 90\n"
+  },
+  "exec_kill": {
+   "ok": true,
+   "ms": 3,
+   "detail": 137
+  },
+  "exec_abort_signal": {
+   "ok": true,
+   "ms": 4,
+   "detail": 137
+  },
+  "internet_off": {
+   "ok": true,
+   "ms": 3,
+   "detail": {
+    "error": "<urlopen error [Errno -2] Name does not resolve>"
+   }
+  },
+  "interceptOutboundHttp": {
+   "ok": true,
+   "ms": 3,
+   "detail": {
+    "status": 200,
+    "body": "intercepted GET http://intercepted.example/hello"
+   }
+  },
+  "interceptOutboundHttps": {
+   "ok": true,
+   "ms": 86,
+   "detail": {
+    "status": 200,
+    "body": "intercepted GET https://secure.example/tls"
+   }
+  },
+  "interceptAllOutboundHttp": {
+   "ok": true,
+   "ms": 2,
+   "detail": {
+    "status": 200,
+    "body": "intercepted GET http://anything.example/all"
+   }
+  },
+  "setInactivityTimeout": {
+   "ok": true,
+   "ms": 0,
+   "detail": "past 6 hours is refused"
+  },
+  "snapshotContainer": {
+   "ok": true,
+   "ms": 46,
+   "detail": {
+    "id": "1b74ffc8bb8b37dfd3ecb829223d79c9",
+    "name": "conformance",
+    "size": 3235840
+   }
+  },
+  "destroy_then_monitor_resolves": {
+   "ok": true,
+   "ms": 163,
+   "detail": "monitor() resolved"
+  },
+  "start_from_snapshot": {
+   "ok": true,
+   "ms": 1422,
+   "detail": {
+    "marker": "snapshotted",
+    "image": ""
+   }
+  },
+  "monitor_rejects_exit_code": {
+   "ok": true,
+   "ms": 261,
+   "detail": "Container exited with unexpected exit code: 3"
+  },
+  "signal": {
+   "ok": true,
+   "ms": 5380,
+   "detail": 42
+  },
+  "destroy_with_error_rejects_monitor": {
+   "ok": true,
+   "ms": 230,
+   "detail": "boom"
+  }
+ },
+ "engine": "celld (fork branch krun-engine) on the test node with sandcastle-engine, seccomp enforced"
+}

@@ -467,6 +467,7 @@ fn reset(layout: &Layout, all: bool) -> Result<Value, Error> {
 /// node's key, its state, the engine's CA key, ubuntu's home, another VM's
 /// disk, and the node's own services are out of reach.
 fn probe(layout: &Layout) -> Result<Value, Error> {
+    let node_ip = crate::layout::node_ip()?;
     let node = Node::new(layout)?;
     let other = node.start("probe-other", &start(BUSYBOX, SLEEP_FOREVER))?;
     let image = node.block(node.client.pull(BUSYBOX)).map_err(engine_err)?;
@@ -482,8 +483,8 @@ fn probe(layout: &Layout) -> Result<Value, Error> {
         other.run_dir.join("scratch.ext4").display().to_string(),
         layout.engine_state().join("ca/ca.key").display().to_string(),
         layout.root.display().to_string(),
-        "tcp:206.223.228.129:22".into(),
-        "tcp:206.223.228.129:443".into(),
+        format!("tcp:{}", std::net::SocketAddr::new(node_ip, 22)),
+        format!("tcp:{}", std::net::SocketAddr::new(node_ip, 443)),
         "tcp:127.0.0.1:3340".into(),
         "tcp:127.0.0.53:53".into(),
     ];

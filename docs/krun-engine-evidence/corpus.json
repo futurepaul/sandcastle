@@ -1,0 +1,80 @@
+{
+  "evidence": {
+    "images": {
+      "alpine:3.20": {
+        "build_ms": 210,
+        "ok": true,
+        "out": "3.20.10\n0",
+        "pull_and_build_ms": 401.0,
+        "start_ms": 108.0
+      },
+      "debian:bookworm-slim": {
+        "build_ms": 827,
+        "ok": true,
+        "out": "debian 12\napt 2.6.1 (amd64)",
+        "pull_and_build_ms": 406.0,
+        "start_ms": 106.0
+      },
+      "nginx:1.27-alpine": {
+        "ok": true,
+        "start_ms": 111.0,
+        "status": "HTTP/1.1 200 OK"
+      },
+      "node:22-slim": {
+        "build_ms": 1679,
+        "ok": true,
+        "out": "v22.23.3",
+        "pull_and_build_ms": 406.0,
+        "start_ms": 107.0
+      },
+      "python:3.12-slim": {
+        "build_ms": 1052,
+        "ok": true,
+        "out": "(3, 12)",
+        "pull_and_build_ms": 403.0,
+        "start_ms": 109.0
+      },
+      "sandbox-shim-on-node:test": {
+        "checks": {
+          "mkdir": true,
+          "node_runs": true,
+          "read_directory": true,
+          "read_file": true,
+          "remove_recursive": true,
+          "rename": true,
+          "stat": true,
+          "user_denied": true,
+          "write_file": true
+        },
+        "load_and_build_ms": 166.0,
+        "ok": true,
+        "seen": {
+          "denied": "[FileError(13, \"Permission denied (os error 13)\")]",
+          "missing": "[FileError(2, \"No such file or directory (os error 2)\")]",
+          "stat": {
+            "mode": "100644",
+            "size": 40,
+            "type": 0
+          }
+        },
+        "start_ms": 108.0
+      },
+      "ubuntu:24.04": {
+        "build_ms": 779,
+        "ok": true,
+        "out": "ubuntu 24.04\nDebian 'dpkg' package management program version 1.22.6 (amd64).",
+        "pull_and_build_ms": 422.0,
+        "start_ms": 108.0
+      }
+    },
+    "pass": true
+  },
+  "scenario": "corpus",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

@@ -7,7 +7,7 @@
 //!   flags a filter can read; everything else allowed, `execve` included;
 //! - the runner's own, its first act: the same refusals and an allowlist
 //!   of what libkrun and the runner call (gathered from every scenario on
-//!   lat-6 in audit mode), with anything else, `execve` among it, killing
+//!   the test node in audit mode), with anything else, `execve` among it, killing
 //!   the process, as Firecracker's does.
 
 use std::io;

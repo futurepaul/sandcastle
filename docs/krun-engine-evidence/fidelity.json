@@ -1,0 +1,35 @@
+{
+  "evidence": {
+    "checks": {
+      "file_capability": true,
+      "file_capability_granted_to_non_root": true,
+      "layers_as_docker": true,
+      "loaded_as_reference": true,
+      "user_xattr": true
+    },
+    "exec_caps_and_mounts": "CapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\noverlay on / type overlay (rw,relatime,lowerdir=/run/sc/lower,upperdir=/run/sc/scratch/upper,workdir=/run/sc/scratch/work,uuid=on)\n",
+    "expected": "v2\ngone=1\nnew.txt\n1234:5678 640\n4755\nc 1, 3\np\nkeep.txt\nv1\ndeep\n",
+    "layers": [
+      "busybox (gzip, from the registry)",
+      "made here (gzip)",
+      "made here (zstd, two frames and a skippable frame)"
+    ],
+    "load_and_build_ms": 229.5,
+    "non_root_cap_eff": "0000000000002000",
+    "non_root_exec": "code Some(0): ",
+    "pass": true,
+    "seen": "v2\ngone=1\nnew.txt\n1234:5678 640\n4755\nc 1, 3\np\nkeep.txt\nv1\ndeep\n",
+    "xattrs": {
+      "cap_file": "Extended attributes:\n  security.capability (20) = 01 00 00 02 00 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "user_xattr": "Extended attributes:\n  user.test (5) = \"hello\""
+    }
+  },
+  "scenario": "fidelity",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

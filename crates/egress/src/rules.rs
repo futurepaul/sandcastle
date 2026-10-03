@@ -556,7 +556,10 @@ mod tests {
     // allow, the internet off refusing the rest.
     #[test]
     fn decisions() {
-        let node = ip("206.223.228.129");
+        // A public address standing in for the node's own, so only the
+        // node rule can refuse it.
+        let node = ip("9.9.9.9");
+        assert!(is_public(node));
         let on = Policy {
             internet: true,
             deny: vec!["blocked.example.com".into(), "1.2.3.4:443".into()],

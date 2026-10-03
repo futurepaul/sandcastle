@@ -1,0 +1,70 @@
+{
+  "evidence": {
+    "engine_ms": {
+      "guest_hello": {
+        "max": 107.91,
+        "median": 104.755,
+        "min": 103.332,
+        "n": 10
+      },
+      "guest_kernel_uptime_at_hello": {
+        "max": 48.0,
+        "median": 47.0,
+        "min": 46.0,
+        "n": 10
+      },
+      "jail_nft": {
+        "max": 2.033,
+        "median": 1.928,
+        "min": 1.604,
+        "n": 10
+      },
+      "jailed": {
+        "max": 6.475,
+        "median": 6.164,
+        "min": 5.622,
+        "n": 10
+      },
+      "prepared": {
+        "max": 2.185,
+        "median": 1.782,
+        "min": 1.618,
+        "n": 10
+      },
+      "ready": {
+        "max": 110.787,
+        "median": 107.903,
+        "min": 106.324,
+        "n": 10
+      },
+      "vmm_built": {
+        "max": 14.022,
+        "median": 12.776,
+        "min": 10.761,
+        "n": 10
+      }
+    },
+    "first_ping_ms": {
+      "max": 2.438,
+      "median": 1.14,
+      "min": 0.721,
+      "n": 10
+    },
+    "image": "busybox:1.37.0",
+    "instance": "lite (1/16 vCPU, 256 MiB; full CPU until ready)",
+    "start_to_ready_ms": {
+      "max": 111.01,
+      "median": 108.139,
+      "min": 106.552,
+      "n": 10
+    }
+  },
+  "scenario": "boot",
+  "versions": {
+    "engine_sha256_16": "364f2f6fac921a28",
+    "guest_sha256_16": "418f05f5f5c6fd78",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "6942962ad58808f7"
+  }
+}

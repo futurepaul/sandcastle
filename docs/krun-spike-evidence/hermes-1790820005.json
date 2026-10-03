@@ -1,0 +1,74 @@
+{
+  "evidence": {
+    "balloon": "free-page reporting",
+    "boot_to_guest_ready_ms": {
+      "max": 229.059,
+      "median": 224.144,
+      "min": 218.613,
+      "n": 9
+    },
+    "boot_to_serving_ms": {
+      "max": 4447.187,
+      "median": 4365.17,
+      "min": 4264.443,
+      "n": 9
+    },
+    "data_kept_root_fresh": true,
+    "exec_round_trip_ms": {
+      "max": 7.88,
+      "median": 3.986,
+      "min": 3.518,
+      "n": 10
+    },
+    "first_boot_to_serving_ms": 4484.6,
+    "health_get_awake_ms": {
+      "max": 12.009,
+      "median": 4.413,
+      "min": 1.802,
+      "n": 10
+    },
+    "health_get_waking_paused_ms": null,
+    "image": "nousresearch/hermes-agent:v2026.9.24",
+    "image_build": {
+      "cached": true,
+      "pull_ms": 835,
+      "reference": "nousresearch/hermes-agent:v2026.9.24"
+    },
+    "image_compressed_bytes": 967802678,
+    "memory_after_reclaim_15s": {
+      "cgroup_mib": 0,
+      "vmm_rss_mib": 0
+    },
+    "memory_idle_60s": {
+      "cgroup_mib": 0,
+      "vmm_rss_mib": 0
+    },
+    "memory_mib": 4096,
+    "memory_serving": {
+      "cgroup_mib": 0,
+      "vmm_rss_mib": 0
+    },
+    "pause_blocked": "krun_vmm_handle_pause: feature not enabled in this build",
+    "pause_ms_client": null,
+    "pause_us_runner": null,
+    "pid1_in_workload": "/package/admin/s6/command/s6-svscan -d4 -- /run/service",
+    "reclaim_guest_free_kib": {
+      "after": 3694260,
+      "before": 3624380
+    },
+    "resume_ms_client": null,
+    "resume_us_runner": null,
+    "second_start_saw": "kept\nroot-fresh\n",
+    "serving_after_reclaim": 200,
+    "vcpus": 2
+  },
+  "jail": true,
+  "scenario": "hermes",
+  "versions": {
+    "guest_sha256_16": "7253e7966932f432",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "beb275961e75a28e"
+  }
+}

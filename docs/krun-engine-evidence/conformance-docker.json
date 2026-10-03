@@ -1,0 +1,150 @@
+{
+ "summary": {
+  "passed": 16,
+  "failed": 4,
+  "unsupported": 5
+ },
+ "results": {
+  "images": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "base": "celld-image:2affc1f2a27f560131ccfbcf253d5da8945e30209fa28b2ddb1c6d6f640dba88"
+   }
+  },
+  "not_running_at_first": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "running": false
+   }
+  },
+  "start": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "running": true
+   }
+  },
+  "getTcpPort_fetch": {
+   "ok": true,
+   "ms": 17002,
+   "detail": "listening"
+  },
+  "inspect": {
+   "ok": true,
+   "ms": 0,
+   "detail": {
+    "image": "celld-image:2affc1f2a27f560131ccfbcf253d5da8945e30209fa28b2ddb1c6d6f640dba88",
+    "labels": {
+     "suite": "conformance"
+    }
+   }
+  },
+  "start_env": {
+   "ok": true,
+   "ms": 6,
+   "detail": "GREETING=hi"
+  },
+  "getTcpPort_connect": {
+   "ok": true,
+   "ms": 3,
+   "detail": "HTTP/1.0 200 OK"
+  },
+  "exec_output": {
+   "ok": true,
+   "ms": 595,
+   "detail": {
+    "out": "out\n",
+    "err": "err\n",
+    "code": 3
+   }
+  },
+  "exec_env_inherits_path_only": {
+   "ok": false,
+   "ms": 499,
+   "error": "expected: \"hi|/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
+  },
+  "exec_stdin": {
+   "ok": true,
+   "ms": 503,
+   "detail": "piped"
+  },
+  "exec_stderr_combined": {
+   "ok": true,
+   "ms": 692,
+   "detail": "b\na\n"
+  },
+  "exec_pty_and_resize": {
+   "ok": true,
+   "ms": 702,
+   "detail": "20 50\n\n30 90\n"
+  },
+  "exec_kill": {
+   "ok": false,
+   "ms": 20417,
+   "error": "expected: 0"
+  },
+  "exec_abort_signal": {
+   "ok": false,
+   "ms": 20090,
+   "error": "expected: 0"
+  },
+  "internet_off": {
+   "ok": false,
+   "ms": 686,
+   "error": "expected: {\"status\":200,\"body\":\"<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewport content=\\\"width=device-width,initial-scale=1\\\"><title>Example Domain</title><style>html{color-scheme:light dark;background:light-dark(#eee,#222)}body{font:16px/1.6 system-ui,sans-serif;max-width:30em;min-height:100vh;margin:auto;padding:4.75em 2em 20vh;box-sizing:border-box;display:grid;place-content:center;text-align:center}</style></head><body><p>This domain is for use in documentation examples without needing permission. This is not a service, avoid relying on it for testing and monitoring purposes.</p><a href=https://iana.org/help/example-domains>Learn more</a><script src=/s.js></script></body></html>\\n\"}"
+  },
+  "interceptOutboundHttp": {
+   "ok": null,
+   "unsupported": true,
+   "detail": "interceptOutboundHttp() is not supported by celld's Docker engine"
+  },
+  "interceptOutboundHttps": {
+   "ok": null,
+   "unsupported": true,
+   "detail": "interceptOutboundHttp() is not supported by celld's Docker engine"
+  },
+  "interceptAllOutboundHttp": {
+   "ok": null,
+   "unsupported": true,
+   "detail": "interceptOutboundHttp() is not supported by celld's Docker engine"
+  },
+  "setInactivityTimeout": {
+   "ok": true,
+   "ms": 0,
+   "detail": "past 6 hours is refused"
+  },
+  "snapshotContainer": {
+   "ok": null,
+   "unsupported": true,
+   "detail": "snapshotContainer() is not supported by celld's Docker engine"
+  },
+  "destroy_then_monitor_resolves": {
+   "ok": true,
+   "ms": 183,
+   "detail": "monitor() resolved"
+  },
+  "start_from_snapshot": {
+   "ok": null,
+   "unsupported": true,
+   "detail": "snapshotContainer() is not supported by celld's Docker engine"
+  },
+  "monitor_rejects_exit_code": {
+   "ok": true,
+   "ms": 297,
+   "detail": "Container exited with unexpected exit code: 3"
+  },
+  "signal": {
+   "ok": true,
+   "ms": 16638,
+   "detail": 42
+  },
+  "destroy_with_error_rejects_monitor": {
+   "ok": true,
+   "ms": 376,
+   "detail": "boom"
+  }
+ },
+ "engine": "celld (fork branch krun-engine) on the Mac with Docker 29.4.0"
+}

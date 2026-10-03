@@ -1,0 +1,74 @@
+{
+  "evidence": {
+    "balloon": true,
+    "guest_meminfo_at_end": "MemTotal:        4034980 kB\nMemFree:         3570180 kB\nMemAvailable:    3520016 kB\nCached:            35236 kB\n",
+    "kernel_args": "page_reporting.page_reporting_order=0",
+    "memory_mib": 4096,
+    "msb_idle_hermes_mib": "892 to 925 (msb, no reclaim)",
+    "reclaim_guest_free_kib": {
+      "after": 3571424,
+      "before": 3316872
+    },
+    "samples": [
+      {
+        "at_s": 0,
+        "memory": {
+          "cgroup_mib": 637,
+          "vmm_rss_mib": 633
+        }
+      },
+      {
+        "at_s": 30,
+        "memory": {
+          "cgroup_mib": 887,
+          "vmm_rss_mib": 858
+        }
+      },
+      {
+        "at_s": 60,
+        "memory": {
+          "cgroup_mib": 932,
+          "vmm_rss_mib": 850
+        }
+      },
+      {
+        "at_s": 90,
+        "memory": {
+          "cgroup_mib": 927,
+          "vmm_rss_mib": 844
+        }
+      },
+      {
+        "after_reclaim_s": 5,
+        "memory": {
+          "cgroup_mib": 688,
+          "vmm_rss_mib": 605
+        }
+      },
+      {
+        "after_reclaim_s": 15,
+        "memory": {
+          "cgroup_mib": 687,
+          "vmm_rss_mib": 604
+        }
+      },
+      {
+        "after_reclaim_s": 45,
+        "memory": {
+          "cgroup_mib": 688,
+          "vmm_rss_mib": 604
+        }
+      }
+    ],
+    "serving_after": 200
+  },
+  "jail": true,
+  "scenario": "hermes-memory",
+  "versions": {
+    "guest_sha256_16": "7253e7966932f432",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrun_so_sha256_16": "e0ed7f4b1487da04",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": "3d412ab45525d1b0"
+  }
+}

@@ -97,6 +97,7 @@ fn curl_start(internet: bool, handler: &str) -> StartRequest {
 }
 
 pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
+    let node_ip = crate::layout::node_ip()?;
     let stand_in = StandIn::new(layout)?;
     let curl = format!("curl -sS --cacert {CA_IN_GUEST} -m 20");
 
@@ -106,7 +107,8 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let (substituted, _) = on.sh(&format!("{curl} https://{SUBSTITUTED_HOST}/headers -H 'Authorization: Bearer {PLACEHOLDER}'"))?;
     let (spliced, _) = on.sh("curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com/")?;
     let (private, _) = on.sh("curl -sS -m 5 http://10.0.0.1/; echo rc=$?; curl -sS -m 5 http://169.254.169.254/latest/meta-data/; echo rc=$?")?;
-    let (node_refused, _) = on.sh("curl -sS -m 5 http://206.223.228.129:22/; echo rc=$?; curl -sS -m 5 http://206.223.228.129:443/; echo rc=$?")?;
+    let (ssh, https) = (std::net::SocketAddr::new(node_ip, 22), std::net::SocketAddr::new(node_ip, 443));
+    let (node_refused, _) = on.sh(&format!("curl -sS -m 5 http://{ssh}/; echo rc=$?; curl -sS -m 5 http://{https}/; echo rc=$?"))?;
     // The handler's round trip on `lite` (Cloudflare's default, 1/16 vCPU:
     // a TLS handshake can spend its 6.25 ms a period and wait out the
     // rest, which `cpu.stat` shows), and on `standard-1` (1/2 vCPU), where
