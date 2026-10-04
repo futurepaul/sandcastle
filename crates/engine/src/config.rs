@@ -174,4 +174,17 @@ pub(crate) mod tests {
         assert!(bad(&|c| c.state_dir = format!("/{}", "a".repeat(100)).into()));
         assert_eq!(config().run_dir(3), PathBuf::from("/var/lib/sandcastle-engine/vms/3"));
     }
+
+    // Goal: a config that names no system libraries gets Debian's, as
+    // before, and one that names them (Arch's /usr/lib) gets those.
+    #[test]
+    fn system_libs() {
+        let mut v = serde_json::to_value(config()).unwrap();
+        v.as_object_mut().unwrap().remove("system_libs");
+        let c: EngineConfig = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib/x86_64-linux-gnu"), PathBuf::from("/usr/lib64")]);
+        v["system_libs"] = serde_json::json!(["/usr/lib"]);
+        let c: EngineConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib")]);
+    }
 }
