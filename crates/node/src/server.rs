@@ -115,7 +115,9 @@ async fn to_engine(node: &Node, method: &Method, path: &str, body: Bytes) -> Res
     }
 }
 
-/// The engine's health, and the node's own: what isolation it gives.
+/// The engine's health, and the node's own: its version, its machine's
+/// architecture, and what isolation it gives (the engine's, when its
+/// health names one: a test double's is not a VM).
 async fn health(node: &Node) -> Response<Body> {
     let req = Request::builder().method("GET").uri("/v1/health").header("host", "engine").body(http::full(Bytes::new())).expect("a request");
     let engine = match http::engine(&node.config.engine, req).await {
@@ -124,7 +126,8 @@ async fn health(node: &Node) -> Response<Body> {
     };
     match engine {
         Some(mut v) => {
-            v["node"] = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "isolation": "microvm" });
+            let isolation = v.get("isolation").and_then(|i| i.as_str()).unwrap_or("microvm").to_string();
+            v["node"] = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "isolation": isolation, "arch": std::env::consts::ARCH });
             http::json(200, &v)
         }
         None => http::error(502, "upstream", "the engine did not answer its health"),
@@ -307,14 +310,7 @@ async fn guest_port(node: Arc<Node>, name: String, port: u16, rest: String, mut 
     };
     if resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
         if let Some(server_side) = server_side {
-            let client_side = hyper::upgrade::on(&mut resp);
-            tokio::spawn(async move {
-                if let (Ok(a), Ok(b)) = (server_side.await, client_side.await) {
-                    let mut a = hyper_util::rt::TokioIo::new(a);
-                    let mut b = hyper_util::rt::TokioIo::new(b);
-                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
-                }
-            });
+            tokio::spawn(http::splice(server_side, hyper::upgrade::on(&mut resp)));
         }
     }
     resp.map(http::streamed)

@@ -41,6 +41,22 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 /// Headers that name one hop, not the request: never passed on.
 pub const HOP: [&str; 8] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host"];
 
+/// Whether a request asks to become a WebSocket: `connection: upgrade`
+/// and `upgrade: websocket`.
+pub fn websocket(h: &hyper::HeaderMap) -> bool {
+    let has = |k: &str, token: &str| h.get_all(k).iter().filter_map(|v| v.to_str().ok()).any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)));
+    has("connection", "upgrade") && has("upgrade", "websocket")
+}
+
+/// Joins two upgraded connections both ways, until each side is done.
+pub async fn splice(a: hyper::upgrade::OnUpgrade, b: hyper::upgrade::OnUpgrade) {
+    if let (Ok(a), Ok(b)) = (a.await, b.await) {
+        let mut a = hyper_util::rt::TokioIo::new(a);
+        let mut b = hyper_util::rt::TokioIo::new(b);
+        let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+    }
+}
+
 /// One request to the engine's API socket, its answer streamed back.
 pub async fn engine(socket: &Path, req: Request<Body>) -> Result<Response<Incoming>, String> {
     let s = tokio::net::UnixStream::connect(socket).await.map_err(|e| format!("the engine at {}: {e}", socket.display()))?;
@@ -82,6 +98,8 @@ impl Platform {
         self.tls.connect(name, tcp).await.map_err(|e| format!("TLS to {host}: {e}"))
     }
 
+    /// One request to the platform; an upgrade's connection is kept for
+    /// whoever takes it from the answer.
     pub async fn send(&self, req: Request<Body>) -> Result<Response<Incoming>, String> {
         let host = self.base.host_str().expect("checked: the platform has a host").to_string();
         let port = self.base.port_or_known_default().expect("http(s) has a port");
@@ -90,11 +108,11 @@ impl Platform {
             let name = rustls_pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("the platform's name: {e}"))?;
             let s = self.tls.connect(name, tcp).await.map_err(|e| format!("the platform's TLS: {e}"))?;
             let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.map_err(|e| format!("the platform: {e}"))?;
-            tokio::spawn(conn);
+            tokio::spawn(conn.with_upgrades());
             send.send_request(req).await.map_err(|e| format!("the platform: {e}"))
         } else {
             let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await.map_err(|e| format!("the platform: {e}"))?;
-            tokio::spawn(conn);
+            tokio::spawn(conn.with_upgrades());
             send.send_request(req).await.map_err(|e| format!("the platform: {e}"))
         }
     }
@@ -105,5 +123,29 @@ impl Platform {
             Some(p) => format!("{}:{p}", self.base.host_str().expect("checked")),
             None => self.base.host_str().expect("checked").to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Goal: a WebSocket's upgrade is told from any other request, its
+    // tokens in any case and among others.
+    #[test]
+    fn websocket_upgrades() {
+        let h = |pairs: &[(&str, &str)]| {
+            let mut m = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                m.append(hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            websocket(&m)
+        };
+        assert!(h(&[("connection", "Upgrade"), ("upgrade", "websocket")]));
+        assert!(h(&[("connection", "keep-alive, upgrade"), ("upgrade", "WebSocket")]));
+        assert!(!h(&[("upgrade", "websocket")]), "no connection: upgrade");
+        assert!(!h(&[("connection", "upgrade"), ("upgrade", "h2c")]));
+        assert!(!h(&[("connection", "close")]));
+        assert!(!h(&[]));
     }
 }

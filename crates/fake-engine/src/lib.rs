@@ -390,7 +390,8 @@ fn end(state: &Mutex<State>, name: &str, exit: Exit) -> Option<Exit> {
     c.info.running = false;
     c.info.state = if exit.destroyed { "destroyed".into() } else { "exited".into() };
     c.info.exit = Some(exit.clone());
-    let _ = c.exit.send(Some(exit.clone()));
+    // send_replace: kept for a wait asked after the end, too
+    c.exit.send_replace(Some(exit.clone()));
     drop(s);
     note(state, name, format!("ended: {}", serde_json::to_string(&exit).expect("serializes")));
     Some(exit)
@@ -683,4 +684,39 @@ fn url_parts(url: &str) -> Result<(Scheme, String, u16, String), ()> {
         return Err(());
     }
     Ok((scheme, host, port, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sandcastle_engine::EngineClient;
+
+    // Goal: a `wait` asked after a container ended answers its end, as one
+    // asked before it does (a watch's `send` keeps nothing while no
+    // receiver is subscribed: the end must be stored, not only sent).
+    #[tokio::test]
+    async fn a_wait_after_the_end() {
+        let dir = std::env::temp_dir().join(format!("sc-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake = FakeEngine::start(&dir).await.unwrap();
+        let client = EngineClient::new(&fake.engine);
+        let start = StartRequest { image: Some("busybox".into()), enable_internet: true, ..StartRequest::default() };
+        let wait = std::time::Duration::from_secs(5);
+        client.start("before", &start, false).await.unwrap();
+        let c = client.clone();
+        let early = tokio::spawn(async move { c.wait("before").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        client.destroy("before", None).await.unwrap();
+        let exit = tokio::time::timeout(wait, early).await.expect("a wait in flight answers").unwrap().unwrap();
+        assert!(exit.destroyed);
+        client.start("after", &start, false).await.unwrap();
+        client.destroy("after", Some("why".into())).await.unwrap();
+        let exit = tokio::time::timeout(wait, client.wait("after")).await.expect("a wait after the end answers").unwrap();
+        assert_eq!((exit.destroyed, exit.error.as_deref()), (true, Some("why")));
+        client.start("stopped", &start, false).await.unwrap();
+        client.signal("stopped", 15).await.unwrap();
+        let exit = tokio::time::timeout(wait, client.wait("stopped")).await.expect("a wait after a stop answers").unwrap();
+        assert_eq!(exit.code, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

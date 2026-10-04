@@ -414,7 +414,8 @@ async fn every_call_through_the_uplink() {
     assert_eq!(h.status, 200, "{}", String::from_utf8_lossy(&body));
     let v = json_of(&body);
     assert_eq!(v["engine"], "sandcastle-fake-engine");
-    assert_eq!(v["node"]["isolation"], "microvm");
+    assert_eq!(v["node"]["isolation"], "microvm", "the fake engine names none");
+    assert_eq!(v["node"]["arch"], std::env::consts::ARCH);
     let (h, _) = t.fetch("GET", "/v1/health", vec![], b"").await.unwrap();
     assert_eq!(h.status, 401);
 
