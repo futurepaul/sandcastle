@@ -77,7 +77,7 @@ impl Platform {
 
     /// TLS to `host` over `tcp`, with the platform's roots (the uplink's
     /// dial, which may name another host than the intercepts' platform).
-    pub async fn tls(&self, host: &str, tcp: tokio::net::TcpStream) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+    pub async fn tls<S: Io>(&self, host: &str, tcp: S) -> Result<tokio_rustls::client::TlsStream<S>, String> {
         let name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(|e| format!("{host}: {e}"))?;
         self.tls.connect(name, tcp).await.map_err(|e| format!("TLS to {host}: {e}"))
     }

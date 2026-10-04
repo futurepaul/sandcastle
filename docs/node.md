@@ -97,8 +97,9 @@ bytes, a file on each side), in the header
 
 **Debt:**
 
-- A signature replayed inside its window verifies. Fixing this needs a
-  nonce cache (the node's and the object's).
+- A call's signature replayed inside its window verifies. Fixing this
+  needs a nonce cache (the node's and the object's), like the one the
+  uplink's dial already has (The uplink, The dial).
 - A guest port's body is not signed.
 - Both matter only where the network itself is not trusted, and that is
   where TLS goes (Reachability).
@@ -176,16 +177,30 @@ nonce, so a hello recorded from another dial answers no other. The node
 serves nothing before a good hello, and gives up on the dial after
 `HELLO_WAIT`.
 
-A newer dial replaces the older connection; the older connection's
-streams are reset.
+A newer dial replaces the older connection. The platform sends the new
+connection's hello before anything else touches it, then ends the older
+connection's streams (below, "Keepalive and reconnecting", for the calls
+it asks again).
 
 ### Frames
 
-Each WebSocket binary message is exactly one frame, big-endian:
+Each WebSocket binary message carries one or more whole frames, each
+big-endian:
 
 ```
 kind u8 | flags u8 | stream u32 | length u32 | payload (length bytes)
 ```
+
+A sender batches the frames it has ready together, up to
+`MESSAGE_BYTES_MAX` (one frame's most) and `FRAMES_PER_MESSAGE_MAX` (64)
+a message. So a call with a small body (`open`, `data`, `end`) is one
+message, not three. This matters because a platform cannot set
+TCP_NODELAY (a Worker cannot, and workerd does not). Its TCP holds a small
+write back until the one before is acknowledged (Nagle's algorithm), so
+with one frame a message every call with a body waited out the node's
+delayed acknowledgement: 41.9 ms a call, against 0.6 ms batched (below,
+Evidence). A message that ends inside a frame, or holds more than the
+limits allow, is refused whole.
 
 | kind | stream | way | payload |
 |---|---|---|---|
@@ -226,6 +241,7 @@ reader falls that far behind.
 | | |
 |---|---|
 | A frame's payload | 256 KiB (`FRAME_PAYLOAD_BYTES_MAX`); `data` at most 64 KiB |
+| A message | its frames, at most 256 KiB and 10 bytes in all, and 64 of them |
 | A head (`open`, `head`) | 64 KiB, at most 100 headers |
 | A WebSocket message, reassembled | 4 MiB (an exec frame is at most 1 MiB and 8 bytes) |
 | Streams in flight on a connection | 128 |
@@ -244,8 +260,22 @@ reader falls that far behind.
   connection that lived `STABLE_AFTER` (30 s) starts the waits over.
 - A dial has `DIAL_WAIT` (15 s), the TCP and TLS connections and the
   upgrade included.
-- Calls in flight when a connection drops fail, as they would if a direct
-  connection dropped.
+- The node sets TCP_NODELAY on its side, and re-arms TCP_QUICKACK after
+  every read: it acknowledges at once whatever a platform that Nagles
+  sends it. Behind a relay that Nagles toward the node, a 2 MiB upload
+  took 53–66 ms with it and 610–650 ms without (Evidence).
+- When a connection drops, a call the node had not yet answered, and that
+  is safe to ask again (a `GET` that is not an upgrade: `wait`, inspect,
+  a guest's page), waits up to `AGAIN_WAIT_MS` (30 s) for the node's next
+  dial and is asked again there. So the platform's `monitor()`, a `wait`
+  that lasts as long as the container, outlives a reconnect. Any other
+  call in flight fails with a 502 that says why, as a direct call fails
+  when its connection drops.
+- A call made while no uplink is open waits `UPLINK_WAIT_MS` (5 s) for
+  one, then answers 503. A platform that is down for long pushes the
+  node's waits toward `RECONNECT_MAX`. A computer that wakes meanwhile
+  then fails its start, as it would against an unreachable node on
+  `listen`, and its owner wakes it again (Evidence).
 
 ### Intercepts stay off the uplink
 
@@ -259,6 +289,113 @@ only if a network allows a node a single connection. What they need
 instead is a pool of connections that the node reuses, in place of one
 connection per request.
 
+### Evidence (2026-10-03)
+
+Nothing here needs root: the engine is the **fake engine**
+(`crates/fake-engine`), a lower-rung test double with no VMs. Its exec
+echoes stdin, its guest ports are a local HTTP and WebSocket echo
+server handed over on `ports.sock`, and its own route makes a guest's
+request through the container's intercepts.
+
+1. **Host tests,** `cargo test -p sandcastle-node --lib` (14):
+   - the codec: round trips, batches, truncated and oversized messages,
+     malformed frames, and heads;
+   - each side's order: data before a head, a second head, data after
+     its end, a replayed open, WebSocket frames before a 101, and
+     fragments;
+   - the dial and the hello: another node's, another nonce's, stale, a
+     replay refused by the book, and a hello from another dial.
+2. **In process,** `cargo test -p sandcastle-node --test uplink`, about
+   3 s. The node's uplink runs against a stand-in platform
+   (`tests/uplink.rs`) and the fake engine. It covers:
+   - health, and an unsigned call (401);
+   - start, inspect and intercepts;
+   - exec with stdin and stdout: 393,238 bytes echoed byte for byte,
+     one message longer than a frame;
+   - a guest port: 3,000,000 bytes down and 2 MiB up, each many windows
+     long; and its WebSocket, with text and a 700,000-byte message;
+   - a guest's request through an intercept to `/api/nodes/egress` and
+     back;
+   - 128 `wait`s in flight, with the 129th refused as busy, and a reset
+     freeing a place;
+   - destroy, which answers every `wait`;
+   - the platform dropping the connection: the node dials again with a
+     new nonce, and the old dial, replayed, is refused (401);
+   - a hello recorded from another dial: the node hangs up and answers
+     nothing.
+3. **The real thing.** fragment's dev stack (`wrangler dev`) with
+   `FRAGMENT_NODE_URL=uplink:dev-node`. The node and the fake engine run
+   in a network namespace with loopback alone; their only way out is a
+   unix-socket bridge to the platform's port:
+
+   ```sh
+   R=target/uplink   # in fragment-uplink: the node's secret (mode 600), node.json, logs
+   FRAGMENT_NODE_URL=uplink:dev-node FRAGMENT_NODE_SECRET_FILE=$R/node.secret \
+     FRAGMENT_NODE_IMAGES='{"stub":"docker.io/library/stub:fake"}' cargo xtask dev --port 8890
+   socat UNIX-LISTEN:$R/platform.sock,fork,mode=600 TCP:127.0.0.1:8890,nodelay
+   unshare -rn sh -c "ip link set lo up
+     socat TCP-LISTEN:8890,bind=127.0.0.1,fork,reuseaddr,nodelay UNIX-CONNECT:$R/platform.sock &
+     sandcastle-fake-engine --dir $R/ns/engine &
+     exec sandcastle-node serve --config $R/ns/node.json"   # an uplink, no listen
+   ```
+
+   Inside the namespace, `ip -brief addr` shows `lo` alone, and `ss -ltn`
+   shows the bridge's `127.0.0.1:8890` and the fake guest's loopback
+   port. The node listens nowhere, and the host's LAN address is
+   unreachable. The platform was driven as the shell drives it, signed
+   in through the WorkOS fake:
+   - `POST /api/computers`, `…/wake`, `…/ports/8080/ticket` and
+     `…/sleep`;
+   - a guest port through the computer's own origin;
+   - the guest's request through the fake engine's own route.
+
+   The final run (release builds; wall-clock times at the client):
+
+   | What | Through the uplink |
+   |---|---|
+   | Wake: start and four intercepts | 46 ms; each call 0.1 to 0.25 ms at the node |
+   | A guest port's page, through the ticket | 200 in 11 ms |
+   | 3 MB down and 2 MiB up through a guest port | 47 ms and 63 ms, intact (on `listen`: 12 ms and about 6 ms) |
+   | A guest port's WebSocket | 101 in 13 ms; text echoed; 700,000 bytes echoed intact (29 ms); close 1000 |
+   | The guest's request through `api.fragment.internal` | 200, the computer's view, in 12 ms |
+   | The node restarted while the computer was awake | it dialed again in 53 ms. The `wait` was asked again and answered when the sleep ended the container. The computer stayed awake |
+   | The platform restarted | the node dialed again by itself. The computer's new object inspected its container (200), adopted it, and armed its intercepts again |
+   | Sleep | 2.1 s: the backup's exec (2.0 s, the double's idle bound), signal 15, then `wait` 200 |
+
+**Found on the way.** Each is fixed here unless it says otherwise.
+
+- **Nagle.** With one frame a message, every call with a body waited for
+  a delayed acknowledgement, about 40 ms. Batching took a wake from
+  290 ms to 46 ms (above, Frames).
+- **The relays.** socat without `nodelay` slowed 2 MiB up to 1.3 s and
+  3 MB down to 0.29 s. With `nodelay` they take 57 to 64 ms and 42 to
+  50 ms, the same as with the node on the host, dialing workerd
+  directly. Behind a relay that Nagles toward the node, TCP_QUICKACK
+  makes a 2 MiB upload 53 to 66 ms, against 610 to 650 ms without it.
+- **curl's `Expect: 100-continue`.** curl waits 1 s for an answer before
+  it sends a body past 1 MiB, on `listen` and the uplink alike. The
+  numbers above send an empty `Expect:`.
+- **A dropped uplink failed the computer's `wait`.** The computer would
+  then never have heard its container exit. Fixed by asking again.
+- **fragment's `entry.mjs` reported to routes the cell does not have.**
+  It reported `container/exited` and `container/tab`, but the cell's
+  routes are `computer/exited` and `computer/tab`. So every guest port's
+  WebSocket answered 500, and no exit was ever reported. Master has the
+  same bug; the fix is on fragment's branch, to cherry-pick.
+- **A long platform outage fails a computer's wake.** It pushes the
+  node's backoff toward a minute. A computer that wakes meanwhile fails
+  its start (`wont_wake`), as it would against an unreachable node, and
+  its owner wakes it again.
+
+**Not shown in the stack: exec's stdin.** The platform's only exec with
+stdin is the Sandbox SDK's backup and restore. Its `sandbox-shim` speaks
+first, and the SDK writes stdin only after the shim's answer, which no
+double gives. So in the stack, the exec's WebSocket, its JSON and its
+exit went through the uplink, and the SDK refused the double's empty
+output ("truncated control data"). Stdin echoed back is shown in process
+(rung 2). S2's checks on a real engine, which runs as root, are still
+Paul's to run.
+
 ## Isolation
 
 `health` reports `isolation: "microvm"`: the engine's VMs, each jailed.
@@ -270,11 +407,9 @@ policy decides what it may run there.
 - **The uplink through a forward proxy.** The node dials TCP to the
   platform's host. An HTTP `CONNECT` proxy (`HTTPS_PROXY`), the usual
   corporate path out, is not spoken yet.
-- **The uplink's calls in flight survive no reconnect.** A `wait` (the
-  platform's `monitor()`) that fails because the connection dropped is
-  reported as the container's exit. The computer then recovers through
-  its lifecycle. A wait that is asked again after a reconnect, before it
-  reports anything, is next.
+- **Some calls in flight do not survive a reconnect.** An exec, a guest
+  port's WebSocket, and a write (start, destroy) cannot be asked again,
+  so they fail with a 502. Only reads are asked again, `wait` among them.
 - **One connection per node.** All of a node's calls pass through its one
   `Node` object, which bounds its throughput. A node with many busy
   computers would dial several uplinks (`<id>/<n>`), with computers

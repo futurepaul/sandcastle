@@ -8,8 +8,11 @@
 //!   and keeps its handler and intercepts. `wait` blocks until a `destroy`
 //!   or a stopping signal ends it.
 //! - `exec` upgrades to the engine's framed stream (`exec_stream`) and
-//!   **echoes stdin to stdout** until stdin's EOF, then exits 0. `true`
-//!   exits 0, `false` 1, and `echo` prints its arguments.
+//!   **echoes stdin to stdout** until stdin's EOF, then exits 0; or after
+//!   `EXEC_IDLE` without stdin, so a caller that waits for an answer only
+//!   a real program would give (the Sandbox SDK's `sandbox-shim`) is not
+//!   held forever. `true` exits 0, `false` 1, and `echo` prints its
+//!   arguments.
 //! - A guest port is a local HTTP and WebSocket echo server, one per
 //!   container and port, made on the first ask. `ports.sock` hands over a
 //!   connected socket to it, as the engine hands one into a VM.
@@ -53,6 +56,8 @@ const GUEST_ECHO_BYTES_MAX: usize = 64 << 20;
 const FETCH_ANSWER_BYTES_MAX: usize = 1 << 20;
 /// Log lines kept per container.
 const LOG_LINES_MAX: usize = 1000;
+/// An echoing exec with no stdin for this long exits (0), as stdin's EOF.
+const EXEC_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 type Body = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
@@ -422,11 +427,16 @@ where
             }
             let mut d = Decoder::default();
             let mut buf = vec![0u8; 64 << 10];
-            // Bounded by stdin: its EOF, a signal, or the client leaving.
+            // Bounded by stdin: its EOF, a signal, the client leaving, or
+            // EXEC_IDLE without any.
             'read: loop {
-                let n = match r.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
+                let n = match tokio::time::timeout(EXEC_IDLE, r.read(&mut buf)).await {
+                    Ok(Ok(0) | Err(_)) => break,
+                    Ok(Ok(n)) => n,
+                    Err(_) => {
+                        let _ = w.write_all(&exited(0)).await;
+                        break;
+                    }
                 };
                 d.push(&buf[..n]);
                 // Bounded by the bytes just read.

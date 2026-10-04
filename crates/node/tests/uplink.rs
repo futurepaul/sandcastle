@@ -85,6 +85,7 @@ impl Platform {
         tokio::spawn(async move {
             // Unbounded by design: the test's life.
             loop {
+                // no TCP_NODELAY, as workerd's: the batching keeps a call one message
                 let (s, _) = listener.accept().await.unwrap();
                 let state = state.clone();
                 tokio::spawn(async move {
@@ -189,17 +190,18 @@ impl Tunnel {
                     Ok(_) => continue,
                     Err(e) => return e.to_string(),
                 };
-                let f = frame::decode(b).expect("the node sends whole frames");
-                match f.kind {
-                    Kind::Ping => {
-                        let _ = o.send(Message::Binary(frame::encode(&Frame::pong(&f)).into()));
-                    }
-                    Kind::Pong => {}
-                    _ => {
-                        let mut s = s.lock().unwrap();
-                        let Some((order, tx)) = s.get_mut(&f.stream) else { continue };
-                        order.received(&f).expect("the node keeps a stream's order");
-                        let _ = tx.send(f);
+                for f in frame::decode_all(b).expect("the node sends whole frames") {
+                    match f.kind {
+                        Kind::Ping => {
+                            let _ = o.send(Message::Binary(frame::encode(&Frame::pong(&f)).into()));
+                        }
+                        Kind::Pong => {}
+                        _ => {
+                            let mut s = s.lock().unwrap();
+                            let Some((order, tx)) = s.get_mut(&f.stream) else { continue };
+                            order.received(&f).expect("the node keeps a stream's order");
+                            let _ = tx.send(f);
+                        }
                     }
                 }
             }
@@ -213,10 +215,18 @@ impl Tunnel {
     }
 
     fn open(&self, method: &str, path: &str, headers: Vec<(String, String)>) -> (u32, mpsc::UnboundedReceiver<Frame>) {
+        self.open_with(method, path, headers, |_| vec![])
+    }
+
+    /// Opens a stream, with the frames `more` makes for it in the same
+    /// message (a small body and its end), as the `Node` object batches them.
+    fn open_with(&self, method: &str, path: &str, headers: Vec<(String, String)>, more: impl FnOnce(u32) -> Vec<Frame>) -> (u32, mpsc::UnboundedReceiver<Frame>) {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::unbounded_channel();
         self.streams.lock().unwrap().insert(id, (Exchange::new(Side::Platform), tx));
-        self.send(&Frame::open(id, &RequestHead { method: method.into(), path: path.into(), headers }));
+        let mut frames = vec![Frame::open(id, &RequestHead { method: method.into(), path: path.into(), headers })];
+        frames.extend(more(id));
+        self.out.send(Message::Binary(frame::encode_all(&frames).into())).expect("the connection is up");
         (id, rx)
     }
 
@@ -224,10 +234,17 @@ impl Tunnel {
     /// (granting as it is read).
     async fn fetch(&self, method: &str, path: &str, mut headers: Vec<(String, String)>, body: &[u8]) -> Result<(ResponseHead, Vec<u8>), String> {
         headers.push(("content-length".into(), body.len().to_string()));
-        let (id, mut rx) = self.open(method, path, headers);
+        // a body of one frame goes with its open and its end, in one message;
+        // a longer one frame by frame, windowed
+        let small = body.len() <= frame::DATA_BYTES_MAX;
+        let (id, mut rx) = self.open_with(method, path, headers, |id| match (small, body.is_empty()) {
+            (true, true) => vec![Frame::end(id)],
+            (true, false) => vec![Frame::data(id, Bytes::copy_from_slice(body)), Frame::end(id)],
+            (false, _) => vec![],
+        });
         let mut early = VecDeque::new();
         let mut credit = frame::WINDOW_BYTES;
-        for chunk in body.chunks(frame::DATA_BYTES_MAX) {
+        for chunk in body.chunks(frame::DATA_BYTES_MAX).filter(|_| !small) {
             // Bounded by the node's grants, within the wait.
             while credit < chunk.len() {
                 let f = tokio::time::timeout(WAIT, rx.recv()).await.map_err(|_| "no window")?.ok_or("the stream ended")?;
@@ -240,7 +257,9 @@ impl Tunnel {
             credit -= chunk.len();
             self.send(&Frame::data(id, Bytes::copy_from_slice(chunk)));
         }
-        self.send(&Frame::end(id));
+        if !small {
+            self.send(&Frame::end(id));
+        }
         let (mut head, mut got, mut consumed, mut granted) = (None, vec![], 0usize, 0usize);
         // Bounded by the answer: its end or its reset.
         loop {

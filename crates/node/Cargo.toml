@@ -28,6 +28,8 @@ rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 hmac.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+# TCP_QUICKACK on the uplink's socket (uplink/client.rs)
+libc.workspace = true
 
 [dev-dependencies]
 # a lower-rung test double: the engine's API with no VMs (tests/uplink.rs)

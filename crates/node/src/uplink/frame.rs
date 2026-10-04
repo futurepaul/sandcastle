@@ -1,14 +1,19 @@
 //! The uplink's frames (docs/node.md, The uplink, Frames): pure, with every
-//! limit a constant and checked. One WebSocket binary message is exactly
-//! one frame, big-endian:
+//! limit a constant and checked. One WebSocket binary message carries one
+//! or more whole frames, each big-endian:
 //!
 //! ```text
 //! kind u8 | flags u8 | stream u32 | length u32 | payload (length bytes)
 //! ```
 //!
-//! `decode` refuses anything it cannot vouch for whole: a short or long
-//! message, an unknown kind, flags or a stream where its kind has none, a
-//! payload of the wrong size. `Exchange` is one stream's order as one side
+//! A sender batches frames that are ready together (a call's `open`, its
+//! small body and its `end`), so a call is one message, not three: the
+//! platform's TCP may hold back a small write until the last is
+//! acknowledged (Nagle's algorithm), and neither a Worker nor workerd sets
+//! TCP_NODELAY. `decode` refuses anything it cannot vouch for whole: a
+//! short or long frame, an unknown kind, flags or a stream where its kind
+//! has none, a payload of the wrong size; `decode_all` splits a message
+//! into its frames, each checked, and bounds how many. `Exchange` is one stream's order as one side
 //! sees it: what may arrive next, given what has arrived and what this
 //! side has sent. The cell's `uplink.mjs` mirrors both.
 
@@ -49,6 +54,11 @@ pub const STREAM_BUFFERED_BYTES_MAX: usize = 4 << 20;
 /// Bytes held for one connection, every stream's together, at most: the
 /// platform's end is a Durable Object, with 128 MB for everything.
 pub const BUFFERED_BYTES_MAX: usize = 32 << 20;
+
+/// A message, all its frames together, at most: one frame of the most.
+pub const MESSAGE_BYTES_MAX: usize = HEADER_BYTES + FRAME_PAYLOAD_BYTES_MAX;
+/// Frames in one message, at most.
+pub const FRAMES_PER_MESSAGE_MAX: usize = 64;
 
 /// `ws-message`: this fragment ends its message.
 pub const FIN: u8 = 1;
@@ -125,6 +135,10 @@ pub enum FrameError {
     Stream(Kind, u32),
     #[error("{0:?}: {1}")]
     Payload(Kind, &'static str),
+    #[error("a message of {0} bytes, past {MESSAGE_BYTES_MAX}")]
+    MessageTooLarge(usize),
+    #[error("a message of more than {FRAMES_PER_MESSAGE_MAX} frames")]
+    TooManyFrames,
 }
 
 impl Frame {
@@ -252,6 +266,48 @@ pub fn decode(message: Bytes) -> Result<Frame, FrameError> {
     let payload = message.slice(HEADER_BYTES..);
     check(kind, flags, stream, &payload)?;
     Ok(Frame { kind, flags, stream, payload })
+}
+
+/// One message as its frames, in order, each checked whole: a message
+/// that ends inside a frame, or holds too much, is refused whole.
+pub fn decode_all(message: Bytes) -> Result<Vec<Frame>, FrameError> {
+    if message.len() > MESSAGE_BYTES_MAX {
+        return Err(FrameError::MessageTooLarge(message.len()));
+    }
+    let mut frames = vec![];
+    let mut at = 0;
+    // Bounded by the message: each turn takes at least a header from it.
+    loop {
+        let rest = message.len() - at;
+        if rest < HEADER_BYTES {
+            return Err(FrameError::Short(rest));
+        }
+        let said = u32::from_be_bytes(message[at + 6..at + 10].try_into().expect("four bytes")) as usize;
+        if said > rest - HEADER_BYTES {
+            return Err(FrameError::Length { said, got: rest - HEADER_BYTES });
+        }
+        if frames.len() == FRAMES_PER_MESSAGE_MAX {
+            return Err(FrameError::TooManyFrames);
+        }
+        frames.push(decode(message.slice(at..at + HEADER_BYTES + said))?);
+        at += HEADER_BYTES + said;
+        if at == message.len() {
+            return Ok(frames);
+        }
+    }
+}
+
+/// Frames as one message: the caller keeps them within `MESSAGE_BYTES_MAX`
+/// and `FRAMES_PER_MESSAGE_MAX`.
+pub fn encode_all<'a>(frames: impl IntoIterator<Item = &'a Frame>) -> Vec<u8> {
+    let mut out = vec![];
+    let mut n = 0;
+    for f in frames {
+        out.extend(encode(f));
+        n += 1;
+    }
+    assert!(n > 0 && n <= FRAMES_PER_MESSAGE_MAX && out.len() <= MESSAGE_BYTES_MAX, "a message of {n} frames and {} bytes", out.len());
+    out
 }
 
 fn check(kind: Kind, flags: u8, stream: u32, payload: &[u8]) -> Result<(), FrameError> {
@@ -578,6 +634,43 @@ mod tests {
         assert!(big_data(DATA_BYTES_MAX).is_ok());
         assert_eq!(big_data(DATA_BYTES_MAX + 1), Err(FrameError::Payload(Kind::Data, "1 to 64 KiB of body")));
         assert!(std::panic::catch_unwind(|| encode(&Frame::data(1, Bytes::from(vec![0; DATA_BYTES_MAX + 1])))).is_err(), "encode refuses what decode would");
+    }
+
+    // Goal: a message of several frames comes back as them, in order
+    // (valid); one that ends inside a frame, carries bytes past its last,
+    // or holds more than the limits allow is refused whole (truncated,
+    // oversized).
+    #[test]
+    fn batches() {
+        let call = [Frame::open(7, &head("POST", "/v1/containers/c/signal")), Frame::data(7, Bytes::from_static(b"{\"signal\":15}")), Frame::end(7)];
+        let message = Bytes::from(encode_all(&call));
+        assert_eq!(decode_all(message.clone()).unwrap(), call.to_vec());
+        assert_eq!(decode_all(Bytes::from(encode(&Frame::end(1)))).unwrap(), vec![Frame::end(1)], "one frame is a message too");
+        let end = encode(&Frame::end(7)).len();
+        for cut in 1..end {
+            assert!(decode_all(message.slice(..message.len() - cut)).is_err(), "cut {cut} bytes short");
+        }
+        let mut trailing = message.to_vec();
+        trailing.push(0);
+        assert_eq!(decode_all(Bytes::from(trailing)), Err(FrameError::Short(1)));
+        assert_eq!(decode_all(Bytes::new()), Err(FrameError::Short(0)));
+        let many: Vec<Frame> = (0..=FRAMES_PER_MESSAGE_MAX as u32).map(|i| Frame::end(i + 1)).collect();
+        let mut raw = vec![];
+        for f in &many {
+            raw.extend(encode(f));
+        }
+        assert_eq!(decode_all(Bytes::from(raw)), Err(FrameError::TooManyFrames));
+        assert!(std::panic::catch_unwind(|| encode_all(&many)).is_err(), "encode_all refuses what decode_all would");
+        let big = vec![Frame::data(1, Bytes::from(vec![1; DATA_BYTES_MAX])); 5];
+        let mut raw = vec![];
+        for f in &big {
+            raw.extend(encode(f));
+        }
+        assert_eq!(decode_all(Bytes::from(raw.clone())), Err(FrameError::MessageTooLarge(raw.len())));
+        // a bad frame among good ones spoils the message
+        let mut spoiled = encode(&Frame::end(1));
+        spoiled.extend([99, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(decode_all(Bytes::from(spoiled)), Err(FrameError::Kind(99)));
     }
 
     // Goal: every malformed header or payload is refused, not guessed at

@@ -131,6 +131,55 @@ fn ws_config(message_max: usize) -> WebSocketConfig {
     WebSocketConfig::default().max_message_size(Some(message_max)).max_frame_size(Some(message_max))
 }
 
+/// The uplink's TCP connection, acknowledging every read at once.
+///
+/// A platform sends a call as a few WebSocket messages, and its TCP may hold
+/// a message's last small segment until the one before is acknowledged
+/// (Nagle's algorithm). Neither a Worker nor workerd sets TCP_NODELAY, and
+/// a receiver's delayed acknowledgement then costs each message 40 ms. So
+/// the node re-arms TCP_QUICKACK after every read (Linux clears it as it
+/// goes), and acknowledges at once. Measured on a 2 MiB upload through the
+/// uplink (docs/node.md, Evidence).
+struct QuickAck(tokio::net::TcpStream);
+
+impl QuickAck {
+    fn arm(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let one: libc::c_int = 1;
+            // SAFETY: setsockopt(2) on our own socket, with an int's address and size.
+            unsafe {
+                libc::setsockopt(self.0.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_QUICKACK, &one as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for QuickAck {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let r = Pin::new(&mut self.0).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = r {
+            self.arm();
+        }
+        r
+    }
+}
+
+impl tokio::io::AsyncWrite for QuickAck {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 /// The upgrade to the platform's uplink, signed for `nonce`.
 async fn dial(node: &Node, up: &UplinkConfig, nonce: &str) -> Result<WebSocketStream<Box<dyn Io>>, UplinkError> {
     let url = url::Url::parse(&up.url).map_err(|e| UplinkError::Dial(e.to_string()))?;
@@ -138,6 +187,8 @@ async fn dial(node: &Node, up: &UplinkConfig, nonce: &str) -> Result<WebSocketSt
     let port = url.port_or_known_default().expect("ws(s) has a port");
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| UplinkError::Dial(format!("{host}:{port}: {e}")))?;
     let _ = tcp.set_nodelay(true);
+    let tcp = QuickAck(tcp);
+    tcp.arm();
     let io: Box<dyn Io> = if url.scheme() == "wss" { Box::new(node.platform.tls(&host, tcp).await.map_err(UplinkError::Dial)?) } else { Box::new(tcp) };
     let mut req = up.url.as_str().into_client_request().map_err(|e| UplinkError::Dial(e.to_string()))?;
     let t = auth::now_s();
@@ -245,17 +296,18 @@ async fn session(node: &Arc<Node>, up: &UplinkConfig) -> UplinkError {
         Err(_) => return UplinkError::DialTimeout,
     };
     let (mut sink, mut stream) = ws.split();
-    let hello = match tokio::time::timeout(HELLO_WAIT, stream.next()).await {
+    let mut first = match tokio::time::timeout(HELLO_WAIT, stream.next()).await {
         Err(_) => return UplinkError::NoHello,
         Ok(None | Some(Ok(Message::Close(_)))) => return UplinkError::Closed,
         Ok(Some(Err(e))) => return UplinkError::Socket(e.to_string()),
-        Ok(Some(Ok(Message::Binary(b)))) => match frame::decode(b) {
-            Ok(f) if f.kind == Kind::Hello => f,
+        Ok(Some(Ok(Message::Binary(b)))) => match frame::decode_all(b) {
+            Ok(fs) if fs[0].kind == Kind::Hello => fs,
             Ok(_) => return UplinkError::Protocol("the first frame is the hello"),
             Err(e) => return e.into(),
         },
         Ok(Some(Ok(_))) => return UplinkError::Protocol("the first frame is the hello"),
     };
+    let hello = first.remove(0);
     let header = String::from_utf8_lossy(&hello.payload).into_owned();
     if let Err(e) = node.secret.verify(Some(&header), auth::now_s(), |t| auth::hello_string(&up.id, &nonce, t)) {
         return UplinkError::Hello(e);
@@ -269,18 +321,35 @@ async fn session(node: &Arc<Node>, up: &UplinkConfig) -> UplinkError {
     let mut writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
         let mut n: u64 = 0;
+        // a frame that did not fit the last message: the next one's first
+        let mut carry: Option<Vec<u8>> = None;
         // Bounded by the connection's life: the session aborts it.
         loop {
-            let bytes = tokio::select! {
-                biased;
-                Some(b) = control_rx.recv() => b,
-                Some(b) = data_rx.recv() => b,
-                _ = ping.tick() => {
-                    n += 1;
-                    frame::encode(&Frame::ping(&n.to_be_bytes()))
-                }
+            let mut message = match carry.take() {
+                Some(b) => b,
+                None => tokio::select! {
+                    biased;
+                    Some(b) = control_rx.recv() => b,
+                    Some(b) = data_rx.recv() => b,
+                    _ = ping.tick() => {
+                        n += 1;
+                        frame::encode(&Frame::ping(&n.to_be_bytes()))
+                    }
+                },
             };
-            if let Err(e) = sink.send(Message::Binary(bytes.into())).await {
+            // the frames ready behind it go with it (frame.rs: one message, not many)
+            let mut count = 1;
+            // Bounded by FRAMES_PER_MESSAGE_MAX.
+            while count < frame::FRAMES_PER_MESSAGE_MAX {
+                let Ok(next) = control_rx.try_recv().or_else(|_| data_rx.try_recv()) else { break };
+                if message.len() + next.len() > frame::MESSAGE_BYTES_MAX {
+                    carry = Some(next);
+                    break;
+                }
+                message.extend(next);
+                count += 1;
+            }
+            if let Err(e) = sink.send(Message::Binary(message.into())).await {
                 return e.to_string();
             }
         }
@@ -289,6 +358,12 @@ async fn session(node: &Arc<Node>, up: &UplinkConfig) -> UplinkError {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u32, u64)>();
     let mut d = Dispatcher { node: node.clone(), conn: conn.clone(), table: HashMap::new(), generation: 0, done: done_tx };
     let mut heard = tokio::time::Instant::now();
+    // the hello's message may carry more
+    for f in first {
+        if let Err(e) = d.dispatch(f) {
+            return e;
+        }
+    }
     // Bounded by the connection's life: each turn handles one event, and
     // silence past SILENT_MAX ends it.
     let why = loop {
@@ -303,9 +378,9 @@ async fn session(node: &Arc<Node>, up: &UplinkConfig) -> UplinkError {
                         break UplinkError::Closed;
                     }
                     Some(Err(e)) => break UplinkError::Socket(e.to_string()),
-                    Some(Ok(Message::Binary(b))) => match frame::decode(b) {
-                        Ok(f) => {
-                            if let Err(e) = d.dispatch(f) {
+                    Some(Ok(Message::Binary(b))) => match frame::decode_all(b) {
+                        Ok(fs) => {
+                            if let Some(e) = fs.into_iter().find_map(|f| d.dispatch(f).err()) {
                                 break e;
                             }
                         }
