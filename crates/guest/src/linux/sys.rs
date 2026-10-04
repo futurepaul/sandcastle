@@ -160,7 +160,8 @@ pub fn mem_free_kib() -> u64 {
 /// Flushes every filesystem and ends the VM. An x86 guest without ACPI
 /// cannot power off (the kernel halts instead), so this reboots: libkrun's
 /// kernel line says `reboot=k`, the reset goes through the i8042, and
-/// libkrun ends the runner's process on it.
+/// libkrun ends the runner's process on it. On arm64 the reset is PSCI's
+/// SYSTEM_RESET, which KVM hands libkrun as a system event, its end too.
 pub fn poweroff() -> ! {
     // SAFETY: sync and reboot(2) as PID 1.
     unsafe {

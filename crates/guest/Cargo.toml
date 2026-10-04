@@ -3,7 +3,7 @@ name = "sandcastle-guest"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "A microVM guest's init and agent: one static binary (x86_64-unknown-linux-musl) that mounts the root, runs the entrypoint as its PID namespace's PID 1, reports its exit, and serves exec, port connections, and image builds over vsock."
+description = "A microVM guest's init and agent: one static binary (x86_64- or aarch64-unknown-linux-musl) that mounts the root, runs the entrypoint as its PID namespace's PID 1, reports its exit, and serves exec, port connections, and image builds over vsock."
 
 [[bin]]
 name = "sandcastle-guest"

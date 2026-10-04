@@ -196,9 +196,14 @@ impl VmConfig {
     /// disk is the kernel's root, read-only, and our init runs from it.
     /// Later arguments win, so these replace libkrun's virtio-fs root.
     pub fn kernel_cmdline(&self) -> String {
+        let mut c = format!("root={} rootfstype=ext4 ro init=/init", sandcastle_wire::disks::BOOT);
         // pci=off: libkrun's devices are all virtio-mmio, and probing PCI
         // configuration space that is not there costs 7 ms of every boot.
-        let mut c = format!("root={} rootfstype=ext4 ro init=/init pci=off", sandcastle_wire::disks::BOOT);
+        // arm64's libkrunfw has no PCI, so there the word would only be
+        // passed on to our init's environment.
+        if cfg!(target_arch = "x86_64") {
+            c.push_str(" pci=off");
+        }
         for a in &self.kernel_args {
             c.push(' ');
             c.push_str(a);
@@ -247,7 +252,9 @@ pub(crate) mod tests {
     #[test]
     fn valid_config() {
         run_config().validate().unwrap();
-        assert!(run_config().kernel_cmdline().contains("root=/dev/vda"));
+        let line = run_config().kernel_cmdline();
+        assert!(line.starts_with("root=/dev/vda rootfstype=ext4 ro init=/init"));
+        assert_eq!(line.split(' ').any(|w| w == "pci=off"), cfg!(target_arch = "x86_64"));
     }
 
     // Goal: every limit refuses one past its edge.

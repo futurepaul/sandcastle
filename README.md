@@ -58,7 +58,7 @@ simulator, its e2e and CLI) was cut, as fragment decided (its
 |---|---|
 | `crates/wire` | the host's and the guest's protocol over vsock: length-prefixed frames, typed messages, every limit a constant |
 | `crates/vm` | `sandcastle-vm`: one microVM per process; its validated configuration, a pure lifecycle, the libkrun gate (`dlopen`), the runner, its jail, and a client |
-| `crates/guest` | `sandcastle-guest`: the guest's init and agent, one static binary (`x86_64-unknown-linux-musl`) |
+| `crates/guest` | `sandcastle-guest`: the guest's init and agent, one static binary (`<arch>-unknown-linux-musl`) |
 | `crates/rootfs` | OCI images: references, manifests, a registry client with every digest checked on download and again before use, and the ext4 disks a VM boots |
 | `crates/egress` | a VM's egress: Cloudflare's rules (128 entries), fake addresses for names, a resolver, and the node-side proxy that intercepts TLS with the node's CA |
 | `crates/engine` | `sandcastle-engine`: the root service holding the node's VMs, serving Cloudflare's API on a unix socket |
@@ -93,14 +93,17 @@ its pure pieces; Linux compiles and tests the rest. CI
 
 The engine needs:
 
-- Linux x86_64 with `/dev/kvm` and `/dev/vhost-vsock`, `mke2fs`, and
-  `nft`;
+- Linux on x86_64 or aarch64 with `/dev/kvm` and `/dev/vhost-vsock`,
+  `mke2fs`, and `nft` (aarch64, as on a Mac's Linux VM with nested
+  virtualization: docs/mac.md). A node runs images of its own
+  architecture (`linux/amd64` or `linux/arm64`);
 - libkrun `b63baa1895c60d58b731fdebb9180ba266292848` (built with
   `--features ffi,blk,net`) and libkrunfw
   `f6a710faaa8cfe3b67a4bcdadb082c2183a914f1` (5.6.2), built into a prefix
   and loaded from there by path, never installed system-wide;
 - the guest built static:
-  `cargo build --release -p sandcastle-guest --target x86_64-unknown-linux-musl`;
+  `cargo build --release -p sandcastle-guest --target x86_64-unknown-linux-musl`
+  (`aarch64-unknown-linux-musl` on arm64);
 - root for the engine itself, which jails each VM. It runs as a
   transient unit with a delegated cgroup subtree, for example
   `sudo systemd-run --unit=krun-engine --slice=krun-spike.slice -p Delegate=yes sandcastle-engine serve --config engine.json`;
