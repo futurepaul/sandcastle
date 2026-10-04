@@ -396,6 +396,122 @@ output ("truncated control data"). Stdin echoed back is shown in process
 (rung 2). S2's checks on a real engine, which runs as root, are still
 Paul's to run.
 
+## Test doubles
+
+Two engines stand in for the real one where it cannot run. Neither is
+ever a node's engine.
+
+- **The fake engine** (`crates/fake-engine`) runs nothing: containers
+  are records and exec echoes (The uplink, Evidence).
+- **The Docker double** (`crates/docker-engine`,
+  `sandcastle-docker-engine`) serves the engine's API on the same two
+  sockets and runs each container in Docker, through the `docker` CLI.
+  It gives Docker's isolation only, with no VMs. It is for a node in front
+  of a real image on a box with Docker but without KVM or root, such as
+  fragment's self-hosted lane.
+
+What the double fakes, and how:
+
+- **Start** is `docker run --init --pull never`. The container is named
+  `sandcastle-<8 hex of the dir>-<name, ':' as '-'>` and labelled
+  `sandcastle.double=<dir>`. Three mounts go in: `<dir>/c/<run>` at
+  `/.sandcastle`, the relay at `/.sandcastle-relay`, and the double's CA
+  where Cloudflare's containers find theirs. The start answers once the
+  relay is up. A container that exits during its start still starts, and
+  `wait` reports the exit. A missing image is a 404.
+- **Intercepts** take exact hosts on 80 (http) and 443 (https) only.
+  A glob, `*`, an address, another port or a substitute is a 400. Each
+  host goes into the container's `/etc/hosts` as 127.0.0.1. There the
+  relay (`sandcastle-docker-relay`, static, std only) listens on loopback.
+  It joins each connection to the container's `http.sock` or
+  `https.sock`, which the double serves on the host. The double terminates
+  HTTPS with its CA, for the name the guest's TLS asks for. It then hands
+  each request to the handler with the egress proxy's four
+  `x-sandcastle-*` headers, streaming both bodies. A host stays in
+  `/etc/hosts` after its intercept is gone, and then answers 502. Nothing
+  else is intercepted: the container's network is Docker's, and open.
+- **Exec** is `docker exec`, with the relay in front
+  (`exec [--combined] <pidfile> <cmd…>`). So a signal frame reaches the
+  process, through the image's `kill`; without `kill`, the docker client
+  is ended instead. A combined stderr keeps its order. The process sees
+  the container's whole env, where the engine gives it only `PATH`.
+  A pty is a 400.
+- **Ports.** `ports.sock` connects over TCP to the container's address on
+  Docker's bridge and hands the socket over as `nic`. A port bound only to
+  the guest's loopback is refused.
+- **Wait** is `docker wait`. A code of 128+n after the double sent
+  signal n is reported as signal n. **Destroy** is `docker rm -f`.
+  **Snapshots** are `docker commit` to `sandcastle-double-snapshot:<id>`.
+  **Logs** are `docker logs --tail 1000`. **Images** are the box's own,
+  and a pull is a 400.
+- **Not applied:** CPU and memory limits, `enableInternet: false`, allow
+  and deny lists, and data disks (a 400). Each start logs what it skips.
+  The start's env is on docker's command line, so other users on the box
+  can read it.
+- **Its own end** (SIGTERM or SIGINT) removes every container and
+  snapshot labelled for its dir. Its start removes whatever a double on
+  the same dir left behind.
+
+```sh
+cargo build --release -p sandcastle-docker-relay --target x86_64-unknown-linux-musl
+# for arm64 from x86: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld … --target aarch64-unknown-linux-musl
+cargo build --release -p sandcastle-docker-engine
+sandcastle-docker-engine --dir <dir> --relay $PWD/target/x86_64-unknown-linux-musl/release/sandcastle-docker-relay
+```
+
+It runs as a user in the `docker` group. The node's config names
+`<dir>/engine.sock` and `<dir>/ports.sock`. `<dir>` must be short, so
+that `<dir>/c/<run>/https.sock` fits a unix socket's 107 bytes; this is
+checked at start.
+
+**Evidence (2026-10-04),** all with `fragment-stub:s2`:
+
+1. **Host tests,** `cargo test -p sandcastle-docker-engine -p
+   sandcastle-docker-relay` (18): names, each docker call's argv,
+   `/etc/hosts` lines, what routes and where, exits and signals, and the
+   relay's command lines and its copy with half-close.
+2. **`tests/docker.rs`** (ignored: it needs Docker,
+   `SANDCASTLE_DOCKER_TEST_IMAGE` and the static relay), about 2.7 s. A
+   start takes 150 to 210 ms. A guest's `wget` reaches the handler with the
+   four headers, and HTTPS through the container's loopback is terminated
+   with the CA. A host no longer intercepted gets a 502. 393,238 bytes of
+   stdin echo intact in about 22 ms. Also covered: stderr apart, combined,
+   or ignored; exit codes; cwd and user; signal 15 to an exec; a guest
+   port and a refused one; a snapshot restored; signal, destroy, and
+   `wait`; an entrypoint that exits at once; a missing image; and the
+   double's end leaving nothing.
+3. **`tests/node.rs`** (ignored, the same needs), about 1.3 s.
+   `sandcastle-node`'s own servers, wired as its `main.rs` wires them,
+   stand in front of the double. A stand-in platform checks the node's
+   signatures. A signed start takes 160 ms. Exec runs over the node's
+   WebSocket: a guest's `POST` goes through `api.fragment.internal` to
+   `/api/nodes/egress`, signed by the node, and 393,238 bytes of stdin
+   echo. A guest port answers. The stub's own entrypoint boots, and its
+   screen on 6080 answers through the node. The bridge's first
+   `GET /api/computer` came before its intercept was armed and failed; it
+   tried again 1.5 s later and reached the platform. Signal 15 ends it
+   with code 0.
+
+**Found on the way:**
+
+- **busybox wget cannot finish an HTTPS handshake here.** Its TLS takes
+  one handshake message per record. rustls 0.23 sends TLS 1.2's server
+  flight as one record. So the handshake fails against the double, and
+  against the engine's egress proxy too, which uses the same rustls. The
+  test drives a rustls client through `nc` in the container instead.
+- **No WebSocket crosses an intercept.** The bridge opens WebSockets to
+  `api.fragment.internal` (`/api/computer/keepalive`, `/f/<f>/__live`).
+  An upgrade through an intercept is carried by neither the double, nor
+  the engine's egress proxy, nor the node's egress, which strips
+  `upgrade`.
+- **A `wait` after the end blocked for good.** tokio's
+  `watch::Sender::send` stores nothing while no receiver is subscribed.
+  So a `wait` asked after a container ended never answered. The double
+  uses `send_replace`. The fake engine's `end` still has the bug.
+- **The node's `health` says `isolation: "microvm"` whatever its
+  engine.** Over the double, only the engine's own `fake` field tells the
+  truth.
+
 ## Isolation
 
 `health` reports `isolation: "microvm"`: the engine's VMs, each jailed.

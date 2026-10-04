@@ -801,6 +801,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-docker-engine"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "sandcastle-egress",
+ "sandcastle-engine",
+ "sandcastle-node",
+ "sandcastle-wire",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "sandcastle-docker-relay"
+version = "0.1.0"
+
+[[package]]
 name = "sandcastle-egress"
 version = "0.1.0"
 dependencies = [

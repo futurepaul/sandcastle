@@ -1,0 +1,33 @@
+[package]
+name = "sandcastle-docker-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A DOCKER DOUBLE, a lower-rung test double for the node (docs/node.md, Test doubles): the engine's API on unix sockets, each container run in Docker through the docker CLI. Docker's isolation only, no VMs, no resource limits; intercepts of exact hosts on 80 and 443 through a loopback relay (sandcastle-docker-relay) and /etc/hosts. Never a node's engine in production."
+
+[[bin]]
+name = "sandcastle-docker-engine"
+path = "src/main.rs"
+
+[dependencies]
+sandcastle-engine.workspace = true
+sandcastle-egress.workspace = true
+sandcastle-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+# the node in front of the double (tests/node.rs), as fragment runs it
+sandcastle-node.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

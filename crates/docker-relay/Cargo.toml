@@ -1,0 +1,15 @@
+[package]
+name = "sandcastle-docker-relay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The Docker double's relay (crates/docker-engine), run inside each container it starts: 127.0.0.1:80 and :443 joined to the double's sockets, so a host /etc/hosts sends to loopback reaches its intercept. std only, so it builds static for musl and runs in any image. A lower-rung test double's part; never a node's."
+
+[[bin]]
+name = "sandcastle-docker-relay"
+path = "src/main.rs"
+
+# None, by design: it builds static with --target x86_64-unknown-linux-musl
+# (or aarch64) and is bind-mounted into images that hold nothing else of ours.
+[dependencies]
