@@ -7,14 +7,24 @@
 //!   flags a filter can read; everything else allowed, `execve` included;
 //! - the runner's own, its first act: the same refusals and an allowlist
 //!   of what libkrun and the runner call (gathered from every scenario on
-//!   the test node in audit mode), with anything else, `execve` among it, killing
-//!   the process, as Firecracker's does.
+//!   the test node in audit mode; arm64's from boots under nested KVM,
+//!   docs/mac.md), with anything else, `execve` among it, killing the
+//!   process, as Firecracker's does.
 
 use std::io;
 
 use crate::jail::SeccompMode;
 
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+/// The one ABI the filter admits (`AUDIT_ARCH_*`): any other a process
+/// could enter by (x86's i386, arm64's AArch32) is killed. x32's calls
+/// share x86_64's and are answered ENOSYS.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xc000_00b7;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the VM's seccomp filter knows x86_64 and aarch64");
+#[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_LOG: u32 = 0x7ffc_0000;
@@ -38,9 +48,8 @@ const NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWIPC
     | libc::CLONE_NEWCGROUP) as u32;
 
-/// Refused in every mode.
-#[cfg(target_arch = "x86_64")]
-pub const DENIED: &[libc::c_long] = &[
+/// Refused in every mode, on every architecture.
+const DENIED_COMMON: &[libc::c_long] = &[
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
@@ -66,8 +75,6 @@ pub const DENIED: &[libc::c_long] = &[
     libc::SYS_swapoff,
     libc::SYS_reboot,
     libc::SYS_acct,
-    libc::SYS_iopl,
-    libc::SYS_ioperm,
     libc::SYS_settimeofday,
     libc::SYS_clock_settime,
     libc::SYS_clock_adjtime,
@@ -90,9 +97,15 @@ pub const DENIED: &[libc::c_long] = &[
     libc::SYS_personality,
 ];
 
-/// What libkrun, the runner, and the C library call.
+/// Refused: the architecture's own (x86's port I/O).
 #[cfg(target_arch = "x86_64")]
-pub const ALLOWED: &[libc::c_long] = &[
+const DENIED_ARCH: &[libc::c_long] = &[libc::SYS_iopl, libc::SYS_ioperm];
+#[cfg(target_arch = "aarch64")]
+const DENIED_ARCH: &[libc::c_long] = &[];
+
+/// What libkrun, the runner, and the C library call, on every
+/// architecture.
+const ALLOWED_COMMON: &[libc::c_long] = &[
     // Files and descriptors.
     libc::SYS_read,
     libc::SYS_write,
@@ -107,24 +120,18 @@ pub const ALLOWED: &[libc::c_long] = &[
     libc::SYS_lseek,
     libc::SYS_close,
     libc::SYS_openat,
-    libc::SYS_open,
     libc::SYS_fstat,
     libc::SYS_newfstatat,
-    libc::SYS_stat,
-    libc::SYS_lstat,
     libc::SYS_statx,
     libc::SYS_statfs,
     libc::SYS_fstatfs,
-    libc::SYS_access,
     libc::SYS_faccessat,
     libc::SYS_faccessat2,
-    libc::SYS_readlink,
     libc::SYS_readlinkat,
     libc::SYS_getcwd,
     libc::SYS_getdents64,
     libc::SYS_fcntl,
     libc::SYS_dup,
-    libc::SYS_dup2,
     libc::SYS_dup3,
     libc::SYS_pipe2,
     libc::SYS_ioctl,
@@ -135,9 +142,7 @@ pub const ALLOWED: &[libc::c_long] = &[
     libc::SYS_ftruncate,
     libc::SYS_fadvise64,
     libc::SYS_flock,
-    libc::SYS_unlink,
     libc::SYS_unlinkat,
-    libc::SYS_rename,
     libc::SYS_renameat2,
     libc::SYS_close_range,
     libc::SYS_copy_file_range,
@@ -178,7 +183,6 @@ pub const ALLOWED: &[libc::c_long] = &[
     libc::SYS_gettimeofday,
     libc::SYS_membarrier,
     libc::SYS_prctl,
-    libc::SYS_arch_prctl,
     libc::SYS_set_tid_address,
     libc::SYS_prlimit64,
     libc::SYS_getrlimit,
@@ -195,17 +199,14 @@ pub const ALLOWED: &[libc::c_long] = &[
     // Waiting.
     libc::SYS_epoll_create1,
     libc::SYS_epoll_ctl,
-    libc::SYS_epoll_wait,
     libc::SYS_epoll_pwait,
     libc::SYS_epoll_pwait2,
     libc::SYS_eventfd2,
     libc::SYS_timerfd_create,
     libc::SYS_timerfd_settime,
     libc::SYS_timerfd_gettime,
-    libc::SYS_poll,
     libc::SYS_ppoll,
     libc::SYS_pselect6,
-    libc::SYS_select,
     // Sockets: vsock's unix ports, the forwarder, the control socket.
     libc::SYS_socket,
     libc::SYS_socketpair,
@@ -229,6 +230,37 @@ pub const ALLOWED: &[libc::c_long] = &[
     libc::SYS_kill,
 ];
 
+/// The architecture's own: x86_64 keeps the calls the generic table
+/// (arm64's) replaced with their `*at` and `p*` forms.
+#[cfg(target_arch = "x86_64")]
+const ALLOWED_ARCH: &[libc::c_long] = &[
+    libc::SYS_open,
+    libc::SYS_stat,
+    libc::SYS_lstat,
+    libc::SYS_access,
+    libc::SYS_readlink,
+    libc::SYS_dup2,
+    libc::SYS_unlink,
+    libc::SYS_rename,
+    libc::SYS_poll,
+    libc::SYS_select,
+    libc::SYS_epoll_wait,
+    libc::SYS_arch_prctl,
+];
+/// arm64's: glibc's `rename` is `renameat` there.
+#[cfg(target_arch = "aarch64")]
+const ALLOWED_ARCH: &[libc::c_long] = &[libc::SYS_renameat];
+
+/// Refused in every mode.
+pub fn denied() -> impl Iterator<Item = libc::c_long> {
+    DENIED_COMMON.iter().chain(DENIED_ARCH).copied()
+}
+
+/// The runner's allowlist.
+pub fn allowed() -> impl Iterator<Item = libc::c_long> {
+    ALLOWED_COMMON.iter().chain(ALLOWED_ARCH).copied()
+}
+
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter { code, jt: 0, jf: 0, k }
 }
@@ -245,14 +277,14 @@ pub fn program(mode: Option<SeccompMode>) -> Vec<libc::sock_filter> {
     let enosys = RET_ERRNO | libc::ENOSYS as u32;
     let mut p = vec![
         stmt(LD_W_ABS, OFFSET_ARCH),
-        jump(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        jump(JEQ_K, AUDIT_ARCH, 1, 0),
         stmt(RET_K, RET_KILL_PROCESS),
         stmt(LD_W_ABS, OFFSET_NR),
-        jump(JSET_K, X32_SYSCALL_BIT, 0, 1),
-        stmt(RET_K, enosys),
     ];
-    for nr in DENIED {
-        p.push(jump(JEQ_K, *nr as u32, 0, 1));
+    #[cfg(target_arch = "x86_64")]
+    p.extend([jump(JSET_K, X32_SYSCALL_BIT, 0, 1), stmt(RET_K, enosys)]);
+    for nr in denied() {
+        p.push(jump(JEQ_K, nr as u32, 0, 1));
         p.push(stmt(RET_K, eperm));
     }
     p.push(jump(JEQ_K, libc::SYS_clone3 as u32, 0, 1));
@@ -267,9 +299,8 @@ pub fn program(mode: Option<SeccompMode>) -> Vec<libc::sock_filter> {
         p.push(stmt(RET_K, RET_ALLOW));
         return p;
     };
-    let allowed: Vec<_> = ALLOWED.iter().filter(|n| **n != libc::SYS_clone).collect();
-    for nr in allowed {
-        p.push(jump(JEQ_K, *nr as u32, 0, 1));
+    for nr in allowed().filter(|n| *n != libc::SYS_clone) {
+        p.push(jump(JEQ_K, nr as u32, 0, 1));
         p.push(stmt(RET_K, RET_ALLOW));
     }
     p.push(stmt(
@@ -324,16 +355,38 @@ mod tests {
     // filter does (it execs the runner).
     #[test]
     fn execve_only_before_the_runner() {
-        assert!(!ALLOWED.contains(&libc::SYS_execve) && !ALLOWED.contains(&libc::SYS_execveat));
+        assert!(!allowed().any(|n| n == libc::SYS_execve || n == libc::SYS_execveat));
         let jailer = program(None);
         assert!(!jailer.iter().any(|i| i.code == JEQ_K && i.k == libc::SYS_execve as u32));
     }
 
-    // Goal: nothing is both denied and allowed.
+    // Goal: nothing is both denied and allowed, and no call is listed
+    // twice (on arm64, `renameat` and x86's `rename` are both 38, so a
+    // list mixing the tables would show here).
     #[test]
     fn lists_disjoint() {
-        for d in DENIED {
-            assert!(!ALLOWED.contains(d), "{d} is denied and allowed");
+        for d in denied() {
+            assert!(!allowed().any(|a| a == d), "{d} is denied and allowed");
         }
+        for list in [denied().collect::<Vec<_>>(), allowed().collect()] {
+            let mut sorted = list.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), list.len(), "a call listed twice");
+        }
+    }
+
+    // Goal: the program checks this build's own ABI first, and kills any
+    // other.
+    #[test]
+    fn arch_checked_first() {
+        let p = program(Some(SeccompMode::Enforce));
+        assert_eq!((p[0].code, p[0].k), (LD_W_ABS, OFFSET_ARCH));
+        assert_eq!((p[1].code, p[1].k, p[1].jt, p[1].jf), (JEQ_K, AUDIT_ARCH, 1, 0));
+        assert_eq!((p[2].code, p[2].k), (RET_K, RET_KILL_PROCESS));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(AUDIT_ARCH, 0xc000_003e);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(AUDIT_ARCH, 0xc000_00b7);
     }
 }

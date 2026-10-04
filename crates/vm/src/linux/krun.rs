@@ -151,7 +151,7 @@ extern "C" fn push_to_string(user: *mut c_void, s: KrunStr) -> bool {
     // only, and `s` is a borrowed (data, len) pair valid for the call.
     unsafe {
         let out = &mut *(user as *mut String);
-        let bytes = std::slice::from_raw_parts(s.data as *const u8, s.len);
+        let bytes = std::slice::from_raw_parts(s.data.cast::<u8>(), s.len);
         out.push_str(&String::from_utf8_lossy(bytes));
     }
     true
