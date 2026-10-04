@@ -12,6 +12,7 @@
 use std::io::Write;
 use std::time::Instant;
 
+use sandcastle_rootfs::manifest::{HOST_ARCH, HOST_OS};
 use sandcastle_rootfs::registry::Registry;
 use sandcastle_rootfs::{Digest, Reference};
 use serde_json::{json, Value};
@@ -190,7 +191,7 @@ pub fn layers_of(node: &Node, image: &str) -> Result<(Vec<Vec<u8>>, Value), Erro
     let tmp = std::env::temp_dir().join(format!("sc-layers-{}", std::process::id()));
     let out = node.block(async {
         let mut reg = Registry::new();
-        let pulled = reg.pull(&r, "linux", "amd64").await.map_err(|e| Error::msg(e.to_string()))?;
+        let pulled = reg.pull(&r, HOST_OS, HOST_ARCH).await.map_err(|e| Error::msg(e.to_string()))?;
         let mut layers = vec![];
         for l in &pulled.manifest.layers {
             let blob = reg.blob(&r, l, &tmp).await.map_err(|e| Error::msg(e.to_string()))?;
@@ -208,13 +209,13 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
     let tmp = std::env::temp_dir().join(format!("sc-fidelity-{}", std::process::id()));
     let base = node.block(async {
         let mut reg = Registry::new();
-        let pulled = reg.pull(&r, "linux", "amd64").await.map_err(|e| Error::msg(e.to_string()))?;
+        let pulled = reg.pull(&r, HOST_OS, HOST_ARCH).await.map_err(|e| Error::msg(e.to_string()))?;
         let blob = reg.blob(&r, &pulled.manifest.layers[0], &tmp).await.map_err(|e| Error::msg(e.to_string()))?;
         std::fs::read(blob).map_err(Error::io("busybox's layer"))
     })?;
     let _ = std::fs::remove_dir_all(&tmp);
     let config = serde_json::to_vec(&json!({
-        "architecture": "amd64", "os": "linux",
+        "architecture": HOST_ARCH, "os": HOST_OS,
         "config": {"Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"], "Cmd": ["sh"]},
         "rootfs": {"type": "layers", "diff_ids": []},
     }))

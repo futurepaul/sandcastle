@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+use sandcastle_rootfs::manifest::{HOST_ARCH, HOST_OS};
 use serde_json::{json, Value};
 
 use crate::launch::ms;
@@ -72,7 +73,7 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
     layers.extend(shim);
     let mut inner = base;
     inner["Cmd"] = json!(["sleep", "infinity"]);
-    let config = json!({"architecture": "amd64", "os": "linux", "config": inner, "rootfs": {"type": "layers", "diff_ids": []}});
+    let config = json!({"architecture": HOST_ARCH, "os": HOST_OS, "config": inner, "rootfs": {"type": "layers", "diff_ids": []}});
     let (tar, _) = crate::fidelity::saved(&serde_json::to_vec(&config).expect("serializes"), &layers, image);
     let t = Instant::now();
     node.block(node.client.load(image, tar)).map_err(engine_err)?;

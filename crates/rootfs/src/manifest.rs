@@ -14,6 +14,16 @@ pub const INDEX_TYPES: &[&str] =
 pub const MANIFEST_TYPES: &[&str] =
     &["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"];
 
+/// The OCI platform of the images a node runs: KVM boots a guest of its
+/// host's own architecture only, so a node pulls and loads that one.
+pub const HOST_OS: &str = "linux";
+#[cfg(target_arch = "x86_64")]
+pub const HOST_ARCH: &str = "amd64";
+#[cfg(target_arch = "aarch64")]
+pub const HOST_ARCH: &str = "arm64";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("sandcastle's nodes are x86_64 or aarch64");
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Platform {
