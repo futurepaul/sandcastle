@@ -88,6 +88,112 @@ refuses an intercept that names any container but its own, and gives the
 request to the binding its container set for that index. Intercepts are
 only ever appended while a container runs, so an index is stable.
 
+### WebSockets through the engine's proxy
+
+The engine's egress proxy carries the guest's half (`crates/egress`,
+`ws.rs`). A guest's upgrade to an intercepted host, `ws://` or `wss://`
+through the proxy's TLS, goes where its request would: to the handler
+(the node), or for a substitute to the real host with its placeholders
+replaced. On the answer's 101 the proxy answers the guest's 101 and
+joins the two connections. Any other answer passes back as one. A 101 to
+anything but a WebSocket's upgrade is a 502.
+
+The proxy reads each frame's head as it passes. Payloads stream through,
+and each way holds one 16 KiB read. It ends both sides, and sends each a
+close frame where one fits between frames (masked toward the platform,
+whose client it is):
+
+| | Limit | Close |
+|---|---|---|
+| A frame's payload | 32 MiB, an intercepted body's bound | 1009 |
+| A message, its frames together | 32 MiB | 1009 |
+| A control frame | 125 bytes, never fragmented | 1002 |
+| RFC 6455's framing broken: a reserved opcode, a continuation with no message, a client's frame unmasked, a server's masked | | 1002 |
+| Nothing either way | 1 hour (`IDLE`) | 1001 |
+| A side done (its stream ended, or close frames both ways) | 10 s (`CLOSE_WAIT`) for the other | 1001 |
+
+`IDLE` is long because a computer's keepalive is silent by design while
+it is held. Ending one costs little: the computer's object holds it awake
+20 minutes after a close, and the bridge dials again at once.
+
+- Each joined WebSocket holds one of the forwarder's 256 connections a VM
+  may have (`FORWARDS_MAX`), so they are bounded with the rest.
+- Each end is a decision in the proxy's log: `WebSocket closed`,
+  `WebSocket idle 3600000 ms (1001)`, `WebSocket refused from the guest:
+  a frame of … bytes, past … (1009)`.
+- A WebSocket to a host that is not intercepted is spliced as bytes, as
+  before: no headers set, no limits. The rules refuse what they refused.
+- An engine restart ends every WebSocket through it; its guests dial
+  again.
+
+**Evidence (2026-10-04).**
+
+1. **Host tests,** `cargo test -p sandcastle-egress`: 25 in the crate
+   and 4 in `tests/websocket.rs`, under 1 s together.
+   - The gate: frames pass byte for byte however the reads split them,
+     in every head form; limits at their edges; each malformed head; the
+     proxy's own close frames, each way.
+   - The join, over in-memory pipes: idle, a refusal, a side done while
+     the other lingers, and a clean close.
+   - Through the proxy, with a stand-in platform on the handler's socket
+     and a guest's client (tokio-tungstenite) that dials the proxy as the
+     forwarder does:
+     - `ws://` and `wss://` (a client that trusts only the node's CA),
+       the four headers set; text, and 700,000 bytes of binary, echoed; a
+       close from the guest and one from the platform, each clean; a
+       second socket after the first;
+     - a 403 passes back as an answer, its body intact; a 101 to a plain
+       `GET` is a 502;
+     - not intercepted, with the internet off: NXDOMAIN, and an
+       unassigned fake address and a public one refused. Allowed by a
+       rule: spliced untouched, no headers set, and a frame past the
+       limit passes;
+     - a substitute's WebSocket goes on to the real host, its placeholder
+       replaced and its frames held to the limits;
+     - a frame at the limit passes. One byte past it, from the guest or
+       from the platform, closes both sides with 1009. A client's frame
+       unmasked closes both with 1002. Traffic keeps a socket open past
+       the idle limit, and quiet ends it with 1001.
+   - After each socket, the proxy's count of joined WebSockets is 0
+     again.
+2. **curl 8.22,** the version in `curlimages/curl:8.22.0`, ran on the
+   host through the same proxy, with a TCP stand-in for the forwarder
+   (not kept). `ws://` and `wss://` got the platform's hello, and
+   `-T -`'s message came back echoed.
+3. **On a jailed engine:** `sandcastle-krun-spike egress` (Acceptance 5)
+   now opens one of each from the curl image too, through the stand-in
+   handler, which answers WebSockets:
+
+   ```sh
+   printf sandcastle-ws-up | curl -sS -m 3 -T - \
+     --cacert /etc/cloudflare/certs/cloudflare-containers-ca.crt wss://model.example.com/ws
+   ```
+
+   Its checks are `ws_through_intercept`, `wss_through_intercept`, and
+   `off_wss_through_intercept` (the internet off). Not yet run: it needs
+   the engine built from this change, as root.
+
+**Found on the way:**
+
+- **An address intercept could take down the engine.** An HTTP
+  `ip:port`, range, or `*` intercept matched by a connection to an
+  address has no name, and the proxy took one with `expect`. That was a
+  panic, and with `panic = "abort"` the whole engine went down, every VM
+  with it, from inside a guest. The address is now the host. Sandcastle's
+  `main` has the same bug; its fix is a PR of its own.
+- **A substitute went on to port 80 or 443,** whatever port the guest
+  dialed. It now goes to that port.
+- **The join's watch missed a side's end.** It took its deadline once and
+  slept, so a side that ended meanwhile waited out `IDLE` instead of
+  `CLOSE_WAIT`. The join test hung in 2 runs of 5. A side's end now wakes
+  the watch.
+- **TLS that ends without `close_notify`.** tokio-tungstenite drops its
+  stream without one, which rustls reports as an error. In a join it is
+  an end like any other: the close frames say whether it was clean.
+- **curl keeps a WebSocket open after the platform's close** (8.22, with
+  `-T -`), and ends only at `-m`, with 28. So the checks read its output,
+  not its exit code.
+
 ## Auth
 
 Calls are signed with HMAC-SHA256 under the node's secret (at least 32
@@ -516,16 +622,9 @@ checked at start.
   test drives a rustls client through `nc` in the container instead.
 - **No WebSocket crossed an intercept.** The bridge opens WebSockets to
   `api.fragment.internal` (`/api/computer/keepalive`, `/f/<f>/__live`).
-  The double and the node's egress now carry them (Intercepts, above).
-  **The engine's egress proxy does not yet.** It would need the same
-  three changes in `crates/egress/src/proxy.rs`:
-  - `serve_http`'s connection `with_upgrades()`;
-  - in `request`, the guest's upgrade taken (`hyper::upgrade::on`) before
-    the request goes on;
-  - in `to_handler` (and `to_upstream`, for a substitute's `ws://` and
-    `wss://`), the connection spawned `with_upgrades()`. On a 101, the
-    other side's upgrade is taken and the two are joined with
-    `copy_bidirectional`.
+  The double and the node's egress now carry them (Intercepts, above),
+  and so does the engine's egress proxy, with limits (Intercepts,
+  WebSockets through the engine's proxy).
 - **A `wait` after the end blocked for good.** tokio's
   `watch::Sender::send` stores nothing while no receiver is subscribed.
   So a `wait` asked after a container ended never answered. Both doubles

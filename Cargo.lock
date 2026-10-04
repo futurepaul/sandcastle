@@ -831,6 +831,7 @@ version = "0.1.0"
 name = "sandcastle-egress"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -842,6 +843,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "webpki-roots",
 ]
 
@@ -901,6 +903,7 @@ name = "sandcastle-krun-spike"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "futures-util",
  "hex",
  "http-body-util",
  "hyper",
@@ -917,6 +920,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

@@ -34,3 +34,6 @@ libc.workspace = true
 tar.workspace = true
 flate2 = { workspace = true, features = ["rust_backend"] }
 ruzstd.workspace = true
+# the egress scenario's stand-in answers a guest's WebSocket
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

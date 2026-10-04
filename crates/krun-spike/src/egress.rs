@@ -2,7 +2,8 @@
 //! setting, an HTTPS request to a named host handed to a handler that
 //! answers it; a placeholder substituted with its value; with the internet
 //! off, a name that is not intercepted does not resolve; a private address
-//! refused.
+//! refused. And a guest's WebSocket, `ws://` and `wss://`, through the
+//! intercept to the handler and back.
 //!
 //! The handler is a stand-in for celld's callback route, labeled so in
 //! every answer. The substituted value is a labeled test string.
@@ -10,6 +11,7 @@
 use std::convert::Infallible;
 use std::path::PathBuf;
 
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
@@ -29,13 +31,44 @@ const SUBSTITUTED_HOST: &str = "httpbin.org";
 const PLACEHOLDER: &str = "SC_PLACEHOLDER_TEST_0001";
 const TEST_VALUE: &str = "sk-test-not-a-real-secret";
 pub const STAND_IN: &str = "the spike's stand-in for celld's callback route";
+/// What a guest's WebSocket sends, and gets back echoed.
+const WS_UP: &str = "sandcastle-ws-up";
+
+/// A guest's WebSocket, answered 101: a hello naming the host and scheme
+/// the proxy set, then each message echoed until the guest goes.
+fn websocket(req: &mut Request<Incoming>) -> Response<Full<Bytes>> {
+    let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let hello = format!("{STAND_IN}: hello {} {}\n", h("x-sandcastle-host"), h("x-sandcastle-scheme"));
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(h("sec-websocket-key").as_bytes());
+    let on = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let Ok(up) = on.await else { return };
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(hyper_util::rt::TokioIo::new(up), tokio_tungstenite::tungstenite::protocol::Role::Server, None).await;
+        let _ = ws.send(tokio_tungstenite::tungstenite::Message::text(hello)).await;
+        // Bounded by the guest's socket, and the proxy's idle limit.
+        while let Some(Ok(m)) = ws.next().await {
+            if m.is_text() || m.is_binary() {
+                let _ = ws.send(m).await;
+            }
+        }
+    });
+    let mut r = Response::new(Full::new(Bytes::new()));
+    *r.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
+    r.headers_mut().insert("connection", "upgrade".parse().expect("a header"));
+    r.headers_mut().insert("upgrade", "websocket".parse().expect("a header"));
+    r.headers_mut().insert("sec-websocket-accept", accept.parse().expect("a header"));
+    r
+}
 
 async fn stand_in(listener: tokio::net::UnixListener) {
     // Unbounded by design: the stand-in serves for the scenario's life.
     loop {
         let Ok((s, _)) = listener.accept().await else { continue };
         tokio::spawn(async move {
-            let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+            let svc = hyper::service::service_fn(|mut req: Request<Incoming>| async move {
+                if sandcastle_egress::ws::asks(req.headers()) {
+                    return Ok::<_, Infallible>(websocket(&mut req));
+                }
                 let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 let body = json!({
                     "stand_in": STAND_IN,
@@ -49,7 +82,7 @@ async fn stand_in(listener: tokio::net::UnixListener) {
                 r.headers_mut().insert("content-type", "application/json".parse().expect("a header"));
                 Ok::<_, Infallible>(r)
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).with_upgrades().await;
         });
     }
 }
@@ -85,6 +118,8 @@ pub fn intercepts() -> Vec<Intercept> {
         Intercept::https("openrouter.ai", Action::Handler),
         Intercept::https("*.openrouter.ai", Action::Handler),
         Intercept::https(SUBSTITUTED_HOST, Action::Substitute { placeholders: vec![Placeholder { placeholder: PLACEHOLDER.into(), value: TEST_VALUE.into() }] }),
+        // for ws://, appended so the others keep their indexes
+        Intercept::http(MODEL_HOST, Action::Handler),
     ]
 }
 
@@ -106,6 +141,8 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let (handled, _) = on.sh(&format!("{curl} https://{MODEL_HOST}/v1/chat/completions -H 'Authorization: Bearer {PLACEHOLDER}' -d '{{}}'"))?;
     let (substituted, _) = on.sh(&format!("{curl} https://{SUBSTITUTED_HOST}/headers -H 'Authorization: Bearer {PLACEHOLDER}'"))?;
     let (spliced, _) = on.sh("curl -sS -m 20 -o /dev/null -w '%{http_code}' https://example.com/")?;
+    let (ws, _) = on.sh(&ws_curl(false))?;
+    let (wss, _) = on.sh(&ws_curl(true))?;
     let (private, _) = on.sh("curl -sS -m 5 http://10.0.0.1/; echo rc=$?; curl -sS -m 5 http://169.254.169.254/latest/meta-data/; echo rc=$?")?;
     let (ssh, https) = (std::net::SocketAddr::new(node_ip, 22), std::net::SocketAddr::new(node_ip, 443));
     let (node_refused, _) = on.sh(&format!("curl -sS -m 5 http://{ssh}/; echo rc=$?; curl -sS -m 5 http://{https}/; echo rc=$?"))?;
@@ -129,6 +166,7 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let (lookup_public, lookup_public_rc) = off.sh("nslookup example.com")?;
     let (lookup_model, _) = off.sh(&format!("nslookup {MODEL_HOST}"))?;
     let (handled_off, _) = off.sh(&format!("{curl} https://{MODEL_HOST}/v1/chat/completions -d '{{}}'"))?;
+    let (wss_off, _) = off.sh(&ws_curl(true))?;
     let (direct_ip, _) = off.sh("curl -sS -m 5 -k https://1.1.1.1/; echo rc=$?")?;
     off.destroy(None)?;
 
@@ -142,6 +180,9 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
         "off_intercepted_name_resolved": lookup_model.contains("198.18."),
         "off_handler_answered": handled_off.contains(STAND_IN),
         "off_direct_ip_refused": !direct_ip.contains("rc=0"),
+        "ws_through_intercept": ws_echoed(&ws, "http"),
+        "wss_through_intercept": ws_echoed(&wss, "https"),
+        "off_wss_through_intercept": ws_echoed(&wss_off, "https"),
     });
     let pass = checks.as_object().expect("an object").values().all(|v| v == true);
     Ok(json!({
@@ -160,7 +201,24 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
         "off_lookup_public": lookup_public,
         "off_lookup_model": lookup_model,
         "off_direct_ip": direct_ip,
+        "ws": ws,
+        "wss": wss,
+        "off_wss": wss_off,
     }))
+}
+
+/// A guest's WebSocket through the intercept, with curl (8.11 and later
+/// speak it): `-T -` sends stdin as one message, and every message back
+/// is printed. curl holds the socket until `-m`, so it ends with 28.
+fn ws_curl(tls: bool) -> String {
+    let (scheme, ca) = if tls { ("wss", format!(" --cacert {CA_IN_GUEST}")) } else { ("ws", String::new()) };
+    format!("printf {WS_UP} | curl -sS -m 3 -T -{ca} {scheme}://{MODEL_HOST}/ws; echo \" rc=$?\"")
+}
+
+/// Whether the stand-in's hello came back over `scheme`, and the guest's
+/// message echoed.
+fn ws_echoed(out: &str, scheme: &str) -> bool {
+    out.contains(&format!("{STAND_IN}: hello {MODEL_HOST} {scheme}\n{WS_UP}"))
 }
 
 /// Five requests to the handler from inside, curl's own clock.

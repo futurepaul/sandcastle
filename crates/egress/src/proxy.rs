@@ -3,13 +3,16 @@
 //! the rules and the fake range, and for a connection decides: refuse,
 //! splice to the real destination, or intercept (terminate TLS with the
 //! node's CA, then hand each request to the handler or substitute its
-//! placeholders and send it on). It runs outside the VM's jail: the CA's
-//! key and every secret stay where an escape from the VMM cannot reach.
+//! placeholders and send it on). A WebSocket's upgrade goes the same way,
+//! and on a 101 the two connections are joined (`ws`). It runs outside the
+//! VM's jail: the CA's key and every secret stay where an escape from the
+//! VMM cannot reach.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -29,11 +32,14 @@ use crate::dns;
 use crate::fakeip::{self, FakeIps};
 use crate::rules::{Action, AddrDecision, Compiled, NameDecision};
 use crate::sni::{self, Peek, PEEK_BYTES_MAX};
+use crate::ws;
 
 /// A connection's first bytes, to decide from.
 const PEEK_WAIT: Duration = Duration::from_secs(10);
 /// Decisions kept for the evidence.
 const LOG_MAX: usize = 1024;
+/// A 101's hand-over of both connections, at most.
+const UPGRADE_WAIT: Duration = Duration::from_secs(10);
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -66,6 +72,19 @@ pub struct Egress {
     container: String,
     upstream: tokio_rustls::TlsConnector,
     log: Mutex<Vec<Decision>>,
+    ws: ws::Limits,
+    /// WebSockets joined now; each holds one of the forwarder's
+    /// `FORWARDS_MAX` connections, which bounds them.
+    websockets: Arc<AtomicUsize>,
+}
+
+/// One WebSocket counted while its join runs.
+struct Joined(Arc<AtomicUsize>);
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A stream whose first bytes were already read to decide.
@@ -124,7 +143,20 @@ impl Egress {
             container,
             upstream: tokio_rustls::TlsConnector::from(Arc::new(config)),
             log: Mutex::new(Vec::new()),
+            ws: ws::Limits::default(),
+            websockets: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Other limits for WebSockets than `ws`'s own (the tests' are short).
+    pub fn with_ws_limits(mut self, limits: ws::Limits) -> Egress {
+        self.ws = limits;
+        self
+    }
+
+    /// WebSockets joined now.
+    pub fn websockets(&self) -> usize {
+        self.websockets.load(Ordering::SeqCst)
     }
 
     fn rules(&self) -> Arc<Compiled> {
@@ -282,11 +314,46 @@ impl Egress {
         });
         hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+            .with_upgrades()
             .await
             .map_err(|e| ProxyError::Refused(e.to_string()))
     }
 
-    async fn request(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool, port: u16) -> Response<Body> {
+    async fn request(self: Arc<Self>, mut req: Request<Incoming>, i: usize, host: &str, tls: bool, port: u16) -> Response<Body> {
+        // A WebSocket's upgrade is taken before the request goes on.
+        let guest = ws::asks(req.headers()).then(|| hyper::upgrade::on(&mut req));
+        let what = format!("{}://{host}:{port}{}", if tls { "wss" } else { "ws" }, req.uri().path());
+        let resp = self.answer_for(req, i, host, tls, port).await;
+        self.upgrade(resp, guest, what, host)
+    }
+
+    /// On a 101 for a WebSocket's upgrade, joins the guest's connection to
+    /// the other side's (`ws::join`); a 101 for anything else is refused.
+    fn upgrade(self: Arc<Self>, mut resp: Response<Body>, guest: Option<hyper::upgrade::OnUpgrade>, what: String, host: &str) -> Response<Body> {
+        if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+            return resp;
+        }
+        let Some(guest) = guest else {
+            self.note(what, Some(host), "Refuse(a 101 for what is not a WebSocket's upgrade)".into());
+            return text(502, "only a WebSocket's upgrade passes an intercept");
+        };
+        let other = hyper::upgrade::on(&mut resp);
+        let host = host.to_string();
+        self.websockets.fetch_add(1, Ordering::SeqCst);
+        let joined = Joined(self.websockets.clone());
+        tokio::spawn(async move {
+            let _joined = joined;
+            let end = match tokio::time::timeout(UPGRADE_WAIT, async { tokio::join!(guest, other) }).await {
+                Ok((Ok(g), Ok(o))) => ws::join(hyper_util::rt::TokioIo::new(g), hyper_util::rt::TokioIo::new(o), self.ws).await.to_string(),
+                Ok((Err(e), _) | (_, Err(e))) => format!("WebSocket not joined: {e}"),
+                Err(_) => format!("WebSocket not joined in {} s", UPGRADE_WAIT.as_secs()),
+            };
+            self.note(what, Some(&host), end);
+        });
+        resp
+    }
+
+    async fn answer_for(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool, port: u16) -> Response<Body> {
         match self.rules().action(i).clone() {
             Action::Handler => {
                 // Each replaces whatever the guest sent under its name.
@@ -323,10 +390,12 @@ impl Egress {
         }
     }
 
+    /// The request to the handler; an upgrade's connection is kept for
+    /// whoever takes it from the answer.
     async fn to_handler(&self, req: Request<Incoming>) -> Result<Response<Body>, String> {
         let s = UnixStream::connect(&self.handler).await.map_err(|e| e.to_string())?;
         let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.map_err(|e| e.to_string())?;
-        tokio::spawn(conn);
+        tokio::spawn(conn.with_upgrades());
         let resp = send.send_request(req).await.map_err(|e| e.to_string())?;
         Ok(resp.map(|b| b.boxed()))
     }
@@ -339,11 +408,11 @@ impl Egress {
             let name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
             let s = self.upstream.connect(name, tcp).await.map_err(|e| e.to_string())?;
             let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.map_err(|e| e.to_string())?;
-            tokio::spawn(conn);
+            tokio::spawn(conn.with_upgrades());
             send.send_request(req).await.map_err(|e| e.to_string())?
         } else {
             let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await.map_err(|e| e.to_string())?;
-            tokio::spawn(conn);
+            tokio::spawn(conn.with_upgrades());
             send.send_request(req).await.map_err(|e| e.to_string())?
         };
         Ok(resp.map(|b| b.boxed()))

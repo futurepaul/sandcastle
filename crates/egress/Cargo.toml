@@ -3,7 +3,7 @@ name = "sandcastle-egress"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "A microVM's egress: the rules (as Cloudflare's: hosts, globs, addresses, ranges; 128 of them), fake addresses for names, a resolver, and the node-side proxy that intercepts TLS with the node's CA and hands a request to a handler or substitutes a placeholder."
+description = "A microVM's egress: the rules (as Cloudflare's: hosts, globs, addresses, ranges; 128 of them), fake addresses for names, a resolver, and the node-side proxy that intercepts TLS with the node's CA and hands a request to a handler or substitutes a placeholder, WebSockets included."
 
 [dependencies]
 sandcastle-wire.workspace = true
@@ -19,3 +19,8 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
 
+
+[dev-dependencies]
+# a guest's WebSocket client and the stand-in platform's (tests/websocket.rs)
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
