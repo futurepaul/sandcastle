@@ -246,6 +246,7 @@ impl Engine {
             owner_uid: c.client_uid,
             owner_gid: c.client_gid,
             system_libs: c.system_libs.clone(),
+            links: sandcastle_vm::jail::host_links(Path::new("/")).map_err(|e| ApiError::Internal(e.to_string()))?,
             seccomp: c.seccomp,
         };
         settings.validate().map_err(|e| ApiError::Internal(e.to_string()))?;

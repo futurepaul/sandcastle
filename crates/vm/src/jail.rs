@@ -58,8 +58,42 @@ pub struct Settings {
     /// The C library's directories, bound read-only (the runner is a
     /// glibc binary, so it can load libkrun).
     pub system_libs: Vec<PathBuf>,
+    /// The root's links into `/usr`, as the host has them (`host_links`):
+    /// the runner's ELF interpreter is `/lib64/ld-linux-x86-64.so.2`, which
+    /// is `usr/lib64` on Debian and `usr/lib` on Arch.
+    #[serde(default = "debian_links")]
+    pub links: Vec<(PathBuf, PathBuf)>,
     #[serde(default)]
     pub seccomp: SeccompMode,
+}
+
+fn debian_links() -> Vec<(PathBuf, PathBuf)> {
+    vec![("/lib".into(), "usr/lib".into()), ("/lib64".into(), "usr/lib64".into())]
+}
+
+/// The host's `/lib` and `/lib64` under `root` (`/` on a node), each a
+/// link into `/usr`: the jail needs a merged `/usr`, and mirrors the host's.
+pub fn host_links(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, JailError> {
+    let mut links = Vec::new();
+    for name in ["lib", "lib64"] {
+        let to = std::fs::read_link(root.join(name)).map_err(|_| JailError::Host(format!("/{name} is not a link into /usr")))?;
+        let to = to.strip_prefix("/").map(Path::to_path_buf).unwrap_or(to);
+        links.push((Path::new("/").join(name), to));
+    }
+    check_links(&links)?;
+    Ok(links)
+}
+
+/// Each link is a name at the root, to a plain relative path under `usr`.
+fn check_links(links: &[(PathBuf, PathBuf)]) -> Result<(), JailError> {
+    for (link, to) in links {
+        let top = normal_absolute(link) && link.components().count() == 2;
+        let into_usr = to.starts_with("usr") && to.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !top || !into_usr {
+            return Err(JailError::Host(format!("{} links to {}, not into /usr", link.display(), to.display())));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +154,8 @@ pub enum JailError {
     Settings(&'static str),
     #[error("the VM's config: {0}")]
     Config(String),
+    #[error("the host: {0}; the jail needs a merged /usr")]
+    Host(String),
 }
 
 fn under(p: &Path, root: &Path) -> bool {
@@ -138,6 +174,7 @@ impl Settings {
                 return Err(JailError::Settings("system libraries come from /usr"));
             }
         }
+        check_links(&self.links)?;
         // Root, and the node's own user, are never a VM's uid.
         if self.uid_base == 0 || self.uid_count == 0 {
             return Err(JailError::Settings("an empty uid range"));
@@ -237,7 +274,7 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
         groups: vec![settings.kvm_gid],
         mounts,
         owned,
-        links: vec![("/lib".into(), "usr/lib".into()), ("/lib64".into(), "usr/lib64".into())],
+        links: settings.links.clone(),
         tap,
         nft,
         inside: inside_config,
@@ -329,8 +366,39 @@ mod tests {
             owner_uid: 1000,
             owner_gid: 1000,
             system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
+            links: debian_links(),
             seccomp: SeccompMode::Enforce,
         }
+    }
+
+    // Goal: the jail's root links as the host's does (Arch's /lib64 is
+    // usr/lib, where its loader is), an absolute link is made relative, and
+    // a host whose /lib64 is a directory, or links outside /usr, is refused.
+    #[test]
+    fn host_links_follow_the_host() {
+        let root = std::env::temp_dir().join(format!("sc-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::os::unix::fs::symlink("/usr/lib", root.join("lib64")).unwrap();
+        let arch = host_links(&root).unwrap();
+        assert_eq!(arch, vec![("/lib".into(), "usr/lib".into()), ("/lib64".into(), "usr/lib".into())]);
+        let mut s = settings();
+        s.system_libs = vec!["/usr/lib".into()];
+        s.links = arch.clone();
+        assert_eq!(plan(&config(), &s, 300_001).unwrap().links, arch);
+
+        std::fs::remove_file(root.join("lib64")).unwrap();
+        std::fs::create_dir(root.join("lib64")).unwrap();
+        assert!(matches!(host_links(&root), Err(JailError::Host(_))));
+        std::fs::remove_dir(root.join("lib64")).unwrap();
+        std::os::unix::fs::symlink("../etc", root.join("lib64")).unwrap();
+        assert!(matches!(host_links(&root), Err(JailError::Host(_))));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut bad = settings();
+        bad.links.push(("/etc".into(), "home/ubuntu".into()));
+        assert!(matches!(plan(&config(), &bad, 300_001), Err(JailError::Host(_))));
     }
 
     fn config() -> VmConfig {
