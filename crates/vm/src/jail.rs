@@ -58,9 +58,16 @@ pub struct Settings {
     /// The C library's directories, bound read-only (the runner is a
     /// glibc binary, so it can load libkrun).
     pub system_libs: Vec<PathBuf>,
+    /// Single files beside them, bound read-only: the ELF interpreter
+    /// where it sits alone in `/usr/lib` (Debian's arm64 has
+    /// `/usr/lib/ld-linux-aarch64.so.1`, a link into its multiarch
+    /// directory).
+    #[serde(default)]
+    pub system_files: Vec<PathBuf>,
     /// The root's links into `/usr`, as the host has them (`host_links`):
-    /// the runner's ELF interpreter is `/lib64/ld-linux-x86-64.so.2`, which
-    /// is `usr/lib64` on Debian and `usr/lib` on Arch.
+    /// x86_64's ELF interpreter is `/lib64/ld-linux-x86-64.so.2`, which is
+    /// `usr/lib64` on Debian and `usr/lib` on Arch; arm64's is
+    /// `/lib/ld-linux-aarch64.so.1`, and its hosts may have no `/lib64`.
     #[serde(default = "debian_links")]
     pub links: Vec<(PathBuf, PathBuf)>,
     #[serde(default)]
@@ -73,10 +80,15 @@ fn debian_links() -> Vec<(PathBuf, PathBuf)> {
 
 /// The host's `/lib` and `/lib64` under `root` (`/` on a node), each a
 /// link into `/usr`: the jail needs a merged `/usr`, and mirrors the host's.
+/// A host without `/lib64` (Debian's arm64) gets none.
 pub fn host_links(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, JailError> {
     let mut links = Vec::new();
     for name in ["lib", "lib64"] {
-        let to = std::fs::read_link(root.join(name)).map_err(|_| JailError::Host(format!("/{name} is not a link into /usr")))?;
+        let at = root.join(name);
+        if name == "lib64" && std::fs::symlink_metadata(&at).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            continue;
+        }
+        let to = std::fs::read_link(&at).map_err(|_| JailError::Host(format!("/{name} is not a link into /usr")))?;
         let to = to.strip_prefix("/").map(Path::to_path_buf).unwrap_or(to);
         links.push((Path::new("/").join(name), to));
     }
@@ -169,10 +181,15 @@ impl Settings {
                 return Err(JailError::Path(p.clone()));
             }
         }
-        for p in &self.system_libs {
+        for p in self.system_libs.iter().chain(&self.system_files) {
             if !normal_absolute(p) || !p.starts_with("/usr") {
                 return Err(JailError::Settings("system libraries come from /usr"));
             }
+        }
+        // A file inside a bound directory would be mounted over a
+        // read-only mount's file.
+        if self.system_files.iter().any(|f| self.system_libs.iter().any(|d| f.starts_with(d))) {
+            return Err(JailError::Settings("a system file lies in a system library directory"));
         }
         check_links(&self.links)?;
         // Root, and the node's own user, are never a VM's uid.
@@ -247,6 +264,9 @@ pub fn plan(config: &VmConfig, settings: &Settings, uid: u32) -> Result<Plan, Ja
     });
     for l in &settings.system_libs {
         mounts.push(Mount { source: l.clone(), target: l.clone(), kind: MountKind::BindRo { exec: true }, file: false });
+    }
+    for f in &settings.system_files {
+        mounts.push(Mount { source: f.clone(), target: f.clone(), kind: MountKind::BindRo { exec: true }, file: true });
     }
     mounts.push(Mount { source: config.run_dir.clone(), target: inside::RUN_DIR.into(), kind: MountKind::BindRw, file: false });
     mounts.push(Mount { source: "/dev/kvm".into(), target: "/dev/kvm".into(), kind: MountKind::Device, file: true });
@@ -366,6 +386,7 @@ mod tests {
             owner_uid: 1000,
             owner_gid: 1000,
             system_libs: vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()],
+            system_files: vec![],
             links: debian_links(),
             seccomp: SeccompMode::Enforce,
         }
@@ -394,11 +415,38 @@ mod tests {
         std::fs::remove_dir(root.join("lib64")).unwrap();
         std::os::unix::fs::symlink("../etc", root.join("lib64")).unwrap();
         assert!(matches!(host_links(&root), Err(JailError::Host(_))));
+        // Debian's arm64: no /lib64, and /lib is still required.
+        std::fs::remove_file(root.join("lib64")).unwrap();
+        assert_eq!(host_links(&root).unwrap(), vec![("/lib".into(), "usr/lib".into())]);
+        std::fs::remove_file(root.join("lib")).unwrap();
+        assert!(matches!(host_links(&root), Err(JailError::Host(_))));
         std::fs::remove_dir_all(&root).unwrap();
 
         let mut bad = settings();
         bad.links.push(("/etc".into(), "home/ubuntu".into()));
         assert!(matches!(plan(&config(), &bad, 300_001), Err(JailError::Host(_))));
+    }
+
+    // Goal: Debian's arm64 jail binds its multiarch directory and the
+    // interpreter's file beside it, and a file inside a bound directory, or
+    // outside /usr, is refused.
+    #[test]
+    fn system_files_bound() {
+        let mut s = settings();
+        s.system_libs = vec!["/usr/lib/aarch64-linux-gnu".into()];
+        s.system_files = vec!["/usr/lib/ld-linux-aarch64.so.1".into()];
+        s.links = vec![("/lib".into(), "usr/lib".into())];
+        let p = plan(&config(), &s, 300_001).unwrap();
+        let ld = p.mounts.iter().find(|m| m.target == Path::new("/usr/lib/ld-linux-aarch64.so.1")).unwrap();
+        assert_eq!((ld.kind, ld.file), (MountKind::BindRo { exec: true }, true));
+        assert!(p.mounts.iter().any(|m| m.target == Path::new("/usr/lib/aarch64-linux-gnu") && !m.file));
+
+        let mut bad = s.clone();
+        bad.system_files = vec!["/usr/lib/aarch64-linux-gnu/libc.so.6".into()];
+        assert!(matches!(plan(&config(), &bad, 300_001), Err(JailError::Settings(_))));
+        let mut bad = s;
+        bad.system_files = vec!["/etc/shadow".into()];
+        assert!(matches!(plan(&config(), &bad, 300_001), Err(JailError::Settings(_))));
     }
 
     fn config() -> VmConfig {

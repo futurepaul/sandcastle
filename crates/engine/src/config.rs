@@ -38,14 +38,22 @@ pub struct EngineConfig {
     #[serde(default)]
     pub seccomp: sandcastle_vm::jail::SeccompMode,
     /// The host's shared libraries a VM's runner loads libkrun's
-    /// dependencies from, each bound read-only into its jail, under `/usr`:
-    /// Debian's layout by default; Arch's is `/usr/lib`.
+    /// dependencies from, and its ELF interpreter, each bound read-only
+    /// into its jail, under `/usr`: a directory, or a single file (a link
+    /// to one is followed). Debian's layout for this architecture by
+    /// default; Arch's is `/usr/lib`.
     #[serde(default = "debian_libs")]
     pub system_libs: Vec<PathBuf>,
 }
 
+/// Debian's: the multiarch directory, and the interpreter where it lies
+/// outside it (amd64's `/usr/lib64/ld-linux-x86-64.so.2`, arm64's
+/// `/usr/lib/ld-linux-aarch64.so.1`).
 fn debian_libs() -> Vec<PathBuf> {
-    vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()]
+    #[cfg(target_arch = "x86_64")]
+    return vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()];
+    #[cfg(target_arch = "aarch64")]
+    return vec!["/usr/lib/aarch64-linux-gnu".into(), "/usr/lib/ld-linux-aarch64.so.1".into()];
 }
 
 fn yes() -> bool {
@@ -91,6 +99,21 @@ impl EngineConfig {
             return Err(ConfigError("state_dir: too long for a VM's sockets".into()));
         }
         Ok(())
+    }
+
+    /// `system_libs` as the host has them: (directories, files), or the
+    /// first that is neither.
+    pub fn system_mounts(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>), ConfigError> {
+        let (mut dirs, mut files) = (Vec::new(), Vec::new());
+        for p in &self.system_libs {
+            match std::fs::metadata(p) {
+                Ok(m) if m.is_dir() => dirs.push(p.clone()),
+                Ok(m) if m.is_file() => files.push(p.clone()),
+                Ok(_) => return Err(ConfigError(format!("system_libs: {} is neither a directory nor a file", p.display()))),
+                Err(e) => return Err(ConfigError(format!("system_libs: {}: {e}", p.display()))),
+            }
+        }
+        Ok((dirs, files))
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -175,16 +198,37 @@ pub(crate) mod tests {
         assert_eq!(config().run_dir(3), PathBuf::from("/var/lib/sandcastle-engine/vms/3"));
     }
 
-    // Goal: a config that names no system libraries gets Debian's, as
-    // before, and one that names them (Arch's /usr/lib) gets those.
+    // Goal: a config that names no system libraries gets Debian's for
+    // this architecture, as before on x86_64, and one that names them
+    // (Arch's /usr/lib) gets those.
     #[test]
     fn system_libs() {
         let mut v = serde_json::to_value(config()).unwrap();
         v.as_object_mut().unwrap().remove("system_libs");
         let c: EngineConfig = serde_json::from_value(v.clone()).unwrap();
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib/x86_64-linux-gnu"), PathBuf::from("/usr/lib64")]);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib/aarch64-linux-gnu"), PathBuf::from("/usr/lib/ld-linux-aarch64.so.1")]);
         v["system_libs"] = serde_json::json!(["/usr/lib"]);
         let c: EngineConfig = serde_json::from_value(v).unwrap();
         assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib")]);
+    }
+
+    // Goal: each system path is sorted by what the host has there, a link
+    // followed to what it names; a missing one is refused by name.
+    #[test]
+    fn system_mounts_follow_the_host() {
+        let root = std::env::temp_dir().join(format!("sc-system-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("multiarch")).unwrap();
+        std::fs::write(root.join("multiarch/ld.so"), b"").unwrap();
+        std::os::unix::fs::symlink("multiarch/ld.so", root.join("ld.so")).unwrap();
+        let mut c = config();
+        c.system_libs = vec![root.join("multiarch"), root.join("ld.so")];
+        assert_eq!(c.system_mounts().unwrap(), (vec![root.join("multiarch")], vec![root.join("ld.so")]));
+        c.system_libs.push(root.join("missing"));
+        assert!(c.system_mounts().unwrap_err().0.contains("missing"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

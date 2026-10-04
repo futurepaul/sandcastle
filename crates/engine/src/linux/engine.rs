@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandcastle_egress::ca::Ca;
 use sandcastle_egress::{Egress, Policy};
+use sandcastle_rootfs::manifest::{HOST_ARCH, HOST_OS};
 use sandcastle_rootfs::registry::Registry;
 use sandcastle_rootfs::{ImageConfig, Reference};
 use sandcastle_vm::client::Vm as AgentClient;
@@ -250,6 +251,7 @@ impl Engine {
                 }
             }
         };
+        let (system_libs, system_files) = c.system_mounts().map_err(|e| ApiError::Internal(e.to_string()))?;
         let settings = sandcastle_vm::jail::Settings {
             state_root: c.state_dir.clone(),
             lib_dir: c.lib_dir.clone(),
@@ -259,7 +261,8 @@ impl Engine {
             kvm_gid: kvm_gid().ok_or_else(|| ApiError::Internal("no kvm group".into()))?,
             owner_uid: c.client_uid,
             owner_gid: c.client_gid,
-            system_libs: c.system_libs.clone(),
+            system_libs,
+            system_files,
             links: sandcastle_vm::jail::host_links(Path::new("/")).map_err(|e| ApiError::Internal(e.to_string()))?,
             seccomp: c.seccomp,
         };
@@ -461,7 +464,7 @@ impl Engine {
         let r = Reference::parse(reference).map_err(|e| ApiError::Invalid(e.to_string()))?;
         let _one_build = self.builds.lock().await;
         let mut reg = Registry::new();
-        let pulled = reg.pull(&r, "linux", "amd64").await.map_err(|e| ApiError::Internal(format!("{reference}: {e}")))?;
+        let pulled = reg.pull(&r, HOST_OS, HOST_ARCH).await.map_err(|e| ApiError::Internal(format!("{reference}: {e}")))?;
         let digest = pulled.manifest_digest.to_string();
         let meta = match self.image_by_digest(&digest) {
             Ok(m) => m,
@@ -509,7 +512,7 @@ impl Engine {
         if config_bytes.len() as u64 > crate::load::MANIFEST_BYTES_MAX {
             return Err(ApiError::Invalid("the config is too large".into()));
         }
-        let config = sandcastle_rootfs::manifest::parse_config(&config_bytes, "linux", "amd64").map_err(|e| ApiError::Invalid(e.to_string()))?;
+        let config = sandcastle_rootfs::manifest::parse_config(&config_bytes, HOST_OS, HOST_ARCH).map_err(|e| ApiError::Invalid(e.to_string()))?;
         let config_digest = sandcastle_rootfs::Digest::of(&config_bytes);
         let blobs_dir = self.config.blobs().join("sha256");
         std::fs::create_dir_all(&blobs_dir).map_err(internal("the blob store"))?;
