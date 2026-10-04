@@ -1,5 +1,6 @@
 # The build, clippy with warnings denied, and every test, on Linux, where
-# the cfg(target_os = "linux") pieces compile. No test needs KVM or
+# the cfg(target_os = "linux") pieces compile, on x86_64 and on aarch64
+# (whose seccomp tables and defaults differ). No test needs KVM or
 # libkrun (it is loaded with dlopen at run time), so a hosted runner holds
 # them all; the scenarios that need a KVM node are the driver's, by hand.
 name: ci
@@ -13,7 +14,10 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,8 +29,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked

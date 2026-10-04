@@ -87,7 +87,8 @@ test needs KVM. The Linux-only pieces (the jail, seccomp, vsock, cgroups,
 the engine's service, the guest, the driver's scenarios) are behind
 `cfg(target_os = "linux")`, so on macOS the workspace builds and tests
 its pure pieces; Linux compiles and tests the rest. CI
-(`.github/workflows/ci.yml`) runs all three on `ubuntu-latest`.
+(`.github/workflows/ci.yml`) runs all three on `ubuntu-latest` and
+`ubuntu-24.04-arm`.
 
 ## Running it on a KVM host
 
