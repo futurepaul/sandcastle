@@ -37,6 +37,15 @@ pub struct EngineConfig {
     /// the allowlist misses.
     #[serde(default)]
     pub seccomp: sandcastle_vm::jail::SeccompMode,
+    /// The host's shared libraries a VM's runner loads libkrun's
+    /// dependencies from, each bound read-only into its jail, under `/usr`:
+    /// Debian's layout by default; Arch's is `/usr/lib`.
+    #[serde(default = "debian_libs")]
+    pub system_libs: Vec<PathBuf>,
+}
+
+fn debian_libs() -> Vec<PathBuf> {
+    vec!["/usr/lib/x86_64-linux-gnu".into(), "/usr/lib64".into()]
 }
 
 fn yes() -> bool {
@@ -144,6 +153,7 @@ pub(crate) mod tests {
             kernel_args: vec![],
             pull: true,
             seccomp: sandcastle_vm::jail::SeccompMode::Enforce,
+            system_libs: debian_libs(),
         }
     }
 
@@ -163,5 +173,18 @@ pub(crate) mod tests {
         assert!(bad(&|c| c.client_uid = 0));
         assert!(bad(&|c| c.state_dir = format!("/{}", "a".repeat(100)).into()));
         assert_eq!(config().run_dir(3), PathBuf::from("/var/lib/sandcastle-engine/vms/3"));
+    }
+
+    // Goal: a config that names no system libraries gets Debian's, as
+    // before, and one that names them (Arch's /usr/lib) gets those.
+    #[test]
+    fn system_libs() {
+        let mut v = serde_json::to_value(config()).unwrap();
+        v.as_object_mut().unwrap().remove("system_libs");
+        let c: EngineConfig = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib/x86_64-linux-gnu"), PathBuf::from("/usr/lib64")]);
+        v["system_libs"] = serde_json::json!(["/usr/lib"]);
+        let c: EngineConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(c.system_libs, vec![PathBuf::from("/usr/lib")]);
     }
 }
