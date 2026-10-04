@@ -1,6 +1,7 @@
 //! File work the engine does often and must do fast: copying a sparse
 //! disk by its data alone (a fresh scratch disk from its template, a
-//! snapshot and its restore), and writing a file whole or not at all.
+//! snapshot and its restore), writing a file whole or not at all, and a
+//! log's last bytes.
 
 use std::fs::File;
 use std::io;
@@ -71,6 +72,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// The last `max` bytes of the file at `path`, as text (lossy), trimmed;
+/// empty when it is missing or empty.
+pub fn tail(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = File::open(path) else { return String::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(max))).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = f.take(max).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +115,26 @@ mod tests {
         assert_eq!(back[100 << 20], 0);
         assert!(allocated(&dst).unwrap() < 4 << 20);
         assert!(sparse_copy(&src, &dst).is_err(), "never overwrites");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Goal: a log's tail is its last bytes, trimmed; a missing or empty
+    // log is empty, and bytes that are not UTF-8 do not stop it.
+    #[test]
+    fn tails() {
+        let dir = std::env::temp_dir().join(format!("sc-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("runner.log");
+        assert_eq!(tail(&log, 16), "");
+        std::fs::write(&log, b"").unwrap();
+        assert_eq!(tail(&log, 16), "");
+        std::fs::write(&log, b"short\n").unwrap();
+        assert_eq!(tail(&log, 16), "short");
+        let mut long = vec![b'a'; 100];
+        long.extend_from_slice(b"\xffend of the log\n");
+        std::fs::write(&log, &long).unwrap();
+        assert_eq!(tail(&log, 16), "\u{fffd}end of the log");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
