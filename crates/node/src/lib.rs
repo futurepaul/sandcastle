@@ -1,7 +1,8 @@
 //! A node on the network (docs/node.md): the engine's API for a platform
 //! elsewhere. The engine stays root and on its unix sockets; this process
 //! is unprivileged, holds the node's secret, checks every call's signature,
-//! and hands each intercepted request to the platform, signed.
+//! and hands each intercepted request to the platform, signed. A node the
+//! platform cannot reach dials it instead (`uplink`).
 
 pub mod auth;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod egress;
 pub mod http;
 #[cfg(unix)]
 pub mod server;
+pub mod uplink;
 
 pub use config::NodeConfig;
 

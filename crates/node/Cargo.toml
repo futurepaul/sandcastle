@@ -28,3 +28,7 @@ rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 hmac.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+
+[dev-dependencies]
+# a lower-rung test double: the engine's API with no VMs (tests/uplink.rs)
+sandcastle-fake-engine.workspace = true

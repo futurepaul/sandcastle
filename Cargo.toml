@@ -3,7 +3,7 @@
 # (docs/krun-spike.md, Dependencies).
 [workspace]
 resolver = "2"
-members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/node", "crates/krun-spike"]
+members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/node", "crates/fake-engine", "crates/krun-spike"]
 
 [workspace.package]
 edition = "2021"
@@ -16,6 +16,7 @@ sandcastle-rootfs = { path = "crates/rootfs" }
 sandcastle-egress = { path = "crates/egress" }
 sandcastle-engine = { path = "crates/engine" }
 sandcastle-node = { path = "crates/node" }
+sandcastle-fake-engine = { path = "crates/fake-engine" }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
 hex = "=0.4.3"
 hmac = "=0.12.1"

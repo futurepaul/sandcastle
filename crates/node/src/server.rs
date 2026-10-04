@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::auth;
-use crate::http::{self, Body};
+use crate::http::{self, Body, Io};
 use crate::Node;
 
 /// A call's body, as read (the engine's own bound).
@@ -319,9 +319,6 @@ async fn guest_port(node: Arc<Node>, name: String, port: u16, rest: String, mut 
     }
     resp.map(http::streamed)
 }
-
-trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 /// Serves the API on `listener` until the process ends.
 pub async fn serve(node: Arc<Node>, listener: tokio::net::TcpListener) {

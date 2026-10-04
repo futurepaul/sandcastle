@@ -11,6 +11,12 @@
 //! own users are the platform's to check; the node only learns that the
 //! platform sent it). An intercepted request's string also names its
 //! container, its intercept's index, its scheme, its host, and its path.
+//!
+//! The uplink (docs/node.md, The uplink) adds two: the node's dial, over
+//! its id, a fresh nonce and its timestamp; and the platform's `hello`,
+//! over the same nonce, which answers that dial and no other. The
+//! platform keeps the nonces it took inside the window (`DialBook`), so a
+//! recorded dial is refused when it comes again.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -24,6 +30,16 @@ pub const SECRET_BYTES_MIN: usize = 32;
 pub const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 /// A header's length, at most.
 const HEADER_BYTES_MAX: usize = 128;
+/// The uplink's dial names its node in this header, and its nonce in the next.
+pub const NODE_HEADER: &str = "x-sandcastle-node";
+pub const NONCE_HEADER: &str = "x-sandcastle-nonce";
+/// A node's id: 1 to this many of `a-z`, `0-9` and `-`.
+pub const NODE_ID_BYTES_MAX: usize = 64;
+/// A dial's nonce: this many hex digits (16 random bytes).
+pub const NONCE_HEX: usize = 32;
+/// Dials one node may make inside the window, at most: the platform keeps
+/// each one's nonce for the window, and refuses a dial past this.
+pub const DIALS_PER_WINDOW: usize = 32;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AuthError {
@@ -37,6 +53,14 @@ pub enum AuthError {
     Mismatch,
     #[error("a node's secret is at least {SECRET_BYTES_MIN} bytes")]
     WeakSecret,
+    #[error("a node's id is 1 to {NODE_ID_BYTES_MAX} of a-z, 0-9 and -")]
+    NodeId,
+    #[error("a dial's nonce is {NONCE_HEX} lowercase hex digits")]
+    Nonce,
+    #[error("a dial seen before: its nonce was taken inside the window")]
+    Replayed,
+    #[error("more than {DIALS_PER_WINDOW} dials inside the window")]
+    TooManyDials,
 }
 
 /// The node's secret: the trimmed bytes of its file, as both sides read it.
@@ -120,6 +144,52 @@ impl Egress<'_> {
     }
 }
 
+pub fn valid_node_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= NODE_ID_BYTES_MAX && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+pub fn valid_nonce(nonce: &str) -> bool {
+    nonce.len() == NONCE_HEX && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The uplink's dial: what the node signs.
+pub fn dial_string(node: &str, nonce: &str, t: u64) -> String {
+    format!("sandcastle-uplink-v1\n{node}\n{nonce}\n{t}")
+}
+
+/// The platform's `hello`, answering the dial whose nonce it names.
+pub fn hello_string(node: &str, nonce: &str, t: u64) -> String {
+    format!("sandcastle-uplink-hello-v1\n{node}\n{nonce}\n{t}")
+}
+
+/// The platform's half of a dial's replay check: the nonces it took inside
+/// the window, at most `DIALS_PER_WINDOW`. A nonce older than the window
+/// needs no keeping, because its signature has expired. The cell's
+/// `uplink.mjs` keeps the same book in its object's storage.
+#[derive(Default, Debug)]
+pub struct DialBook {
+    seen: std::collections::VecDeque<(String, u64)>,
+}
+
+impl DialBook {
+    /// Takes `nonce`, signed at `t`, at `now`; refuses one seen before, or
+    /// one past the window's allowance. Call it after the signature verifies.
+    pub fn admit(&mut self, nonce: &str, t: u64, now: u64) -> Result<(), AuthError> {
+        if !valid_nonce(nonce) {
+            return Err(AuthError::Nonce);
+        }
+        self.seen.retain(|(_, at)| now.abs_diff(*at) <= WINDOW_S);
+        if self.seen.iter().any(|(n, _)| n == nonce) {
+            return Err(AuthError::Replayed);
+        }
+        if self.seen.len() >= DIALS_PER_WINDOW {
+            return Err(AuthError::TooManyDials);
+        }
+        self.seen.push_back((nonce.to_string(), t));
+        Ok(())
+    }
+}
+
 pub fn now_s() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -164,6 +234,41 @@ mod tests {
             assert_eq!(parse(bad).map(|_| ()), Err(AuthError::Malformed), "{bad}");
         }
         assert_eq!(Secret::new(b"  short  ").map(|_| ()), Err(AuthError::WeakSecret));
+    }
+
+    // Goal: a dial verifies for its node, nonce and time, valid; another
+    // node's, another nonce's, or a stale one is refused, invalid; the
+    // same dial again inside the window is refused by the book, replay;
+    // and a hello answers only the dial whose nonce it signs.
+    #[test]
+    fn dials() {
+        let s = secret();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let t = 1_800_000_000;
+        let h = s.header(t, &dial_string("node-1", nonce, t));
+        assert_eq!(s.verify(Some(&h), t + 5, |t| dial_string("node-1", nonce, t)), Ok(()));
+        assert_eq!(s.verify(Some(&h), t, |t| dial_string("node-2", nonce, t)), Err(AuthError::Mismatch));
+        assert_eq!(s.verify(Some(&h), t, |t| dial_string("node-1", &"f".repeat(32), t)), Err(AuthError::Mismatch));
+        assert_eq!(s.verify(Some(&h), t + WINDOW_S + 1, |t| dial_string("node-1", nonce, t)), Err(AuthError::Expired(WINDOW_S + 1)));
+        let mut book = DialBook::default();
+        assert_eq!(book.admit(nonce, t, t + 1), Ok(()));
+        assert_eq!(book.admit(nonce, t, t + 30), Err(AuthError::Replayed));
+        // past the window the nonce is forgotten: its signature has expired anyway
+        assert_eq!(book.admit(nonce, t, t + WINDOW_S + 1), Ok(()));
+        assert_eq!(book.admit("not hex", t, t), Err(AuthError::Nonce));
+        assert_eq!(book.admit(&"A".repeat(32), t, t), Err(AuthError::Nonce));
+        let mut full = DialBook::default();
+        for i in 0..DIALS_PER_WINDOW {
+            assert_eq!(full.admit(&format!("{i:032x}"), t, t), Ok(()));
+        }
+        assert_eq!(full.admit(&format!("{:032x}", 999), t, t), Err(AuthError::TooManyDials));
+        assert_eq!(full.admit(&format!("{:032x}", 999), t, t + WINDOW_S + 1), Ok(()), "the window moved on");
+        // the hello signs the dial's own nonce: a recorded one answers no other dial
+        let hello = s.header(t, &hello_string("node-1", nonce, t));
+        assert_eq!(s.verify(Some(&hello), t, |t| hello_string("node-1", nonce, t)), Ok(()));
+        assert_eq!(s.verify(Some(&hello), t, |t| hello_string("node-1", &"e".repeat(32), t)), Err(AuthError::Mismatch));
+        assert_eq!(s.verify(Some(&hello), t, |t| dial_string("node-1", nonce, t)), Err(AuthError::Mismatch), "a hello is no dial");
+        assert!(valid_node_id("dev-node-1") && !valid_node_id("") && !valid_node_id("Node") && !valid_node_id(&"a".repeat(65)) && !valid_node_id("a/b"));
     }
 
     // Goal: an intercepted request's signature binds its container, its

@@ -840,6 +840,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-fake-engine"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "sandcastle-egress",
+ "sandcastle-engine",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "sandcastle-guest"
 version = "0.1.0"
 dependencies = [
@@ -889,6 +905,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sandcastle-engine",
+ "sandcastle-fake-engine",
  "serde",
  "serde_json",
  "sha2",

@@ -1,6 +1,6 @@
-//! The node's configuration (docs/node.md): where it listens, the engine's
-//! sockets, its secret's file, and the platform it hands intercepts to.
-//! Read once at start and checked.
+//! The node's configuration (docs/node.md): where it listens or what it
+//! dials (the uplink), the engine's sockets, its secret's file, and the
+//! platform it hands intercepts to. Read once at start and checked.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,8 +12,9 @@ use serde::Deserialize;
 pub struct NodeConfig {
     /// The API's address: loopback for a platform on the same box, a LAN
     /// address for one beside it. TLS is the network's (docs/node.md,
-    /// Reachability).
-    pub listen: SocketAddr,
+    /// Reachability). A node with an uplink may listen nowhere.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
     /// The engine's `engine.sock` and `ports.sock`.
     pub engine: PathBuf,
     pub ports: PathBuf,
@@ -28,6 +29,21 @@ pub struct NodeConfig {
     /// the public ones.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// The uplink: the node dials the platform, which serves the API over
+    /// that connection (docs/node.md, The uplink).
+    #[serde(default)]
+    pub uplink: Option<UplinkConfig>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct UplinkConfig {
+    /// The platform's uplink: `wss://<platform>/api/nodes/uplink` (`ws://`
+    /// in dev). Its TLS takes `ca_file`'s roots too.
+    pub url: String,
+    /// The node's id, as the platform is configured with it
+    /// (`FRAGMENT_NODE_URL=uplink:<id>`).
+    pub id: String,
 }
 
 impl NodeConfig {
@@ -40,6 +56,18 @@ impl NodeConfig {
         let u = url::Url::parse(&self.platform).map_err(|e| format!("platform: {e}"))?;
         if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || u.path() != "/" || u.query().is_some() {
             return Err("platform is an http(s) origin, with no path".into());
+        }
+        if let Some(up) = &self.uplink {
+            let u = url::Url::parse(&up.url).map_err(|e| format!("uplink.url: {e}"))?;
+            if !matches!(u.scheme(), "ws" | "wss") || u.host_str().is_none() || u.query().is_some() || u.fragment().is_some() {
+                return Err("uplink.url is a ws(s) URL, with no query".into());
+            }
+            if !crate::auth::valid_node_id(&up.id) {
+                return Err(format!("uplink.id is 1 to {} of a-z, 0-9 and -", crate::auth::NODE_ID_BYTES_MAX));
+            }
+        }
+        if self.listen.is_none() && self.uplink.is_none() {
+            return Err("a node listens, dials an uplink, or both".into());
         }
         Ok(())
     }
@@ -70,5 +98,26 @@ mod tests {
         }
         assert!(NodeConfig { egress: "relative.sock".into(), ..config() }.check().is_err());
         assert!(serde_json::from_str::<NodeConfig>(r#"{"listen":"127.0.0.1:1","surprise":1}"#).is_err());
+    }
+
+    // Goal: a node dials an uplink, listens, or both, never neither; the
+    // uplink's URL is a WebSocket's and its id the platform's form.
+    #[test]
+    fn uplinks() {
+        let up = |url: &str, id: &str| NodeConfig { listen: None, uplink: Some(UplinkConfig { url: url.into(), id: id.into() }), ..config() };
+        assert_eq!(up("wss://fragment.example/api/nodes/uplink", "node-1").check(), Ok(()));
+        assert_eq!(up("ws://127.0.0.1:8890/api/nodes/uplink", "n").check(), Ok(()));
+        assert!(up("https://fragment.example/api/nodes/uplink", "node-1").check().is_err());
+        assert!(up("wss://fragment.example/api/nodes/uplink?x=1", "node-1").check().is_err());
+        assert!(up("wss://fragment.example/api/nodes/uplink", "Node_1").check().is_err());
+        assert!(NodeConfig { listen: None, ..config() }.check().is_err(), "neither");
+        let both = NodeConfig { uplink: up("wss://x/api/nodes/uplink", "a").uplink, ..config() };
+        assert_eq!(both.check(), Ok(()));
+        let parsed: NodeConfig = serde_json::from_str(
+            r#"{"engine":"/s/engine.sock","ports":"/s/ports.sock","egress":"/e.sock","secret_file":"/k","platform":"http://p","uplink":{"url":"ws://p/api/nodes/uplink","id":"dev"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.check(), Ok(()));
+        assert!(serde_json::from_str::<NodeConfig>(r#"{"engine":"/s","ports":"/p","egress":"/e","secret_file":"/k","platform":"http://p","uplink":{"url":"ws://p/","id":"d","more":1}}"#).is_err());
     }
 }

@@ -1,5 +1,6 @@
 //! `sandcastle-node serve --config <path>`: the engine's API on the network
-//! (docs/node.md), as the engine's client user, never root.
+//! (docs/node.md), as the engine's client user, never root: on `listen`,
+//! over the uplink it dials, or both.
 
 use std::process::ExitCode;
 
@@ -50,12 +51,15 @@ fn serve(config: sandcastle_node::NodeConfig) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let api = match tokio::net::TcpListener::bind(config.listen).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("sandcastle-node: {}: {e}", config.listen);
-                return ExitCode::FAILURE;
-            }
+        let api = match config.listen {
+            Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("sandcastle-node: {addr}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => None,
         };
         let _ = std::fs::remove_file(&config.egress);
         if let Some(dir) = config.egress.parent() {
@@ -70,11 +74,27 @@ fn serve(config: sandcastle_node::NodeConfig) -> ExitCode {
         };
         // the engine (root) connects; no one else on the node may
         let _ = std::fs::set_permissions(&config.egress, std::os::unix::fs::PermissionsExt::from_mode(0o600));
-        eprintln!("sandcastle-node: serving on {}, intercepts on {} to {}", config.listen, config.egress.display(), config.platform_base());
+        let listening = config.listen.map(|a| format!("on {a}")).into_iter();
+        let dialing = config.uplink.as_ref().map(|u| format!("over the uplink to {} as {}", u.url, u.id)).into_iter();
+        let ways: Vec<String> = listening.chain(dialing).collect();
+        eprintln!("sandcastle-node: serving {}, intercepts on {} to {}", ways.join(" and "), config.egress.display(), config.platform_base());
         let node = std::sync::Arc::new(sandcastle_node::Node { config, secret, platform });
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a signal handler");
+        let listen = async {
+            match api {
+                Some(l) => sandcastle_node::server::serve(node.clone(), l).await,
+                None => std::future::pending().await,
+            }
+        };
+        let uplink = async {
+            match node.config.uplink {
+                Some(_) => sandcastle_node::uplink::run(node.clone()).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            _ = sandcastle_node::server::serve(node.clone(), api) => {}
+            _ = listen => {}
+            _ = uplink => {}
             _ = sandcastle_node::egress::serve(node.clone(), egress) => {}
             _ = term.recv() => eprintln!("sandcastle-node: stopping"),
             _ = tokio::signal::ctrl_c() => eprintln!("sandcastle-node: stopping"),

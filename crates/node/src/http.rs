@@ -33,6 +33,11 @@ pub fn error(status: u16, kind: &str, message: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": message, "kind": kind }))
 }
 
+/// A connection the node speaks HTTP or a WebSocket over: TCP, TLS, a
+/// unix socket, or an in-memory pipe.
+pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
+
 /// Headers that name one hop, not the request: never passed on.
 pub const HOP: [&str; 8] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "host"];
 
@@ -68,6 +73,13 @@ impl Platform {
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Platform { base, tls: tokio_rustls::TlsConnector::from(Arc::new(config)) })
+    }
+
+    /// TLS to `host` over `tcp`, with the platform's roots (the uplink's
+    /// dial, which may name another host than the intercepts' platform).
+    pub async fn tls(&self, host: &str, tcp: tokio::net::TcpStream) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+        let name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(|e| format!("{host}: {e}"))?;
+        self.tls.connect(name, tcp).await.map_err(|e| format!("TLS to {host}: {e}"))
     }
 
     pub async fn send(&self, req: Request<Body>) -> Result<Response<Incoming>, String> {
