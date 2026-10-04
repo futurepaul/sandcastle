@@ -2,7 +2,8 @@
 //! runs them: `sandcastle-node`'s API (its own servers, wired as its
 //! `main.rs` wires them) on a TCP port, every call signed, its handler
 //! socket for intercepts, and a stand-in platform at
-//! `/api/nodes/egress` that checks the node's signature on each. The
+//! `/api/nodes/egress` that checks the node's signature on each, and
+//! echoes a WebSocket a guest opens through an intercept. The
 //! containers are real, of a real image, in Docker. Needs what
 //! tests/docker.rs needs:
 //!
@@ -26,7 +27,8 @@ use sandcastle_engine::exec_stream::{self, Decoder, Exited, Stream};
 use sandcastle_node::auth::{self, Secret};
 use sandcastle_node::{Node, NodeConfig};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, Role};
+use tokio_tungstenite::WebSocketStream;
 
 mod common;
 use common::{docker, image, relay, scratch, Sweep, WAIT};
@@ -49,14 +51,27 @@ async fn platform() -> (SocketAddr, Arc<Mutex<Vec<serde_json::Value>>>) {
                     let s = s.clone();
                     async move { Ok::<_, Infallible>(egress(s, req).await) }
                 });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(conn), svc).await;
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(conn), svc).with_upgrades().await;
             });
         }
     });
     (addr, seen)
 }
 
-async fn egress(seen: Arc<Mutex<Vec<serde_json::Value>>>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+/// Echoes a WebSocket's text and binary messages until its client closes.
+async fn echo(up: hyper::upgrade::OnUpgrade) {
+    let Ok(up) = up.await else { return };
+    let ws = WebSocketStream::from_raw_socket(hyper_util::rt::TokioIo::new(up), Role::Server, None).await;
+    let (mut tx, mut rx) = ws.split();
+    // Bounded by the socket's life.
+    while let Some(Ok(m)) = rx.next().await {
+        if matches!(m, Message::Text(_) | Message::Binary(_)) && tx.send(m).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn egress(seen: Arc<Mutex<Vec<serde_json::Value>>>, mut req: Request<Incoming>) -> Response<Full<Bytes>> {
     let answer = |status: u16, body: String| {
         let mut r = Response::new(Full::new(Bytes::from(body)));
         *r.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
@@ -68,13 +83,24 @@ async fn egress(seen: Arc<Mutex<Vec<serde_json::Value>>>, req: Request<Incoming>
     let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let (container, intercept, host, scheme, path, sig) = (h("x-sandcastle-container"), h("x-sandcastle-intercept"), h("x-sandcastle-host"), h("x-sandcastle-scheme"), h("x-sandcastle-path"), h(auth::HEADER));
     let method = req.method().to_string();
+    let probe = h("x-sandcastle-probe");
+    let key = req.headers().get("sec-websocket-key").map(|k| k.as_bytes().to_vec());
+    let websocket = key.is_some().then(|| hyper::upgrade::on(&mut req));
     let body = req.into_body().collect().await.unwrap().to_bytes();
     let e = auth::Egress { method: &method, container: &container, intercept: &intercept, scheme: &scheme, host: &host, path: &path };
     if let Err(err) = Secret::new(SECRET).unwrap().verify(Some(&sig), auth::now_s(), |t| e.string(t, &auth::sha256_hex(&body))) {
         return answer(401, err.to_string());
     }
-    let saw = serde_json::json!({ "container": container, "intercept": intercept, "host": host, "scheme": scheme, "path": path, "method": method, "body": String::from_utf8_lossy(&body) });
+    let saw = serde_json::json!({ "container": container, "intercept": intercept, "host": host, "scheme": scheme, "path": path, "method": method, "body": String::from_utf8_lossy(&body), "websocket": websocket.is_some(), "probe": probe });
     seen.lock().unwrap().push(saw.clone());
+    if let (Some(up), Some(key)) = (websocket, key) {
+        tokio::spawn(echo(up));
+        let mut r = answer(101, String::new());
+        r.headers_mut().insert("connection", "Upgrade".parse().unwrap());
+        r.headers_mut().insert("upgrade", "websocket".parse().unwrap());
+        r.headers_mut().insert("sec-websocket-accept", tokio_tungstenite::tungstenite::handshake::derive_accept_key(&key).parse().unwrap());
+        return r;
+    }
     answer(200, serde_json::to_string(&serde_json::json!({ "platform": "the stand-in", "saw": saw })).unwrap())
 }
 
@@ -191,6 +217,7 @@ async fn a_node_over_the_double() {
 
     let (status, health) = call_json(node_addr, "GET", "/v1/health", serde_json::Value::Null).await;
     assert_eq!((status, health["engine"].as_str()), (200, Some("sandcastle-docker-engine")), "{health}");
+    assert_eq!((health["node"]["isolation"].as_str(), health["node"]["arch"].as_str()), (Some("docker"), Some(std::env::consts::ARCH)), "{health}");
     let (status, _) = call(node_addr, "GET", "/v1/containers", b"").await;
     assert_eq!(status, 200);
 
@@ -216,6 +243,16 @@ async fn a_node_over_the_double() {
     let saw = &answer["saw"];
     assert_eq!((saw["container"].as_str(), saw["intercept"].as_str(), saw["host"].as_str()), (Some("n1"), Some("0"), Some("api.fragment.internal")));
     assert_eq!((saw["scheme"].as_str(), saw["path"].as_str(), saw["method"].as_str(), saw["body"].as_str()), (Some("http"), Some("/v1/ping?q=1"), Some("POST"), Some("hello")));
+    // a guest's WebSocket through the intercept, the node, to the platform
+    let probe = ["/.sandcastle-relay", "ws-probe", "api.fragment.internal", "/api/computer/keepalive?v=2", "hello through the node"];
+    let t = std::time::Instant::now();
+    let ran = exec(node_addr, "n1", cmd(&probe), None).await;
+    assert_eq!(ran.exited, Some(Exited { code: Some(0), signal: None }), "{ran:?} {}", String::from_utf8_lossy(&ran.stderr));
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "hello through the node\n", "echoed by the platform");
+    eprintln!("a guest's WebSocket echoed through the node: {:?}", t.elapsed());
+    let ws = seen.lock().unwrap().iter().find(|s| s["websocket"] == true).cloned().expect("the platform saw the upgrade");
+    assert_eq!((ws["container"].as_str(), ws["host"].as_str(), ws["path"].as_str(), ws["method"].as_str()), (Some("n1"), Some("api.fragment.internal"), Some("/api/computer/keepalive?v=2"), Some("GET")));
+    assert_eq!(ws["probe"], "ws", "the guest's own headers pass");
     let big: Vec<u8> = (0..393_238u32).map(|i| (i % 251) as u8).collect();
     let ran = exec(node_addr, "n1", ExecRequest { stdin: true, ..cmd(&["cat"]) }, Some(big.clone())).await;
     assert!(ran.stdout == big && ran.exited == Some(Exited { code: Some(0), signal: None }), "stdin echoed whole through the node: {} bytes", ran.stdout.len());

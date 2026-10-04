@@ -27,7 +27,7 @@ The API is the engine's routes (`crates/engine/src/linux/server.rs`) on
 `engine.sock` unchanged:
 
 ```
-GET    /v1/health                          the engine's, and {"node": {version, isolation}}
+GET    /v1/health                          the engine's, and {"node": {version, isolation, arch}}
 GET    /v1/containers[/{name}]             list, inspect
 POST   /v1/containers/{name}/start         see below
 POST   /v1/containers/{name}/destroy|signal|snapshots
@@ -74,6 +74,14 @@ then:
 3. sends it to `<platform>/api/nodes/egress`, with its path in
    `x-sandcastle-path`;
 4. streams the platform's answer back to the guest.
+
+A WebSocket's upgrade (`connection: upgrade`, `upgrade: websocket`) has
+no body. The node signs it over the empty body and sends it on with its
+`connection` and `upgrade` headers; these are the only hop headers that
+pass. On the platform's 101, the node answers the engine with the same
+101 and joins the two connections both ways. Any other answer passes back
+as it is. The stub's bridge needs this for its keepalive and for
+`/f/<f>/__live`.
 
 On the platform, the computer's object checks the signature again. It
 refuses an intercept that names any container but its own, and gives the
@@ -427,9 +435,13 @@ What the double fakes, and how:
   `https.sock`, which the double serves on the host. The double terminates
   HTTPS with its CA, for the name the guest's TLS asks for. It then hands
   each request to the handler with the egress proxy's four
-  `x-sandcastle-*` headers, streaming both bodies. A host stays in
+  `x-sandcastle-*` headers, streaming both bodies. A WebSocket's upgrade
+  goes the same way: on the handler's 101 the double answers the guest's
+  101 and joins the two connections. A host stays in
   `/etc/hosts` after its intercept is gone, and then answers 502. Nothing
   else is intercepted: the container's network is Docker's, and open.
+- **The relay** also has `ws-probe <host> <path> <message>`, a guest's
+  WebSocket client for the tests, since busybox has none.
 - **Exec** is `docker exec`, with the relay in front
   (`exec [--combined] <pidfile> <cmd…>`). So a signal frame reaches the
   process, through the image's `kill`; without `kill`, the docker client
@@ -467,7 +479,7 @@ checked at start.
 **Evidence (2026-10-04),** all with `fragment-stub:s2`:
 
 1. **Host tests,** `cargo test -p sandcastle-docker-engine -p
-   sandcastle-docker-relay` (18): names, each docker call's argv,
+   sandcastle-docker-relay` (21): names, each docker call's argv,
    `/etc/hosts` lines, what routes and where, exits and signals, and the
    relay's command lines and its copy with half-close.
 2. **`tests/docker.rs`** (ignored: it needs Docker,
@@ -480,13 +492,16 @@ checked at start.
    port and a refused one; a snapshot restored; signal, destroy, and
    `wait`; an entrypoint that exits at once; a missing image; and the
    double's end leaving nothing.
-3. **`tests/node.rs`** (ignored, the same needs), about 1.3 s.
+3. **`tests/node.rs`** (ignored, the same needs), about 1.5 s.
    `sandcastle-node`'s own servers, wired as its `main.rs` wires them,
    stand in front of the double. A stand-in platform checks the node's
    signatures. A signed start takes 160 ms. Exec runs over the node's
    WebSocket: a guest's `POST` goes through `api.fragment.internal` to
    `/api/nodes/egress`, signed by the node, and 393,238 bytes of stdin
-   echo. A guest port answers. The stub's own entrypoint boots, and its
+   echo. A guest's WebSocket (`ws-probe`) goes through the intercept, the
+   double and the node. The platform echoes it, and the round trip takes
+   about 20 ms. `health` says `isolation: "docker"` and the node's arch.
+   A guest port answers. The stub's own entrypoint boots, and its
    screen on 6080 answers through the node. The bridge's first
    `GET /api/computer` came before its intercept was armed and failed; it
    tried again 1.5 s later and reached the platform. Signal 15 ends it
@@ -499,24 +514,34 @@ checked at start.
   flight as one record. So the handshake fails against the double, and
   against the engine's egress proxy too, which uses the same rustls. The
   test drives a rustls client through `nc` in the container instead.
-- **No WebSocket crosses an intercept.** The bridge opens WebSockets to
+- **No WebSocket crossed an intercept.** The bridge opens WebSockets to
   `api.fragment.internal` (`/api/computer/keepalive`, `/f/<f>/__live`).
-  An upgrade through an intercept is carried by neither the double, nor
-  the engine's egress proxy, nor the node's egress, which strips
-  `upgrade`.
+  The double and the node's egress now carry them (Intercepts, above).
+  **The engine's egress proxy does not yet.** It would need the same
+  three changes in `crates/egress/src/proxy.rs`:
+  - `serve_http`'s connection `with_upgrades()`;
+  - in `request`, the guest's upgrade taken (`hyper::upgrade::on`) before
+    the request goes on;
+  - in `to_handler` (and `to_upstream`, for a substitute's `ws://` and
+    `wss://`), the connection spawned `with_upgrades()`. On a 101, the
+    other side's upgrade is taken and the two are joined with
+    `copy_bidirectional`.
 - **A `wait` after the end blocked for good.** tokio's
   `watch::Sender::send` stores nothing while no receiver is subscribed.
-  So a `wait` asked after a container ended never answered. The double
-  uses `send_replace`. The fake engine's `end` still has the bug.
-- **The node's `health` says `isolation: "microvm"` whatever its
-  engine.** Over the double, only the engine's own `fake` field tells the
-  truth.
+  So a `wait` asked after a container ended never answered. Both doubles
+  now use `send_replace`; the fake engine has a test for it.
+- **The node's `health` said `isolation: "microvm"` whatever its
+  engine.** It now reports the engine's `isolation` when its health names
+  one (the double's is `docker`), and the node's `arch`.
 
 ## Isolation
 
 `health` reports `isolation: "microvm"`: the engine's VMs, each jailed.
-A node without KVM would report something weaker, and the platform's
-policy decides what it may run there.
+An engine whose own health names its isolation is reported as such
+instead; the Docker double's is `docker`. A node without KVM would report
+something weaker, and the platform's policy decides what it may run
+there. `arch` is the node's machine (`x86_64`, `aarch64`), so a platform
+can check that a node is what it is listed as.
 
 ## Not done
 

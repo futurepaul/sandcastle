@@ -1,5 +1,5 @@
 //! The Docker double's relay (crates/docker-engine), bind-mounted into each
-//! container the double starts at `/.sandcastle-relay`. Two ways to run it:
+//! container the double starts at `/.sandcastle-relay`. Three ways to run it:
 //!
 //! - `sandcastle-docker-relay <dir>`: listens on 127.0.0.1:80 and
 //!   127.0.0.1:443 inside the container, where its `/etc/hosts` sends each
@@ -13,6 +13,9 @@
 //!   only its client. `--combined` sends the process's stderr to its
 //!   stdout first, so the two keep their order (the docker client's two
 //!   pipes would not).
+//! - `sandcastle-docker-relay ws-probe <host> <path> <message>`: a guest's
+//!   WebSocket, for the double's tests (`probe`): it prints the echo of
+//!   `<message>`.
 //!
 //! std only and threads, so it builds static for musl and runs in any
 //! image. A lower-rung test double's part; never a node's.
@@ -29,6 +32,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod probe;
+
 /// Connections relayed at once, at most; one past it is closed at once.
 const CONNECTIONS_MAX: usize = 256;
 /// Each relaying thread's stack: it only copies.
@@ -42,9 +47,10 @@ const ROUTES: [(u16, &str); 2] = [(80, "http.sock"), (443, "https.sock")];
 enum Mode {
     Relay(PathBuf),
     Exec { pidfile: PathBuf, combined: bool, argv: Vec<OsString> },
+    Probe { host: String, path: String, message: String },
 }
 
-const USAGE: &str = "usage: sandcastle-docker-relay <dir> | exec [--combined] <pidfile> <cmd> [arg...]   (the Docker double's, in its containers)";
+const USAGE: &str = "usage: sandcastle-docker-relay <dir> | exec [--combined] <pidfile> <cmd> [arg...] | ws-probe <host> <path> <message>   (the Docker double's, in its containers)";
 
 /// The command line, checked: absolute paths, and a command to become.
 fn parse(args: &[OsString]) -> Result<Mode, &'static str> {
@@ -62,6 +68,12 @@ fn parse(args: &[OsString]) -> Result<Mode, &'static str> {
                 _ => Err(USAGE),
             }
         }
+        [probe, host, path, message] if probe == "ws-probe" => match (host.to_str(), path.to_str(), message.to_str()) {
+            (Some(h), Some(p), Some(m)) if !h.is_empty() && p.starts_with('/') && m.len() <= probe::MESSAGE_BYTES_MAX => {
+                Ok(Mode::Probe { host: h.into(), path: p.into(), message: m.into() })
+            }
+            _ => Err(USAGE),
+        },
         _ => Err(USAGE),
     }
 }
@@ -71,6 +83,16 @@ fn main() -> ExitCode {
     match parse(&args) {
         Ok(Mode::Relay(dir)) => relay(&dir),
         Ok(Mode::Exec { pidfile, combined, argv }) => exec(&pidfile, combined, &argv),
+        Ok(Mode::Probe { host, path, message }) => match probe::run(&host, &path, &message) {
+            Ok(echo) => {
+                println!("{echo}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandcastle-docker-relay: ws-probe ws://{host}{path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Err(usage) => {
             eprintln!("{usage}");
             ExitCode::from(2)
@@ -215,6 +237,11 @@ mod tests {
             Ok(Mode::Exec { pidfile: "/p".into(), combined: true, argv: args(&["--combined"]) }),
             "the flag once, before the pidfile; after it, the command's"
         );
+        assert_eq!(parse(&args(&["ws-probe", "api.test.internal", "/ws", "hi"])), Ok(Mode::Probe { host: "api.test.internal".into(), path: "/ws".into(), message: "hi".into() }));
+        let long = "x".repeat(probe::MESSAGE_BYTES_MAX + 1);
+        for bad in [&["ws-probe", "h", "ws", "hi"][..], &["ws-probe", "", "/", "hi"], &["ws-probe", "h", "/"], &["ws-probe", "h", "/", &long]] {
+            assert_eq!(parse(&args(bad)), Err(USAGE), "{bad:?}");
+        }
         for bad in [&[][..], &["relative"], &["/a", "/b"], &["exec", "/p"], &["exec", "p.pid", "true"], &["exec", "/p", ""], &["exec", "--combined", "/p"], &["exec", "--combined"]] {
             assert_eq!(parse(&args(bad)), Err(USAGE), "{bad:?}");
         }

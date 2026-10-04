@@ -5,7 +5,10 @@
 //! `https.sock`, which this serves. HTTPS is terminated with the double's
 //! CA (`sandcastle_egress::ca`), for the name the guest's TLS asked for.
 //! Each request then goes to the container's handler with the headers the
-//! engine's egress proxy sets, both bodies streamed, never held.
+//! engine's egress proxy sets, both bodies streamed, never held. A
+//! WebSocket's upgrade goes the same way, its upgrade headers intact; on
+//! the handler's 101 the guest gets the 101, and the two connections are
+//! joined both ways until each side is done.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -134,7 +137,22 @@ where
         let (shared, name, sni) = (shared.clone(), name.clone(), sni.clone());
         async move { Ok::<_, Infallible>(forward(shared, &name, run, req, scheme, sni).await) }
     });
-    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(io), svc).await;
+    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(io), svc).with_upgrades().await;
+}
+
+/// Whether a request asks to become a WebSocket.
+pub fn websocket(h: &hyper::HeaderMap) -> bool {
+    let has = |k: &str, token: &str| h.get_all(k).iter().filter_map(|v| v.to_str().ok()).any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)));
+    has("connection", "upgrade") && has("upgrade", "websocket")
+}
+
+/// Joins the guest's upgraded connection to the handler's, both ways.
+async fn splice(guest: hyper::upgrade::OnUpgrade, handler: hyper::upgrade::OnUpgrade) {
+    if let (Ok(g), Ok(h)) = (guest.await, handler.await) {
+        let mut g = hyper_util::rt::TokioIo::new(g);
+        let mut h = hyper_util::rt::TokioIo::new(h);
+        let _ = tokio::io::copy_bidirectional(&mut g, &mut h).await;
+    }
 }
 
 /// One request the guest made, to its handler: an HTTPS one by the name
@@ -156,6 +174,7 @@ async fn forward(shared: Arc<Shared>, name: &str, run: u64, mut req: Request<Inc
             return refused(502, &format!("{label}://{host}: not intercepted, and the Docker double routes nothing else"));
         }
     };
+    let guest_side = websocket(req.headers()).then(|| hyper::upgrade::on(&mut req));
     // what the egress proxy sets, over anything the guest sent
     let h = req.headers_mut();
     h.insert("x-sandcastle-host", HeaderValue::from_str(&host).expect("a checked host"));
@@ -167,12 +186,16 @@ async fn forward(shared: Arc<Shared>, name: &str, run: u64, mut req: Request<Inc
     let answered = async {
         let s = tokio::net::UnixStream::connect(&handler).await.map_err(|e| format!("the handler at {}: {e}", handler.display()))?;
         let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.map_err(|e| e.to_string())?;
-        tokio::spawn(conn);
+        tokio::spawn(conn.with_upgrades());
         send.send_request(req).await.map_err(|e| e.to_string())
     };
     match answered.await {
-        Ok(resp) => {
-            crate::note(name, format!("guest {method} {label}://{host}{path}: intercept {index} answered {}", resp.status().as_u16()));
+        Ok(mut resp) => {
+            let status = resp.status();
+            crate::note(name, format!("guest {method} {label}://{host}{path}: intercept {index} answered {}", status.as_u16()));
+            if let (hyper::StatusCode::SWITCHING_PROTOCOLS, Some(guest_side)) = (status, guest_side) {
+                tokio::spawn(splice(guest_side, hyper::upgrade::on(&mut resp)));
+            }
             resp.map(|b| b.boxed())
         }
         Err(e) => {
@@ -223,6 +246,21 @@ mod tests {
         assert_eq!(intercept_of(&list, Scheme::Http, "api.example.com", 80), None);
         assert_eq!(intercept_of(&list, Scheme::Http, "elsewhere.example", 80), None);
         assert_eq!(intercept_of(&[], Scheme::Http, "api.fragment.internal", 80), None);
+    }
+
+    #[test]
+    fn websocket_upgrades() {
+        let h = |pairs: &[(&str, &str)]| {
+            let mut m = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                m.append(hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            websocket(&m)
+        };
+        assert!(h(&[("connection", "Upgrade"), ("upgrade", "websocket")]));
+        assert!(h(&[("connection", "keep-alive, Upgrade"), ("upgrade", "WebSocket")]));
+        assert!(!h(&[("upgrade", "websocket")]));
+        assert!(!h(&[("connection", "upgrade"), ("upgrade", "h2c")]));
     }
 
     #[test]

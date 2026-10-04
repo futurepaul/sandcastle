@@ -316,7 +316,7 @@ async fn route(shared: Arc<Shared>, mut req: Request<Incoming>) -> Response<Body
     match (&method, p.as_slice()) {
         (&Method::GET, ["v1", "health"]) => {
             let n = shared.state.lock().expect("state").containers.values().filter(|c| c.info.running).count();
-            json(200, &serde_json::json!({ "engine": "sandcastle-docker-engine", "fake": "a lower-rung test double: Docker's isolation, no VMs", "vms": n }))
+            json(200, &serde_json::json!({ "engine": "sandcastle-docker-engine", "fake": "a lower-rung test double: Docker's isolation, no VMs", "isolation": "docker", "vms": n }))
         }
         (&Method::GET, ["v1", "containers"]) => json(200, &shared.state.lock().expect("state").containers.values().map(|c| c.info.clone()).collect::<Vec<_>>()),
         (&Method::GET, ["v1", "containers", name]) => match shared.state.lock().expect("state").containers.get(*name) {
