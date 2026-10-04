@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 
 use super::cgroup::Subtree;
-use super::files::{allocated, sparse_copy, write_atomic};
+use super::files::{allocated, sparse_copy, tail, write_atomic};
 use crate::api::{self, ApiError, Exit, Info, Resources, Snapshot, StartRequest};
 use crate::config::EngineConfig;
 use crate::state::{self, Record, SnapshotRecord, Slots};
@@ -38,6 +38,8 @@ const BUILD_MEMORY_MIB: u32 = 1024;
 const BUILD_VCPUS: u8 = 2;
 /// The bytes of each log stream `logs` returns.
 const LOG_TAIL_BYTES: usize = 64 * 1024;
+/// The bytes of a runner's log quoted when its VM ends before ready.
+const RUNNER_SAID_BYTES: u64 = 2048;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -172,6 +174,18 @@ struct Launched {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     pid: i32,
     start_ticks: u64,
+    /// The jailer's and the runner's stderr: what an end with no event
+    /// quotes (`runner_said`).
+    log: PathBuf,
+}
+
+/// What a launch's runner (or its jailer) wrote before it ended, for an
+/// end that came with no event; said in the engine's log as well.
+fn runner_said(l: &Launched, what: &str) -> String {
+    let said = tail(&l.log, RUNNER_SAID_BYTES);
+    let said = if said.is_empty() { "nothing".to_string() } else { said };
+    eprintln!("sandcastle-engine: {what}; its runner said: {said}");
+    format!("{what}; its runner said: {said}")
 }
 
 fn mode(p: &Path, mode: u32) -> std::io::Result<()> {
@@ -612,7 +626,7 @@ impl Engine {
             let status = l.child.wait().await.map_err(internal("waiting for a build"))?;
             streamed.map_err(|e| ApiError::Internal(format!("{reference}: {e}")))?;
             if !status.success() {
-                return Err(ApiError::Internal(format!("{reference}: the build VM ended {status}")));
+                return Err(ApiError::Internal(runner_said(&l, &format!("{reference}: the build VM ended {status}"))));
             }
             Ok(())
         }
@@ -676,7 +690,8 @@ impl Engine {
         vm.validate().map_err(|e| ApiError::Internal(format!("a VM's config: {e}")))?;
         let config_path = vm.run_dir.join(sandcastle_vm::paths::CONFIG);
         std::fs::write(&config_path, serde_json::to_vec_pretty(vm).expect("serializes")).map_err(internal("a VM's config"))?;
-        let log = std::fs::File::create(vm.run_dir.join("runner.log")).map_err(internal("the runner's log"))?;
+        let log_path = vm.run_dir.join("runner.log");
+        let log = std::fs::File::create(&log_path).map_err(internal("the runner's log"))?;
         let mut child = tokio::process::Command::new(&self.config.runner)
             .arg("jail")
             .arg("--config")
@@ -696,7 +711,7 @@ impl Engine {
         let pid = child.id().expect("a spawned child has a pid") as i32;
         let start_ticks = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| state::start_ticks(&s)).unwrap_or(0);
         let stdout = child.stdout.take().expect("piped");
-        Ok(Launched { child, lines: BufReader::new(stdout).lines(), pid, start_ticks })
+        Ok(Launched { child, lines: BufReader::new(stdout).lines(), pid, start_ticks, log: log_path })
     }
 
     // ---- start ----
@@ -942,8 +957,9 @@ impl Engine {
                 _ => ending.note(&v),
             }
         }
-        let status = l.child.wait().await.ok();
-        self.finish(&vm, ending, format!("{status:?}"), egress_task);
+        let status = format!("{:?}", l.child.wait().await.ok());
+        let status = if *vm.ready.borrow() { status } else { runner_said(&l, &format!("{} ended before ready ({status})", vm.name)) };
+        self.finish(&vm, ending, status, egress_task);
     }
 
     /// An adopted VM, whose runner's stdout went with the engine that
@@ -1369,7 +1385,9 @@ async fn wait_event(l: &mut Launched, name: &str) -> Result<Value, ApiError> {
                 }
             }
         }
-        Err(ApiError::Internal(format!("the VM ended before {name}")))
+        // Its stdout is closed, so it has ended or is ending: its log is whole.
+        let _ = l.child.wait().await;
+        Err(ApiError::Internal(runner_said(l, &format!("the VM ended before {name}"))))
     })
     .await
     .map_err(|_| ApiError::Internal(format!("no {name} in time")))?
