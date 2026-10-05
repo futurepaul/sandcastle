@@ -76,9 +76,15 @@ pub fn run_root() -> Vec<Mount> {
     ]
 }
 
-/// The overlay, once the scratch disk's `upper` and `work` exist.
+/// The overlay, once the scratch disk's `upper` and `work` exist. Its
+/// layers are two filesystems (the image's disk and the scratch disk), so
+/// without `xino=on` a file's `st_dev` is its layer's while a directory's
+/// is the overlay's: anything that stays on one filesystem (the Sandbox
+/// SDK's backup shim, `tar --one-file-system`, `find -xdev`) then skips
+/// every file. With it, every object has the overlay's `st_dev`, as on
+/// Docker's overlay2, whose layers share a filesystem.
 pub fn overlay() -> Mount {
-    let data = format!("lowerdir={LOWER},upperdir={UPPER},workdir={WORK}");
+    let data = format!("lowerdir={LOWER},upperdir={UPPER},workdir={WORK},xino=on");
     m("overlay", ROOT, "overlay", Flags::default(), Some(&data))
 }
 
@@ -125,6 +131,7 @@ mod tests {
         let o = overlay();
         let data = o.data.unwrap();
         assert!(data.contains(LOWER) && data.contains(UPPER) && data.contains(WORK));
+        assert!(data.split(',').any(|o| o == "xino=on"), "one st_dev for files and directories alike");
         assert!(UPPER.starts_with(SCRATCH) && WORK.starts_with(SCRATCH));
     }
 
