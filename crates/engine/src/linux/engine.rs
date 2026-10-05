@@ -34,6 +34,9 @@ const CA_NAME: &str = "sandcastle engine CA";
 const ENDED_MAX: usize = 4096;
 /// How long a destroy waits for the VM to end before forcing it.
 const DESTROY_WAIT: Duration = Duration::from_secs(10);
+/// An exec's process started by the guest's agent, at most: an agent that
+/// takes the connection and never answers is an error, not a wait forever.
+const EXEC_START_WAIT: Duration = Duration::from_secs(10);
 /// A build VM's size.
 const BUILD_MEMORY_MIB: u32 = 1024;
 const BUILD_VCPUS: u8 = 2;
@@ -925,6 +928,9 @@ impl Engine {
             netns: Mutex::new(None),
         });
         self.inner.lock().expect("never poisoned").vms.insert(name.into(), vm.clone());
+        // Each container's start, ready, and end are a line in the
+        // engine's log: what the node's operator has to go on.
+        eprintln!("sandcastle-engine: {name}: started in slot {slot}");
         let engine = self.clone();
         let supervised = vm.clone();
         tokio::spawn(async move { engine.supervise(supervised, launched, egress_task).await });
@@ -953,6 +959,7 @@ impl Engine {
                 }
                 Some("ready") => {
                     vm.timings.lock().expect("never poisoned").ready_us = at;
+                    eprintln!("sandcastle-engine: {}: ready in {} ms", vm.name, at / 1000);
                     *vm.phase.lock().expect("never poisoned") = Phase::Running;
                     let res = vm.record.lock().expect("never poisoned").resources;
                     let _ = self.cgroups.throttle(vm.slot, &res);
@@ -996,6 +1003,7 @@ impl Engine {
             i.vms.remove(&vm.name);
             i.note_ended(&vm.name, exit.clone());
         }
+        eprintln!("sandcastle-engine: {}: ended {}", vm.name, serde_json::to_string(&exit).expect("serializes"));
         vm.exit.send_replace(Some(exit));
     }
 
@@ -1188,7 +1196,9 @@ impl Engine {
         let opened = self
             .agent(name, move |c| {
                 let mut s = c.exec_with(process, stdin, pty, stdout, stderr)?;
+                s.set_read_timeout(Some(EXEC_START_WAIT))?;
                 let first = s.next_event();
+                s.set_read_timeout(None)?;
                 Ok((s, first))
             })
             .await?;
@@ -1196,7 +1206,10 @@ impl Engine {
             (s, Ok(sandcastle_vm::client::ExecEvent::Started(pid))) => Ok((s, pid)),
             (_, Ok(other)) => Err(ApiError::Internal(format!("exec: {other:?} before the process started"))),
             (_, Err(sandcastle_vm::client::ClientError::Refused(m))) => Err(ApiError::Invalid(format!("exec: {m}"))),
-            (_, Err(e)) => Err(ApiError::Internal(format!("exec: {e}"))),
+            (_, Err(e)) => {
+                eprintln!("sandcastle-engine: {name}: exec: {e}");
+                Err(ApiError::Internal(format!("exec: {e}")))
+            }
         }
     }
 

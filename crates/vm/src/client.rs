@@ -151,6 +151,13 @@ impl ExecSession {
     pub fn next_event(&mut self) -> Result<ExecEvent, ClientError> {
         next_event(&mut self.reader, &mut self.host)
     }
+
+    /// A bound on each read from the agent (`None`: none), for a wait that
+    /// must not outlast an agent that stopped answering.
+    pub fn set_read_timeout(&self, wait: Option<Duration>) -> Result<(), ClientError> {
+        self.writer.set_read_timeout(wait).map_err(WireError::Io)?;
+        Ok(())
+    }
 }
 
 impl Vm {
