@@ -233,9 +233,10 @@ export KRUN_SPIKE_ROOT=~/spike
 
 **Pair it** (experimental; docs/node.md, Pairing): the box must let its
 people bring their own machines (fragment's `FRAGMENT_BYOC=on`;
-docs/self-host-lan.md, step 5), and `sandcastle-node` must have `pair`:
-build step 5's binaries from the branch `node-pair` (it holds `arm64`). The CA is still copied in first (below,
-"The CA"). Then, in the VM, as your user:
+docs/self-host-lan.md, step 7), and `sandcastle-node` must have `pair`:
+step 5's binaries, built from the branch `node`, have it (and `arm64`).
+The CA is still copied in first (below, "The CA"). Then, in the VM, as
+your user:
 
 ```sh
 sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" /etc/sandcastle-node
@@ -245,7 +246,9 @@ sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" /etc/sandcastle-node
 ```
 
 It prints a link and a code. Open the link (the iPhone or the Mac),
-signed in, check the code, and approve. It ends having written
+signed in, check the code, and approve; tick "Run my new computers on it"
+for a person whose first computer should start here (a person's first
+computer starts as they pick a username, before settings). It ends having written
 `/etc/sandcastle-node/node.json` and `node.secret` (0600): no secret is
 copied by hand, and the box needs no row for it. Then use
 `/etc/sandcastle-node/node.json` in the unit below, and skip "The secret"
@@ -253,8 +256,7 @@ and the hand-written config. The node runs only the computers you choose
 for it in the platform's settings.
 
 **Or by hand**, as a node of the box's own list: four things come from
-the box. Each is a parameter here, because the box's LAN mode (fragment,
-branch `selfhost`) is still being built:
+the box (fragment's LAN mode, its docs/self-host-lan.md):
 
 | | Here | Where it comes from |
 |---|---|---|
@@ -268,9 +270,17 @@ branch `selfhost`) is still being built:
 uses the box's DNS. Until then:
 `echo '192.168.50.7 fragment.home.arpa' | sudo tee -a /etc/hosts`.
 
-**The CA** is a certificate, not a secret. Copy it in (on the Mac:
-`limactl copy home-ca.pem sandcastle:/tmp/home-ca.pem`), then trust it
-for the system's tools and give it to the node:
+**The CA** is a certificate, not a secret. Fetch it on the Mac from the
+box's root page, and check its fingerprint against the one the box's
+banner printed:
+
+```sh
+curl -so home-ca.pem http://192.168.50.7/ca/ca.pem
+openssl x509 -in home-ca.pem -noout -fingerprint -sha256
+```
+
+Copy it in (`limactl copy home-ca.pem sandcastle:/tmp/home-ca.pem`), then
+trust it for the system's tools and give it to the node:
 
 ```sh
 sudo install -m 0644 /tmp/home-ca.pem /usr/local/share/ca-certificates/fragment-home.crt
