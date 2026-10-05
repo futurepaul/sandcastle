@@ -104,6 +104,9 @@ impl Platform {
         let host = self.base.host_str().expect("checked: the platform has a host").to_string();
         let port = self.base.port_or_known_default().expect("http(s) has a port");
         let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| format!("the platform at {host}:{port}: {e}"))?;
+        // A WebSocket's frames through an intercept are each a small write,
+        // which Nagle's algorithm would hold for the platform's delayed ACK.
+        let _ = tcp.set_nodelay(true);
         if self.base.scheme() == "https" {
             let name = rustls_pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("the platform's name: {e}"))?;
             let s = self.tls.connect(name, tcp).await.map_err(|e| format!("the platform's TLS: {e}"))?;
