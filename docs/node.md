@@ -684,13 +684,21 @@ a minute. Pair the machine again to use it again (a new id and secret).
 
 **Evidence (2026-10-05).** `cargo test -p sandcastle-node --lib pair` (5:
 its arguments, the uplink from the platform, the config it writes, the
-answers, a file written whole) and `--test pair` (2, in process against a
+answers, a file written whole) and `--test pair` (3, in process against a
 stand-in platform: a pairing through `pending` and `slow_down` to its
-files, paired again keeping the sockets, and five refusals that write
+files, paired again keeping the sockets; five refusals that write
 nothing: BYOC off, an expired code, a replayed poll, an answer naming no
-node's id, a secret too short). fragment's e2e `pairing` section runs the
-real `pair` in front of the Docker double (fragment's docs/self-host.md,
-Status).
+node's id, a secret too short; and a lost poll asked again, three in a
+row ending it). fragment's e2e `pairing` section runs the real `pair` in
+front of the Docker double, on celld and on wrangler dev (fragment's
+docs/self-host.md, Status).
+
+A poll that found no answer (the connection failed, or a gateway's 5xx)
+is asked again, up to three in a row. If the platform had answered it
+(the approval, its secret) and the answer was lost on the way, the next
+poll finds the pairing spent: the node says so, and its owner revokes
+that node in settings and pairs again. The calls are sent in origin
+form, as the intercepts are (wrangler dev refuses an absolute URI).
 
 ## Isolation
 
