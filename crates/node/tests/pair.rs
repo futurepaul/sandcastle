@@ -155,3 +155,26 @@ async fn refusals_write_nothing() {
         assert!(!dir.join("node.json").exists() && !dir.join("node.secret").exists(), "{name}: nothing written");
     }
 }
+
+// Goal: a poll that found no answer (a gateway's 5xx) is asked again, and
+// the pairing goes on; three in a row end it, saying why; a lost answer
+// followed by a spent pairing says what the person does about it.
+#[tokio::test]
+async fn a_lost_poll_is_asked_again() {
+    let lost = || (502, serde_json::json!({ "error": "Network connection lost." }));
+    let dir = scratch("again");
+    let p = platform(started(), vec![lost(), (200, serde_json::json!({ "state": "approved", "node": "paired-00000000000000dd", "secret": SECRET }))]).await;
+    let mut said = vec![];
+    let done = pair(&args(&p.url, &dir), |l| said.push(l.to_string())).await.unwrap();
+    assert_eq!(done.id, "paired-00000000000000dd");
+    assert!(said.iter().any(|l| l.contains("asking again")), "{said:?}");
+    let dir = scratch("again-thrice");
+    let p = platform(started(), vec![lost(), lost(), lost()]).await;
+    let e = pair(&args(&p.url, &dir), |_| {}).await.unwrap_err();
+    assert!(e.contains("502"), "{e}");
+    assert!(!dir.join("node.json").exists());
+    let dir = scratch("again-spent");
+    let p = platform(started(), vec![lost()]).await;
+    let e = pair(&args(&p.url, &dir), |_| {}).await.unwrap_err();
+    assert!(e.contains("revoke it there"), "{e}");
+}

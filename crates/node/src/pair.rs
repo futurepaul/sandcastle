@@ -149,23 +149,50 @@ pub enum Polled {
     Approved { node: String, secret: String },
 }
 
-/// One JSON call to the platform: its answer, or its refusal's message.
-async fn call<T: serde::de::DeserializeOwned>(platform: &Platform, path: &str, body: &serde_json::Value) -> Result<T, String> {
-    let req = hyper::Request::post(format!("{}{path}", platform.base.as_str().trim_end_matches('/')))
+/// Why a call to the platform has no answer: one asked again may have
+/// (the connection failed, or a gateway's 5xx), or one asked again will
+/// not (the platform refused it).
+#[derive(Debug)]
+enum CallError {
+    Again(String),
+    Refused(String),
+}
+
+impl CallError {
+    fn message(self) -> String {
+        match self {
+            CallError::Again(m) | CallError::Refused(m) => m,
+        }
+    }
+}
+
+/// One JSON call to the platform: its answer, or why not.
+async fn call<T: serde::de::DeserializeOwned>(platform: &Platform, path: &str, body: &serde_json::Value) -> Result<T, CallError> {
+    // origin-form, its host in `Host`, as the intercepts send theirs: an
+    // absolute URI on the request line is not every server's (wrangler's)
+    let req = hyper::Request::post(path)
         .header("host", platform.authority())
         .header("content-type", "application/json")
         .body(http::full(serde_json::to_vec(body).expect("serializes")))
-        .map_err(|e| e.to_string())?;
-    let resp = tokio::time::timeout(Duration::from_secs(30), platform.send(req)).await.map_err(|_| format!("{path}: no answer within 30 s"))??;
+        .map_err(|e| CallError::Refused(e.to_string()))?;
+    let resp = tokio::time::timeout(Duration::from_secs(30), platform.send(req))
+        .await
+        .map_err(|_| CallError::Again(format!("{path}: no answer within 30 s")))?
+        .map_err(CallError::Again)?;
     let status = resp.status().as_u16();
-    let bytes = http_body_util::Limited::new(resp.into_body(), ANSWER_BYTES_MAX).collect().await.map_err(|e| format!("{path}: {e}"))?.to_bytes();
+    let bytes = http_body_util::Limited::new(resp.into_body(), ANSWER_BYTES_MAX).collect().await.map_err(|e| CallError::Again(format!("{path}: {e}")))?.to_bytes();
     if status != 200 {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         let why = v["message"].as_str().or(v["error"].as_str()).map(str::to_string).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-        return Err(format!("the platform refused ({status}): {why}"));
+        let said = format!("the platform refused ({status}): {why}");
+        return Err(if status >= 500 { CallError::Again(said) } else { CallError::Refused(said) });
     }
-    serde_json::from_slice(&bytes).map_err(|e| format!("{path}: the platform's answer: {e}"))
+    serde_json::from_slice(&bytes).map_err(|e| CallError::Refused(format!("{path}: the platform's answer: {e}")))
 }
+
+/// A poll that found no answer is asked again, at most this many times in
+/// a row: a poll that never reached the platform changed nothing there.
+const POLL_TRIES: u32 = 3;
 
 /// This machine's name, for its owner's settings.
 fn hostname() -> String {
@@ -218,19 +245,33 @@ pub async fn pair(args: &PairArgs, mut say: impl FnMut(&str)) -> Result<Paired, 
     let platform = Platform::new(args.platform.trim_end_matches('/'), ca.as_deref())?;
     let name = args.name.clone().unwrap_or_else(hostname);
     let arch = std::env::consts::ARCH;
-    let started: Started = call(&platform, "/api/nodes/pair", &serde_json::json!({ "name": name, "arch": arch })).await?;
+    let started: Started = call(&platform, "/api/nodes/pair", &serde_json::json!({ "name": name, "arch": arch })).await.map_err(CallError::message)?;
     say(&format!("sandcastle-node: pairing with {} as {name:?} ({arch})", args.platform));
     say(&format!("  open {}", started.verify_url));
     say(&format!("  where you are signed in, and approve it if it shows the code {}", started.user_code));
     let deadline = Instant::now() + Duration::from_secs(started.expires_in_s).min(WAIT_MAX);
     let mut wait = Duration::from_secs(started.interval_s).clamp(POLL_MIN, POLL_MAX);
+    let mut missed = 0;
     // bounded by `deadline`: each turn waits at least POLL_MIN
     let (id, secret) = loop {
         if Instant::now() + wait > deadline {
             return Err("no approval before the code expired: run `sandcastle-node pair` again".into());
         }
         tokio::time::sleep(wait).await;
-        match call::<Polled>(&platform, "/api/nodes/pair/poll", &serde_json::json!({ "deviceCode": started.device_code })).await? {
+        let polled = match call::<Polled>(&platform, "/api/nodes/pair/poll", &serde_json::json!({ "deviceCode": started.device_code })).await {
+            Ok(p) => p,
+            Err(CallError::Again(why)) if missed + 1 < POLL_TRIES => {
+                missed += 1;
+                say(&format!("sandcastle-node: a poll found no answer ({why}); asking again"));
+                continue;
+            }
+            // a poll that reached the platform after one whose answer was
+            // lost may find the pairing spent: the person revokes that node
+            Err(CallError::Refused(why)) if missed > 0 => return Err(format!("{why} (an answer before it was lost on the way: if the node shows in your settings, revoke it there, and pair again)")),
+            Err(e) => return Err(e.message()),
+        };
+        missed = 0;
+        match polled {
             Polled::Pending { interval_s } => wait = Duration::from_secs(interval_s).clamp(POLL_MIN, POLL_MAX),
             Polled::SlowDown { interval_s } => wait = Duration::from_secs(interval_s).clamp(POLL_MIN, POLL_MAX),
             Polled::Expired => return Err("the code expired before it was approved: run `sandcastle-node pair` again".into()),
