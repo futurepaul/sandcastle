@@ -335,6 +335,8 @@ impl Egress {
     async fn to_upstream(&self, req: Request<Incoming>, host: &str, tls: bool, port: u16) -> Result<Response<Body>, String> {
         let addr = self.resolve(host, port).await.map_err(|e| e.to_string())?;
         let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        // A streamed body is many writes, and an upgrade's frames more.
+        let _ = tcp.set_nodelay(true);
         let resp = if tls {
             let name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
             let s = self.upstream.connect(name, tcp).await.map_err(|e| e.to_string())?;
