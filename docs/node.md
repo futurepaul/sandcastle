@@ -700,6 +700,65 @@ poll finds the pairing spent: the node says so, and its owner revokes
 that node in settings and pairs again. The calls are sent in origin
 form, as the intercepts are (wrangler dev refuses an absolute URI).
 
+## Computers on the real engine
+
+*2026-10-05.* fragment's e2e put its computers on one node in front of
+the real engine on an x86_64 box (`FRAGMENT_E2E_NODES=real`). The
+computers and chat sections pass on the Docker double. On the engine
+they gave 165 passed and 10 failed. Each failure went back to one of two
+causes, both fixed here. After the fixes the same sections passed, 175
+of 175, in four runs.
+
+- **A computer woke with an empty `/data`.** The workload's root is an
+  overlay of two filesystems, the image's disk and the scratch disk.
+  - Without `xino`, a directory has the overlay's `st_dev`, and a file
+    has its layer's.
+  - The Sandbox SDK's backup shim stays on one filesystem. So it backed
+    up `/data`'s directories and none of its files.
+  - The bridge then woke without its state and answered every turn
+    again.
+
+  The guest now mounts the overlay with `xino=on` (`mounts::overlay`).
+  Before, `stat` in a guest gave 25 for directories and 26 and 27 for
+  files; after, 25 for all. A backup through an intercept to a stand-in
+  gateway then held `bridge/state.json`, and a restore into a fresh
+  container gave it back.
+- **Every intercepted request waited about 40 ms.** The runner's
+  forwarder wrote the proxy's answer to the guest's TCP connection piece
+  by piece. Nagle's algorithm held each piece after the first for the
+  guest's delayed ACK.
+  - The bridge's posts came 48 ms apart.
+  - The e2e checks that race them failed ("its turn starts and ends on
+    work").
+
+  The forwarder now sets `TCP_NODELAY`, as the double's relay always
+  did, and so do the proxy's substitute connection and the node's
+  connection to the platform. Posts now come 11 ms apart.
+
+The double never showed either: overlay2's layers share a filesystem,
+and its relay set `TCP_NODELAY` from the start.
+
+**Not a fault: the keepalive opens and closes every few hundred ms.**
+The bridge holds it only while a turn runs, and the scripted turns are
+short. Its own log says `keepalive.held` and `keepalive.dropped` each
+time, and the double shows the same.
+
+**Not reproduced: three starts that took no exec.** In one earlier
+run, three starts in a row each took no exec for 120 s, and a start
+half a minute later was fine.
+- The VMs had booted: the runner fails a boot at 60 s, and these lived
+  120 s, until the platform destroyed them.
+- Since then, nine e2e runs and 20 restart cycles on the engine have not
+  shown it. Each cycle ends a container with a signal or a kill, then
+  starts it again at once.
+
+Two changes make it diagnosable if it comes back:
+
+- an exec's start is bounded at 10 s (`EXEC_START_WAIT`). Before, an
+  agent that never answered held the call forever;
+- the engine logs each container's start, ready and end, and each exec
+  that fails to open, by name.
+
 ## Isolation
 
 `health` reports `isolation: "microvm"`: the engine's VMs, each jailed.
