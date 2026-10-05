@@ -526,7 +526,10 @@ ever a node's engine.
 
 What the double fakes, and how:
 
-- **Start** is `docker run --init --pull never`. The container is named
+- **Start** is `docker run --pull never`, with no `--init`: the
+  entrypoint is PID 1, as in the engine's guest and on Cloudflare, so a
+  signal it has no handler for is dropped, and an init that must be PID 1
+  (s6-overlay's) runs. The container is named
   `sandcastle-<8 hex of the dir>-<name, ':' as '-'>` and labelled
   `sandcastle.double=<dir>`. Three mounts go in: `<dir>/c/<run>` at
   `/.sandcastle`, the relay at `/.sandcastle-relay`, and the double's CA

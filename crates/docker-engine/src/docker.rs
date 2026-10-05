@@ -91,14 +91,16 @@ pub struct Run<'a> {
     pub image: &'a str,
 }
 
-/// `docker run`'s argv. `--init` runs the process under Docker's init, so
-/// a signal it has no handler for ends it, as under the engine's guest;
+/// `docker run`'s argv. No `--init`: the entrypoint is the container's PID 1,
+/// as it is in the engine's guest (PID 1 of the workload's namespace) and
+/// on Cloudflare, so a signal it has no handler for is dropped, and an
+/// init that must be PID 1 (s6-overlay's, in fragment's Hermes image) runs;
 /// `--pull never`, because the double runs only what this box holds.
 pub fn run_args(r: &Run<'_>) -> Vec<String> {
     for p in [r.container_dir, r.relay, r.ca] {
         assert!(p.starts_with('/') && !p.contains(':') && !p.contains(','), "a mount's path is checked at the double's start");
     }
-    let mut a = vec![s("run"), s("-d"), s("--pull"), s("never"), s("--init"), s("--name"), s(r.docker_name)];
+    let mut a = vec![s("run"), s("-d"), s("--pull"), s("never"), s("--name"), s(r.docker_name)];
     a.extend([s("--label"), format!("{LABEL}={}", r.dir), s("--label"), format!("{NAME_LABEL}={}", r.name)]);
     for (k, v) in r.env {
         a.extend([s("-e"), format!("{k}={v}")]);
@@ -294,12 +296,12 @@ mod tests {
         let env: BTreeMap<String, String> = [("A".into(), "1 2".into()), ("PATH".into(), "/bin".into())].into();
         let entry = v(&["sh", "-c", "sleep 600"]);
         let mounts = v(&["-v", "/d/c/k:/.sandcastle", "-v", "/bin/relay:/.sandcastle-relay:ro", "-v", "/d/ca.crt:/etc/cloudflare/certs/cloudflare-containers-ca.crt:ro"]);
-        let mut want = v(&["run", "-d", "--pull", "never", "--init", "--name", "sandcastle-0123abcd-c-1", "--label", "sandcastle.double=/d", "--label", "sandcastle.name=c:1", "-e", "A=1 2", "-e", "PATH=/bin"]);
+        let mut want = v(&["run", "-d", "--pull", "never", "--name", "sandcastle-0123abcd-c-1", "--label", "sandcastle.double=/d", "--label", "sandcastle.name=c:1", "-e", "A=1 2", "-e", "PATH=/bin"]);
         want.extend(mounts.clone());
         want.extend(v(&["--entrypoint", "sh", "busybox:musl", "-c", "sleep 600"]));
         assert_eq!(run_args(&run(&env, Some(&entry))), want);
         let none = BTreeMap::new();
-        let mut want = v(&["run", "-d", "--pull", "never", "--init", "--name", "sandcastle-0123abcd-c-1", "--label", "sandcastle.double=/d", "--label", "sandcastle.name=c:1"]);
+        let mut want = v(&["run", "-d", "--pull", "never", "--name", "sandcastle-0123abcd-c-1", "--label", "sandcastle.double=/d", "--label", "sandcastle.name=c:1"]);
         want.extend(mounts);
         want.push("busybox:musl".into());
         assert_eq!(run_args(&run(&none, None)), want);

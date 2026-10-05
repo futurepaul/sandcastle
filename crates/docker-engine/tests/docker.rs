@@ -138,7 +138,8 @@ fn sleeper(image: &str, handler: &Path, intercepts: Vec<Intercept>) -> StartRequ
     StartRequest {
         image: Some(image.into()),
         enable_internet: true,
-        entrypoint: Some(vec!["sh".into(), "-c".into(), "sleep 600".into()]),
+        // PID 1, as in the engine's guest: it ends on 15 because it says so
+        entrypoint: Some(vec!["sh".into(), "-c".into(), "trap 'exit 143' TERM; sleep 600 & wait".into()]),
         env: [("SANDCASTLE_TEST".into(), "a value with spaces".into())].into(),
         intercepts,
         handler: Some(format!("unix:{}", handler.display())),

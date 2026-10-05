@@ -6,7 +6,8 @@
 //! a box without KVM or root (docs/node.md, Test doubles). Never a node's
 //! engine in production.
 //!
-//! - **start** is `docker run --init`, the engine's name behind the
+//! - **start** is `docker run` (its entrypoint PID 1, as in the engine's
+//!   guest: no `--init`), the engine's name behind the
 //!   double's tag, labelled with the double's directory, with three mounts:
 //!   the container's own directory at `/.sandcastle` (the relay's sockets),
 //!   the relay at `/.sandcastle-relay`, and the double's CA where
@@ -419,7 +420,8 @@ fn snapshot_image(id: &str) -> String {
 }
 
 /// How a container's run ended, from Docker's code: 128+n after the
-/// double sent signal n is that signal (Docker's init reports a signal so).
+/// double sent signal n is that signal (Docker reports a process a signal
+/// ended so).
 pub fn exit_of(code: i32, signaled: Option<i32>) -> Exit {
     match signaled {
         Some(n) if code == 128 + n => Exit { code: None, signal: Some(n), destroyed: false, error: None },
