@@ -57,6 +57,13 @@ pub fn basics() -> Vec<Mount> {
     ]
 }
 
+/// The links every container's `/dev` has beside its devices (the OCI
+/// runtime spec's, which Docker and runc make): bash's process
+/// substitution, `<(…)`, opens `/dev/fd/N`, and a program that writes to
+/// `/dev/stdout` means its own. A bare devtmpfs has none of them. Made in
+/// the init's `/dev`, which the workload's is (`workload`).
+pub const DEV_LINKS: [(&str, &str); 4] = [("/dev/fd", "/proc/self/fd"), ("/dev/stdin", "/proc/self/fd/0"), ("/dev/stdout", "/proc/self/fd/1"), ("/dev/stderr", "/proc/self/fd/2")];
+
 /// Directories made before `basics` (they are on the read-only boot disk)
 /// and after it (on the init's tmpfs).
 pub fn dirs_after_basics(build: bool) -> Vec<&'static str> {
@@ -143,5 +150,18 @@ mod tests {
         assert!(data(None).target.starts_with(ROOT) && data(None).target.ends_with("/data"));
         assert_eq!(data(Some("/opt/data")).target, format!("{ROOT}/opt/data"));
         assert!(basics().iter().any(|m| m.target == "/dev" && m.may_exist));
+    }
+
+    // Goal: the workload's /dev has the links a container's has, each into
+    // the process's own descriptors, under the /dev it binds. Method: the
+    // list, against the OCI runtime spec's.
+    #[test]
+    fn dev_has_a_containers_links() {
+        assert_eq!(DEV_LINKS[0], ("/dev/fd", "/proc/self/fd"), "process substitution opens /dev/fd/N");
+        for (i, name) in ["stdin", "stdout", "stderr"].iter().enumerate() {
+            assert_eq!(DEV_LINKS[i + 1], (format!("/dev/{name}").as_str(), format!("/proc/self/fd/{i}").as_str()));
+        }
+        assert!(DEV_LINKS.iter().all(|(link, _)| link.starts_with("/dev/")), "in the /dev the workload binds");
+        assert!(basics().iter().any(|m| m.target == "/proc"), "their targets are proc's");
     }
 }
