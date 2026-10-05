@@ -633,6 +633,65 @@ checked at start.
   engine.** It now reports the engine's `isolation` when its health names
   one (the double's is `docker`), and the node's `arch`.
 
+## Pairing
+
+*Experimental; fragment's docs/self-host.md, seam 2, "Bring your own
+computer".* A person starts sandcastle on a machine of theirs and pairs it
+with their account on a platform that lets its people bring their own
+computers (fragment's `FRAGMENT_BYOC=on`). It is then a node for their
+computers alone, dialing in over the uplink like any node the platform
+cannot reach. A platform with it off refuses the pairing, saying why.
+
+```sh
+sandcastle-node pair https://fragment.home.arpa --config /etc/sandcastle-node/node.json \
+  [--name mac] [--ca-file /etc/sandcastle/home-ca.pem] [--secret-file <path>] \
+  [--engine <engine.sock> --ports <ports.sock> --egress <egress.sock>]
+```
+
+It is a device authorization (RFC 8628's shape; `src/pair.rs`):
+
+1. The node asks to be paired, `POST <platform>/api/nodes/pair` with its
+   name (`--name`, else the machine's) and architecture. It holds nothing
+   yet, so the call is unsigned.
+2. The platform answers a code for a person to compare (`BCDF-GHJK`), the
+   link they approve it at, and a device code that only the node holds.
+   The node prints the link and the code, never the device code.
+3. It polls `POST <platform>/api/nodes/pair/poll` as often as the
+   platform says, and slower when told `slow_down`, until the code
+   expires (ten minutes).
+4. The person opens the link where they are signed in, checks the code,
+   and approves. The platform names the node (`paired-<16 hex>`, never the
+   node's choice) and mints its secret. The node's next poll takes both,
+   once: a poll replayed after finds nothing.
+5. The node writes its secret to its secret's file, 0600, replacing it
+   whole (a file beside it, then a rename). It writes its config the same
+   way: `platform`, `uplink` (`wss://<platform>/api/nodes/uplink` for
+   https, `ws` for http) as the id it was given, `secret_file`, and
+   `ca_file` for a private CA (it covers the pairing's calls too). An
+   existing config keeps its engine's sockets, its `listen` and its CA. A
+   first config takes the three sockets from the flags and puts the
+   secret beside itself.
+6. `sandcastle-node serve --config <path>` dials as that id.
+
+The secret is never printed and never on a command line. Run it as the
+node's user, in a directory of the node's own (`/etc/sandcastle-node`,
+not root's `/etc/sandcastle`, where the engine's config lives).
+
+**Revoked** by its owner (in the platform's settings), the node's uplink
+is closed (4003), and each later dial is refused: `uplink: the platform
+refused the dial: 403 … node_revoked`. It keeps dialing, backing off to
+a minute. Pair the machine again to use it again (a new id and secret).
+
+**Evidence (2026-10-05).** `cargo test -p sandcastle-node --lib pair` (5:
+its arguments, the uplink from the platform, the config it writes, the
+answers, a file written whole) and `--test pair` (2, in process against a
+stand-in platform: a pairing through `pending` and `slow_down` to its
+files, paired again keeping the sockets, and five refusals that write
+nothing: BYOC off, an expired code, a replayed poll, an answer naming no
+node's id, a secret too short). fragment's e2e `pairing` section runs the
+real `pair` in front of the Docker double (fragment's docs/self-host.md,
+Status).
+
 ## Isolation
 
 `health` reports `isolation: "microvm"`: the engine's VMs, each jailed.

@@ -231,8 +231,29 @@ export KRUN_SPIKE_ROOT=~/spike
 
 ## 7. The node, dialing the box
 
-Four things come from the box. Each is a parameter here, because the
-box's LAN mode (fragment, branch `selfhost`) is still being built:
+**Pair it** (experimental; docs/node.md, Pairing): the box must let its
+people bring their own machines (fragment's `FRAGMENT_BYOC=on`;
+docs/self-host-lan.md, step 5). The CA is still copied in first (below,
+"The CA"). Then, in the VM, as your user:
+
+```sh
+sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" /etc/sandcastle-node
+/opt/sandcastle/bin/sandcastle-node pair https://fragment.home.arpa --config /etc/sandcastle-node/node.json --name mac \
+  --ca-file /etc/sandcastle/home-ca.pem \
+  --engine /var/lib/sandcastle/engine.sock --ports /var/lib/sandcastle/ports.sock --egress /run/sandcastle-node/egress.sock
+```
+
+It prints a link and a code. Open the link (the iPhone or the Mac),
+signed in, check the code, and approve. It ends having written
+`/etc/sandcastle-node/node.json` and `node.secret` (0600): no secret is
+copied by hand, and the box needs no row for it. Then use
+`/etc/sandcastle-node/node.json` in the unit below, and skip "The secret"
+and the hand-written config. The node runs only the computers you choose
+for it in the platform's settings.
+
+**Or by hand**, as a node of the box's own list: four things come from
+the box. Each is a parameter here, because the box's LAN mode (fragment,
+branch `selfhost`) is still being built:
 
 | | Here | Where it comes from |
 |---|---|---|
@@ -291,7 +312,8 @@ platform:
 }
 ```
 
-`/etc/systemd/system/sandcastle-node.service`, as your user (write it
+`/etc/systemd/system/sandcastle-node.service`, as your user (a paired
+node's config is `/etc/sandcastle-node/node.json`; write it
 with `sudo tee` so `$(id -un)` is filled in, or type the name):
 
 ```ini

@@ -5,15 +5,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct NodeConfig {
     /// The API's address: loopback for a platform on the same box, a LAN
     /// address for one beside it. TLS is the network's (docs/node.md,
     /// Reachability). A node with an uplink may listen nowhere.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<SocketAddr>,
     /// The engine's `engine.sock` and `ports.sock`.
     pub engine: PathBuf,
@@ -27,22 +27,23 @@ pub struct NodeConfig {
     pub platform: String,
     /// More roots for the platform's TLS (an intranet's CA, PEM), beside
     /// the public ones.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<PathBuf>,
     /// The uplink: the node dials the platform, which serves the API over
-    /// that connection (docs/node.md, The uplink).
-    #[serde(default)]
+    /// that connection (docs/node.md, The uplink). `pair` writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uplink: Option<UplinkConfig>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct UplinkConfig {
     /// The platform's uplink: `wss://<platform>/api/nodes/uplink` (`ws://`
     /// in dev). Its TLS takes `ca_file`'s roots too.
     pub url: String,
-    /// The node's id, as the platform is configured with it
-    /// (`FRAGMENT_NODE_URL=uplink:<id>`).
+    /// The node's id, as the platform names it: its list's (fragment's
+    /// `FRAGMENT_NODES`), or the one it gave a person's own node as it
+    /// paired it (`pair`).
     pub id: String,
 }
 

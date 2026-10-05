@@ -1,15 +1,24 @@
 //! `sandcastle-node serve --config <path>`: the engine's API on the network
 //! (docs/node.md), as the engine's client user, never root: on `listen`,
 //! over the uplink it dials, or both.
+//!
+//! `sandcastle-node pair <platform> --config <path> ...`: the node becomes a
+//! person's own on their platform (docs/node.md, Pairing): it writes the
+//! config and the secret `serve` then runs with.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("pair") {
+        return pair(&args[1..]);
+    }
     let config = match (args.first().map(String::as_str), args.get(1).map(String::as_str), args.get(2)) {
         (Some("serve"), Some("--config"), Some(path)) => path.clone(),
         _ => {
             eprintln!("usage: sandcastle-node serve --config <path>");
+            #[cfg(unix)]
+            eprintln!("{}", sandcastle_node::pair::USAGE);
             return ExitCode::from(2);
         }
     };
@@ -101,6 +110,48 @@ fn serve(config: sandcastle_node::NodeConfig) -> ExitCode {
         }
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(unix)]
+fn pair(args: &[String]) -> ExitCode {
+    let args = match sandcastle_node::pair::PairArgs::parse(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sandcastle-node: {e}\n{}", sandcastle_node::pair::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("sandcastle-node: runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // what a person must see goes to stdout, as it comes
+    let say = |line: &str| {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    };
+    match rt.block_on(sandcastle_node::pair::pair(&args, say)) {
+        Ok(p) => {
+            println!("sandcastle-node: paired as {}; wrote {} and its secret {}", p.id, p.config.display(), p.secret_file.display());
+            println!("  start it: sandcastle-node serve --config {}", p.config.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("sandcastle-node: pairing: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn pair(_: &[String]) -> ExitCode {
+    eprintln!("sandcastle-node runs on Unix");
+    ExitCode::FAILURE
 }
 
 #[cfg(not(unix))]
