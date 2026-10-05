@@ -216,7 +216,9 @@ impl Egress {
         match decision {
             AddrDecision::Refuse(_) => Ok(()),
             AddrDecision::Splice => self.splice(s, ip, port, host).await,
-            AddrDecision::Intercept(i) => self.intercept(s, i, host.expect("intercepted by name")).await,
+            // An address intercept (`ip:port`, a range, HTTP's `*`) matched
+            // no name: the address the guest dialed is the host.
+            AddrDecision::Intercept(i) => self.intercept(s, i, host.unwrap_or_else(|| ip.to_string()), port).await,
         }
     }
 
@@ -240,7 +242,7 @@ impl Egress {
         Ok(())
     }
 
-    async fn intercept(self: Arc<Self>, mut s: UnixStream, i: usize, host: String) -> Result<(), ProxyError> {
+    async fn intercept(self: Arc<Self>, mut s: UnixStream, i: usize, host: String, port: u16) -> Result<(), ProxyError> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         // Bounded by PEEK_BYTES_MAX and PEEK_WAIT.
@@ -261,14 +263,14 @@ impl Egress {
                 let name = sni.unwrap_or_else(|| host.clone());
                 let config = self.ca.server_config(&name).map_err(|e| ProxyError::Refused(e.to_string()))?;
                 let tls = tokio_rustls::TlsAcceptor::from(config).accept(stream).await?;
-                self.serve_http(tls, i, name, true).await
+                self.serve_http(tls, i, name, true, port).await
             }
-            Peek::Http(_) => self.serve_http(stream, i, host, false).await,
+            Peek::Http(_) => self.serve_http(stream, i, host, false, port).await,
             Peek::More | Peek::Other => Ok(()),
         }
     }
 
-    async fn serve_http<S>(self: Arc<Self>, io: S, i: usize, host: String, tls: bool) -> Result<(), ProxyError>
+    async fn serve_http<S>(self: Arc<Self>, io: S, i: usize, host: String, tls: bool, port: u16) -> Result<(), ProxyError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -276,7 +278,7 @@ impl Egress {
         let service = hyper::service::service_fn(move |req: Request<Incoming>| {
             let me = me.clone();
             let host = host.clone();
-            async move { Ok::<_, Infallible>(me.request(req, i, &host, tls).await) }
+            async move { Ok::<_, Infallible>(me.request(req, i, &host, tls, port).await) }
         });
         hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(io), service)
@@ -284,7 +286,7 @@ impl Egress {
             .map_err(|e| ProxyError::Refused(e.to_string()))
     }
 
-    async fn request(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool) -> Response<Body> {
+    async fn request(&self, mut req: Request<Incoming>, i: usize, host: &str, tls: bool, port: u16) -> Response<Body> {
         match self.rules().action(i).clone() {
             Action::Handler => {
                 // Each replaces whatever the guest sent under its name.
@@ -313,7 +315,7 @@ impl Egress {
                         }
                     }
                 }
-                match self.to_upstream(req, host, tls).await {
+                match self.to_upstream(req, host, tls, port).await {
                     Ok(r) => r,
                     Err(e) => text(502, &format!("{host}: {e}")),
                 }
@@ -329,8 +331,8 @@ impl Egress {
         Ok(resp.map(|b| b.boxed()))
     }
 
-    async fn to_upstream(&self, req: Request<Incoming>, host: &str, tls: bool) -> Result<Response<Body>, String> {
-        let port = if tls { 443 } else { 80 };
+    /// The request to the real host, on the port the guest dialed.
+    async fn to_upstream(&self, req: Request<Incoming>, host: &str, tls: bool, port: u16) -> Result<Response<Body>, String> {
         let addr = self.resolve(host, port).await.map_err(|e| e.to_string())?;
         let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
         let resp = if tls {
@@ -351,7 +353,7 @@ impl Egress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Intercept, Policy};
+    use crate::rules::{Intercept, Placeholder, Policy};
 
     fn egress(internet: bool) -> Egress {
         let rules = Policy {
@@ -457,6 +459,78 @@ mod tests {
         assert_eq!(&body[..], b"stand-in for model.example.com/v1/chat from c-1 by 0");
         let d = eg.decisions();
         assert!(d.iter().any(|d| d.decision == "Intercept(0)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serves `s`: each request answered with its `x-sandcastle-host`
+    /// and `authorization`.
+    fn mirror<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(s: S) {
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!("{} {}", h("x-sandcastle-host"), h("authorization"))))))
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+        });
+    }
+
+    async fn get(egress: &std::path::Path, ip: IpAddr, port: u16, auth: &str) -> String {
+        let mut s = UnixStream::connect(egress).await.unwrap();
+        s.write_all(&Header { kind: Kind::Tcp, ip, port }.encode()).await.unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::get("/").header("host", "anything.example").header("authorization", auth).body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    }
+
+    // Goal: an address intercept (a range, an `ip:port`) matched by no
+    // name hands its request on with the address as its host, and a
+    // substitute goes on to the port the guest dialed, not 80. Before,
+    // the first was a panic (the whole engine, with panic = "abort") and
+    // the second went to port 80.
+    #[tokio::test]
+    async fn address_intercepts_name_the_address_and_keep_the_port() {
+        let dir = std::env::temp_dir().join(format!("sc-egress-addr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let handler_sock = dir.join("handler.sock");
+        let handler = UnixListener::bind(&handler_sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = handler.accept().await {
+                mirror(s);
+            }
+        });
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = upstream.accept().await {
+                mirror(s);
+            }
+        });
+        let placeholder = Placeholder { placeholder: "SC_PLACEHOLDER_TEST_0001".into(), value: "sk-test-not-a-secret".into() };
+        let rules = Policy {
+            internet: false,
+            // a range allows the loopback the stand-in upstream is on
+            allow: vec!["127.0.0.0/8".into()],
+            intercept: vec![
+                Intercept::http("10.9.0.0/16", Action::Handler),
+                Intercept::http(&format!("127.0.0.1:{up_port}"), Action::Substitute { placeholders: vec![placeholder] }),
+            ],
+            ..Policy::default()
+        }
+        .compile(&[])
+        .unwrap();
+        let eg = Arc::new(Egress::new(rules, Arc::new(Ca::generate("t").unwrap()), handler_sock, "c-1".into()));
+        let egress_sock = dir.join("egress.sock");
+        tokio::spawn(eg.clone().serve(UnixListener::bind(&egress_sock).unwrap()));
+
+        let handled = get(&egress_sock, "10.9.1.1".parse().unwrap(), 80, "Bearer x").await;
+        assert_eq!(handled, "10.9.1.1 Bearer x");
+        let substituted = get(&egress_sock, "127.0.0.1".parse().unwrap(), up_port, "Bearer SC_PLACEHOLDER_TEST_0001").await;
+        assert_eq!(substituted, "- Bearer sk-test-not-a-secret");
+        let d = eg.decisions();
+        assert_eq!(d.iter().filter(|d| d.decision.starts_with("Intercept(")).count(), 2, "{d:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
