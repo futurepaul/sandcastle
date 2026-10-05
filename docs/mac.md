@@ -233,7 +233,8 @@ export KRUN_SPIKE_ROOT=~/spike
 
 **Pair it** (experimental; docs/node.md, Pairing): the box must let its
 people bring their own machines (fragment's `FRAGMENT_BYOC=on`;
-docs/self-host-lan.md, step 5). The CA is still copied in first (below,
+docs/self-host-lan.md, step 5), and `sandcastle-node` must have `pair`:
+build step 5's binaries from the branch `node-pair` (it holds `arm64`). The CA is still copied in first (below,
 "The CA"). Then, in the VM, as your user:
 
 ```sh
