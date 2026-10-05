@@ -79,6 +79,11 @@ fn tcp_loop(listener: TcpListener, egress: PathBuf, count: Arc<AtomicUsize>) {
 
 fn forward_tcp(guest: TcpStream, egress: &Path) -> io::Result<()> {
     let dst = original_dst(&guest)?;
+    // What the proxy answers arrives in pieces (a head, then its body as
+    // the platform sends it), each one write here. With Nagle's algorithm
+    // each piece after the first waited for the guest's delayed ACK, about
+    // 40 ms an intercepted request.
+    guest.set_nodelay(true)?;
     let mut node = UnixStream::connect(egress)?;
     node.write_all(&Header { kind: Kind::Tcp, ip: (*dst.ip()).into(), port: dst.port() }.encode())?;
     let (mut g_read, mut n_write) = (guest.try_clone()?, node.try_clone()?);
