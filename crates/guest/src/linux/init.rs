@@ -88,6 +88,9 @@ fn boot(life_out: &mut Option<Lifecycle>) -> Result<std::convert::Infallible, In
     for m in mounts::basics() {
         sys::mount(&m).map_err(io("mounting the basics"))?;
     }
+    for (link, to) in mounts::DEV_LINKS {
+        sys::symlink(to, link).map_err(io("linking /dev"))?;
+    }
     let mut life = Lifecycle::connect()?;
     life.send(&Event::Hello { version: sandcastle_wire::VERSION, uptime_ms: sys::uptime_ms() })?;
     let start = life.read_start()?;
