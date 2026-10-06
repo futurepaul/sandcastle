@@ -53,6 +53,15 @@ pub fn mkdir_p(path: &str) -> io::Result<()> {
     }
 }
 
+/// Links `link` to `to`; a link already there is fine (a devtmpfs the
+/// kernel mounted may carry it).
+pub fn symlink(to: &str, link: &str) -> io::Result<()> {
+    match std::os::unix::fs::symlink(to, link) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        r => r,
+    }
+}
+
 pub fn mount(m: &Mount) -> io::Result<()> {
     mkdir_p(&m.target)?;
     let source = cstr(&m.source)?;
