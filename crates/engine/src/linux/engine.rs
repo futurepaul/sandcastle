@@ -448,11 +448,21 @@ impl Engine {
     }
 
     /// The image `reference` names, from the node if it has it, else
-    /// pulled and built.
+    /// pulled and built. A reference pinned by a digest the node holds
+    /// names that image whatever name it came under: the digest is its
+    /// content's (a pull's, its manifest's; a load's, the OCI manifest of
+    /// its config and layers, `load_in`), so a platform may name a loaded
+    /// image by the digest its load answered, as it names a pushed one.
     pub async fn image(&self, reference: &str) -> Result<ImageMeta, ApiError> {
         let cached = self.inner.lock().expect("never poisoned").refs.get(reference).cloned();
         if let Some(d) = cached {
             if let Ok(m) = self.image_by_digest(&d) {
+                return Ok(m);
+            }
+        }
+        if let Some(d) = pinned_digest(reference) {
+            if let Ok(mut m) = self.image_by_digest(&d) {
+                m.reference = reference.to_string();
                 return Ok(m);
             }
         }
@@ -1408,4 +1418,26 @@ async fn wait_event(l: &mut Launched, name: &str) -> Result<Value, ApiError> {
     })
     .await
     .map_err(|_| ApiError::Internal(format!("no {name} in time")))?
+}
+
+/// The digest `reference` is pinned by (`<name>@sha256:<64 hex>`), if it is.
+fn pinned_digest(reference: &str) -> Option<String> {
+    Reference::parse(reference).ok()?.digest.map(|d| d.to_string())
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use super::pinned_digest;
+
+    /// Goal: a reference pinned by a digest names it, however the name
+    /// before it reads; a tag, or no reference at all, names none.
+    #[test]
+    fn a_pinned_reference_names_its_digest() {
+        let d = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(pinned_digest(&format!("docker.io/library/fragment-stub@{d}")), Some(d.clone()));
+        assert_eq!(pinned_digest(&format!("registry.lan:5000/team/hermes@{d}")), Some(d.clone()));
+        assert_eq!(pinned_digest("docker.io/library/fragment-stub:local"), None);
+        assert_eq!(pinned_digest("fragment-stub@sha256:short"), None);
+        assert_eq!(pinned_digest(""), None);
+    }
 }
