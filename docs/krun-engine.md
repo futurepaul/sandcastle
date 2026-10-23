@@ -73,7 +73,9 @@ Constraints), with evidence in `docs/krun-spike-evidence/`.
      `start({containerSnapshot})`, image-tied, kept 30 days and refreshed
      on restore;
    - `interceptOutboundHttp` and `interceptOutboundHttps` (host, glob,
-     `ip:port`, CIDR, `*`, an optional port), and `interceptAllOutbound`,
+     `ip:port`, CIDR, `*`, an optional port; an HTTP host or glob with a
+     port is sandcastle's own, docs/node.md, Intercepts), and
+     `interceptAllOutbound`,
      added while running; 128 entries counted as Cloudflare counts them
      (a hostname is two); the CA at Cloudflare's path;
    - logs.

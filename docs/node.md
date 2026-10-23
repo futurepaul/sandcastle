@@ -91,6 +91,32 @@ refuses an intercept that names any container but its own, and gives the
 request to the binding its container set for that index. Intercepts are
 only ever appended while a container runs, so an index is stable.
 
+**What an intercept names** (`crates/egress`, `rules.rs`) is Cloudflare's,
+and one form more:
+
+| Scheme | Target | Port |
+|---|---|---|
+| `http` | a host, or a `*.` glob | 80, or its own: `name:port`, `*.glob:port` (sandcastle's own) |
+| `http` | `*` | 80 |
+| `http` | an `ip:port` | its own |
+| `http` | an address, or a range | 80 |
+| `https` | a host, a glob | 443, or its own: `name:port`, `*.glob:port` |
+| `https` | `*` | 443 |
+
+A port is 1 to 65535; anything else is a 400. They are counted as
+Cloudflare counts them, 128 entries: a host or `*` is two (a host with a
+port too), an address or a range one, at most 64 host targets and 128
+address targets.
+
+The HTTP host with a port is for a platform on a plain-HTTP port (a local
+stack's, `http://<app>.fragment.localhost:8790/`). The egress knows a
+connection's name only by the fake address its DNS answered for it
+(`fakeip.rs`), never by `Host` or SNI. So a guest that looks the name up
+(glibc's resolver: Python's, Node's) and dials the platform's port
+reaches the platform only through an intercept on that port; one on 80
+alone left it to the name's real host. A platform sets it only on a
+node: Cloudflare's containers take an HTTP host on 80 alone.
+
 ### WebSockets through the engine's proxy
 
 The engine's egress proxy carries the guest's half (`crates/egress`,
@@ -539,12 +565,14 @@ What the double fakes, and how:
   where Cloudflare's containers find theirs. The start answers once the
   relay is up. A container that exits during its start still starts, and
   `wait` reports the exit. A missing image is a 404.
-- **Intercepts** take hosts and globs on 80 (http) and 443 (https) only.
-  `*`, an address, another port or a substitute is a 400. Each exact
-  host goes into the container's `/etc/hosts` as 127.0.0.1. A glob is
-  taken (a platform intercepts its own hosts, `*.<zone>`), but no name
-  under it resolves to the relay: only a guest that dials loopback for it
-  itself reaches it (curl does for `*.localhost`). There the
+- **Intercepts** take hosts and globs on 80 (http) and 443 (https), and
+  globs on another HTTP port. `*`, an address, an exact host on another
+  port or a substitute is a 400. Each exact host goes into the
+  container's `/etc/hosts` as 127.0.0.1. A glob is taken (a platform
+  intercepts its own hosts, `*.<zone>`, and on a local stack
+  `*.<zone>:<port>` too), but no name under it resolves to the relay:
+  only a guest that dials loopback for it itself reaches it (curl does
+  for `*.localhost`), and on 80 or 443 alone, the relay's ports. There the
   relay (`sandcastle-docker-relay`, static, std only) listens on loopback.
   It joins each connection to the container's `http.sock` or
   `https.sock`, which the double serves on the host. The double terminates

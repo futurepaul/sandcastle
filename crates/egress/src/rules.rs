@@ -1,11 +1,14 @@
 //! The rules, as Cloudflare's containers have them: the internet on or
-//! off, and intercepts, each HTTP (port 80: a host, a `*.` glob, `*`, an
-//! `ip:port`, or a range) or HTTPS (443 or a given port: a host, a glob,
-//! or `*`), counted as Cloudflare counts them (128 entries; a host or `*`
-//! is two, an address or range one; at most 64 host targets and 128
-//! address targets). Allow and deny lists are sandcastle's own, beyond
-//! Cloudflare's. Whatever the rules say, a private address and the node's
-//! own are refused unless a range allows them by name.
+//! off, and intercepts, each HTTP (a host or a `*.` glob on 80 or a given
+//! port, `*` on 80, an `ip:port`, or a range on 80) or HTTPS (a host or a
+//! glob on 443 or a given port, or `*` on 443), counted as Cloudflare
+//! counts them (128 entries; a host or `*` is two, an address or range
+//! one; at most 64 host targets and 128 address targets). A port is 1 to
+//! 65535. Allow and deny lists, and an HTTP host or glob on a port of its
+//! own (`name:port`, `*.glob:port`: a platform on a plain-HTTP port, a
+//! local stack's), are sandcastle's own, beyond Cloudflare's. Whatever
+//! the rules say, a private address and the node's own are refused unless
+//! a range allows them by name.
 
 use std::net::IpAddr;
 
@@ -59,7 +62,7 @@ impl Scheme {
 pub struct Intercept {
     pub scheme: Scheme,
     /// A host, a `*.` glob, or `*`; for HTTP also an `ip:port` or a range.
-    /// An HTTPS host may end in `:port`.
+    /// A host or a glob may end in `:port` (on HTTP, sandcastle's own).
     pub target: String,
     pub action: Action,
 }
@@ -93,37 +96,46 @@ impl Target {
     }
 }
 
+/// A target's `:port`, when it ends in one: what comes before it, and the
+/// port, 1 to 65535. Nothing when it names no port.
+fn split_port(s: &str) -> Result<Option<(&str, u16)>, RuleError> {
+    match s.rsplit_once(':') {
+        Some((before, p)) if p.bytes().all(|b| b.is_ascii_digit()) => match p.parse::<u16>() {
+            Ok(port) if port > 0 => Ok(Some((before, port))),
+            _ => Err(RuleError::Pattern(s.into())),
+        },
+        _ => Ok(None),
+    }
+}
+
 /// Parses an intercept's target and the port it applies to.
 pub fn parse_target(scheme: Scheme, s: &str) -> Result<(Target, u16), RuleError> {
     let bad = || RuleError::Pattern(s.into());
     if s == "*" {
         return Ok((Target::Any, scheme.port()));
     }
-    match scheme {
-        Scheme::Http => {
-            if let Some(c) = Cidr::parse(s) {
-                return Ok((Target::Range(c), 80));
-            }
-            if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
-                return Ok((Target::AddrPort(sa.ip(), sa.port()), sa.port()));
-            }
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                let len = if ip.is_ipv4() { 32 } else { 128 };
-                return Ok((Target::Range(Cidr { net: ip, len }), 80));
-            }
-            Glob::parse(s).map(|g| (Target::Host(g), 80)).ok_or_else(bad)
+    if scheme == Scheme::Http {
+        if let Some(c) = Cidr::parse(s) {
+            return Ok((Target::Range(c), 80));
         }
-        Scheme::Https => {
-            let (host, port) = match s.rsplit_once(':') {
-                Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h, p.parse::<u16>().map_err(|_| bad())?),
-                _ => (s, 443),
+        if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+            return match sa.port() {
+                0 => Err(bad()),
+                port => Ok((Target::AddrPort(sa.ip(), port), port)),
             };
-            if host.parse::<IpAddr>().is_ok() || Cidr::parse(host).is_some() || port == 0 {
-                return Err(bad());
-            }
-            Glob::parse(host).map(|g| (Target::Host(g), port)).ok_or_else(bad)
+        }
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            let len = if ip.is_ipv4() { 32 } else { 128 };
+            return Ok((Target::Range(Cidr { net: ip, len }), 80));
         }
     }
+    // A host or a glob, on the scheme's port unless it names one; never
+    // an address (HTTPS takes none, and HTTP's are taken above).
+    let (host, port) = split_port(s)?.unwrap_or((s, scheme.port()));
+    if host.parse::<IpAddr>().is_ok() || Cidr::parse(host).is_some() {
+        return Err(bad());
+    }
+    Glob::parse(host).map(|g| (Target::Host(g), port)).ok_or_else(bad)
 }
 
 /// Checks a set of intercepts against Cloudflare's limits.
@@ -166,7 +178,7 @@ pub struct Policy {
 pub enum RuleError {
     #[error("{0} rules pass the limit of {RULES_MAX}")]
     TooMany(usize),
-    #[error("not a host, address, ip:port, or range: {0:.80}")]
+    #[error("not a host[:port], glob[:port], address, ip:port, or range: {0:.80}")]
     Pattern(String),
     #[error("a placeholder: {0}")]
     Placeholder(&'static str),
@@ -497,6 +509,105 @@ mod tests {
         assert!(matches!(parse_target(Scheme::Http, "10.0.0.0/8").unwrap(), (Target::Range(_), 80)));
         assert!(matches!(parse_target(Scheme::Http, "10.1.2.3").unwrap(), (Target::Range(_), 80)));
         assert!(parse_target(Scheme::Http, "not a target!").is_err());
+    }
+
+    // Goal: an HTTP host or glob takes a port of its own (sandcastle's,
+    // beyond Cloudflare's), 1 to 65535, and is on 80 without one; every
+    // other form is as it was, and a port that is no port is refused, on
+    // either scheme.
+    #[test]
+    fn http_hosts_take_a_port() {
+        let host = |s: &str, port: u16| (Target::Host(Glob::parse(s).unwrap()), port);
+        assert_eq!(parse_target(Scheme::Http, "*.fragment.localhost:8790").unwrap(), host("*.fragment.localhost", 8790));
+        assert_eq!(parse_target(Scheme::Http, "fragment.localhost:41234").unwrap(), host("fragment.localhost", 41234));
+        assert_eq!(parse_target(Scheme::Http, "*.fragment.localhost").unwrap(), host("*.fragment.localhost", 80), "no port is 80, as before");
+        assert_eq!(parse_target(Scheme::Http, "a.example.com:80").unwrap(), host("a.example.com", 80));
+        assert_eq!(parse_target(Scheme::Http, "a.example.com:1").unwrap(), host("a.example.com", 1));
+        assert_eq!(parse_target(Scheme::Http, "a.example.com:65535").unwrap(), host("a.example.com", 65535));
+        assert_eq!(parse_target(Scheme::Http, "A.Example.com.:8080").unwrap(), host("a.example.com", 8080));
+        assert_eq!(parse_target(Scheme::Https, "a.example.com:65535").unwrap(), host("a.example.com", 65535));
+        // the address forms are unchanged
+        assert_eq!(parse_target(Scheme::Http, "1.2.3.4:8080").unwrap(), (Target::AddrPort(ip("1.2.3.4"), 8080), 8080));
+        assert_eq!(parse_target(Scheme::Http, "[fd00::1]:8080").unwrap(), (Target::AddrPort(ip("fd00::1"), 8080), 8080));
+        assert_eq!(parse_target(Scheme::Http, "*").unwrap(), (Target::Any, 80));
+        for (scheme, bad) in [
+            (Scheme::Http, "a.example.com:0"),
+            (Scheme::Http, "*.example.com:0"),
+            (Scheme::Http, "a.example.com:65536"),
+            (Scheme::Http, "a.example.com:99999999999"),
+            (Scheme::Http, "a.example.com:"),
+            (Scheme::Http, "a.example.com:80:80"),
+            (Scheme::Http, "a.example.com:http"),
+            (Scheme::Http, "a.example.com:-1"),
+            (Scheme::Http, ":8080"),
+            (Scheme::Http, "*:8080"),
+            (Scheme::Http, "*.:8080"),
+            (Scheme::Http, "1.2.3.4:0"),
+            (Scheme::Http, "1.2.3.4:65536"),
+            (Scheme::Http, "10.0.0.0/8:80"),
+            (Scheme::Https, "a.example.com:0"),
+            (Scheme::Https, "a.example.com:"),
+            (Scheme::Https, "1.2.3.4:443"),
+            (Scheme::Https, "[fd00::1]:443"),
+        ] {
+            assert!(matches!(parse_target(scheme, bad), Err(RuleError::Pattern(_))), "{scheme:?} {bad}");
+        }
+    }
+
+    // Goal: a host with a port counts as any host does: 64 targets (128
+    // entries) fit, a 65th is refused.
+    #[test]
+    fn hosts_with_ports_count_as_hosts() {
+        let hosts = |n: usize| (0..n).map(|i| Intercept::http(&format!("*.h{i}.localhost:8790"), Action::Handler)).collect::<Vec<_>>();
+        check_intercepts(&hosts(HOST_TARGETS_MAX)).unwrap();
+        assert!(matches!(check_intercepts(&hosts(HOST_TARGETS_MAX + 1)), Err(RuleError::Intercepts(_))));
+        let mut mixed = hosts(32);
+        mixed.extend((0..64).map(|i| Intercept::http(&format!("10.{i}.0.0/16"), Action::Handler)));
+        check_intercepts(&mixed).unwrap();
+        mixed.push(Intercept::http("plain.localhost", Action::Handler));
+        assert!(matches!(check_intercepts(&mixed), Err(RuleError::Intercepts(_))), "130 entries");
+    }
+
+    // Goal: a name intercepted on its port is caught there by the name the
+    // guest looked up, as a platform on a local stack's port is
+    // (`http://<app>.fragment.localhost:8790/`), with the internet on or
+    // off; on 80 it is caught only where it is intercepted on 80 too, and
+    // another port is the name's real host, if anything.
+    #[test]
+    fn a_name_is_caught_on_its_port() {
+        let fake = ip("198.18.0.7");
+        for internet in [true, false] {
+            let c = Policy {
+                internet,
+                intercept: vec![
+                    Intercept::http("*.fragment.localhost", Action::Handler),
+                    Intercept::http("*.fragment.localhost:8790", Action::Handler),
+                    Intercept::http("fragment.localhost:41234", Action::Handler),
+                ],
+                ..Policy::default()
+            }
+            .compile(&[])
+            .unwrap();
+            assert_eq!(c.name("shelf--e2e.fragment.localhost"), NameDecision::Intercept(0));
+            assert_eq!(c.name("fragment.localhost"), NameDecision::Intercept(2));
+            assert_eq!(c.addr(fake, 80, Some("shelf--e2e.fragment.localhost")), AddrDecision::Intercept(0));
+            assert_eq!(c.addr(fake, 8790, Some("shelf--e2e.fragment.localhost")), AddrDecision::Intercept(1));
+            assert_eq!(c.addr(fake, 8790, Some("Shelf--E2E.fragment.localhost.")), AddrDecision::Intercept(1));
+            assert_eq!(c.addr(fake, 41234, Some("fragment.localhost")), AddrDecision::Intercept(2));
+            // the glob's port is not its apex's, nor the apex's the glob's
+            assert_ne!(c.addr(fake, 8790, Some("fragment.localhost")), AddrDecision::Intercept(1));
+            assert_ne!(c.addr(fake, 41234, Some("a.fragment.localhost")), AddrDecision::Intercept(2));
+            // another port: the name's real host, which the internet decides
+            let elsewhere = c.addr(fake, 8791, Some("shelf--e2e.fragment.localhost"));
+            assert_eq!(elsewhere, if internet { AddrDecision::Splice } else { AddrDecision::Refuse("the internet is off") });
+            // by address alone, a host's port catches nothing
+            assert_eq!(c.addr(ip("93.184.215.14"), 8790, None), if internet { AddrDecision::Splice } else { AddrDecision::Refuse("the internet is off") });
+        }
+        // a port alone, with no intercept on 80: 80 is the real host's
+        let only = Policy { internet: false, intercept: vec![Intercept::http("*.fragment.localhost:8790", Action::Handler)], ..Policy::default() }.compile(&[]).unwrap();
+        assert_eq!(only.name("a.fragment.localhost"), NameDecision::Intercept(0), "an intercepted name resolves whatever its port");
+        assert_eq!(only.addr(fake, 8790, Some("a.fragment.localhost")), AddrDecision::Intercept(0));
+        assert_eq!(only.addr(fake, 80, Some("a.fragment.localhost")), AddrDecision::Refuse("the internet is off"));
     }
 
     // Goal: Cloudflare's accounting: 64 host targets (128 entries) fit and

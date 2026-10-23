@@ -555,6 +555,65 @@ mod tests {
         String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
 
+    // Goal: a guest that looks a name up and dials it on the port a host
+    // intercept names (a local stack's platform,
+    // `http://<app>.fragment.localhost:8790/`) reaches the handler by that
+    // name, its `Host` as it sent it; on another port, with the internet
+    // off, it reaches nothing. Before, an HTTP host took no port, so no
+    // rule could name it, and the connection went to the name's real host.
+    #[tokio::test]
+    async fn a_name_intercepted_on_its_port_reaches_the_handler() {
+        let dir = std::env::temp_dir().join(format!("sc-egress-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let handler_sock = dir.join("handler.sock");
+        let handler = UnixListener::bind(&handler_sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = handler.accept().await {
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                        let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+                        let said = format!("{} {} {} {}", h("x-sandcastle-scheme"), h("x-sandcastle-host"), h("x-sandcastle-intercept"), h("host"));
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(said))))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).await;
+                });
+            }
+        });
+        let rules = Policy {
+            internet: false,
+            intercept: vec![Intercept::http("*.fragment.localhost", Action::Handler), Intercept::http("*.fragment.localhost:8790", Action::Handler)],
+            ..Policy::default()
+        }
+        .compile(&[])
+        .unwrap();
+        let eg = Arc::new(Egress::new(rules, Arc::new(Ca::generate("t").unwrap()), handler_sock, "c-1".into()));
+        let egress_sock = dir.join("egress.sock");
+        tokio::spawn(eg.clone().serve(UnixListener::bind(&egress_sock).unwrap()));
+        // the guest's resolver asks first, and dials the address it got
+        let a = eg.answer(&query("shelf--e2e.fragment.localhost", dns::TYPE_A)).unwrap();
+        let fake = IpAddr::V4(std::net::Ipv4Addr::new(a[a.len() - 4], a[a.len() - 3], a[a.len() - 2], a[a.len() - 1]));
+        assert!(matches!(fake, IpAddr::V4(v4) if fakeip::in_range(v4)), "{fake}");
+        let dial = |port: u16| {
+            let egress_sock = egress_sock.clone();
+            async move {
+                let mut s = UnixStream::connect(&egress_sock).await.unwrap();
+                s.write_all(&Header { kind: Kind::Tcp, ip: fake, port }.encode()).await.unwrap();
+                let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.ok()?;
+                tokio::spawn(conn);
+                let req = Request::get("/?view=t").header("host", format!("shelf--e2e.fragment.localhost:{port}")).body(http_body_util::Empty::<Bytes>::new()).unwrap();
+                let resp = send.send_request(req).await.ok()?;
+                Some(String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap())
+            }
+        };
+        assert_eq!(dial(8790).await.as_deref(), Some("http shelf--e2e.fragment.localhost 1 shelf--e2e.fragment.localhost:8790"));
+        assert_eq!(dial(80).await.as_deref(), Some("http shelf--e2e.fragment.localhost 0 shelf--e2e.fragment.localhost:80"));
+        assert_eq!(dial(8791).await, None, "another port, the internet off: refused, the connection closed");
+        let d = eg.decisions();
+        assert!(d.iter().any(|d| d.to == format!("{fake}:8791") && d.decision == "Refuse(\"the internet is off\")"), "{d:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Goal: an address intercept (a range, an `ip:port`) matched by no
     // name hands its request on with the address as its host, and a
     // substitute goes on to the port the guest dialed, not 80. Before,
