@@ -321,6 +321,10 @@ pub async fn serve(node: Arc<Node>, listener: tokio::net::TcpListener) {
     // Unbounded by design: one task per connection, for the node's life.
     loop {
         let Ok((s, _)) = listener.accept().await else { continue };
+        // an exec's frames (started, its output, its exit) and a response's
+        // parts are small writes back to back: Nagle held each behind the
+        // platform's delayed ACK of the one before (docs/node.md)
+        let _ = s.set_nodelay(true);
         let node = node.clone();
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| {
