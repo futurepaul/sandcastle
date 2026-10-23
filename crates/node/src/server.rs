@@ -3,7 +3,7 @@
 //! socket as they came. Three differ:
 //!
 //! - `start` names this node's handler socket for the container's
-//!   intercepts, whatever the platform sent;
+//!   intercepts, whatever the platform sent, and adds the node's labels;
 //! - `exec` is a WebSocket (a Worker's `fetch` upgrades to nothing else):
 //!   its first message is the exec's JSON, then each binary message is one
 //!   of the engine's frames (`exec_stream`), both ways;
@@ -86,8 +86,10 @@ pub async fn route(node: Arc<Node>, req: Request<Incoming>) -> Response<Body> {
                 Ok(s) => s,
                 Err(e) => return http::error(400, "invalid", &format!("the body: {e}")),
             };
-            // the engine hands this container's intercepts to this node
+            // the engine hands this container's intercepts to this node, and
+            // the container carries this node's labels
             start.handler = Some(format!("unix:{}", node.config.egress.display()));
+            start.labels.extend(node.config.labels.clone());
             to_engine(&node, &method, &path, Bytes::from(serde_json::to_vec(&start).expect("serializes"))).await
         }
         (&Method::GET, ["v1", "health"]) => health(&node).await,

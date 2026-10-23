@@ -41,7 +41,10 @@ Three calls work differently from the engine's:
 
 - **`start`.** The node sets `handler` to its own egress socket,
   whatever the platform sent. A platform never names a path on the
-  node.
+  node. The node adds its config's `labels` to the start's, over any of
+  the same name, so that on an engine more than one node fronts, each
+  node's containers are known as its own (a test run's, beside a
+  person's).
 - **`exec` is a WebSocket** (`GET /v1/containers/{name}/exec`, with
   `Upgrade: websocket`), because a Worker's `fetch` can upgrade to
   nothing else.

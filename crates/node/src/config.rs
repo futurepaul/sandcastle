@@ -2,6 +2,7 @@
 //! dials (the uplink), the engine's sockets, its secret's file, and the
 //! platform it hands intercepts to. Read once at start and checked.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -33,6 +34,11 @@ pub struct NodeConfig {
     /// that connection (docs/node.md, The uplink). `pair` writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uplink: Option<UplinkConfig>,
+    /// Labels every container this node starts carries, over the
+    /// platform's of the same name: which node started it, on an engine
+    /// that more than one node fronts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -70,6 +76,7 @@ impl NodeConfig {
         if self.listen.is_none() && self.uplink.is_none() {
             return Err("a node listens, dials an uplink, or both".into());
         }
+        sandcastle_engine::api::validate_labels(&self.labels).map_err(|e| format!("labels: {e}"))?;
         Ok(())
     }
 
@@ -99,6 +106,22 @@ mod tests {
         }
         assert!(NodeConfig { egress: "relative.sock".into(), ..config() }.check().is_err());
         assert!(serde_json::from_str::<NodeConfig>(r#"{"listen":"127.0.0.1:1","surprise":1}"#).is_err());
+    }
+
+    // Goal: a node's labels are checked as the engine checks a start's, so
+    // a node that would make every start fail does not start.
+    #[test]
+    fn labels() {
+        let with = |labels: &[(&str, &str)]| NodeConfig { labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..config() };
+        assert_eq!(with(&[("fragment-e2e", "1f2e3d4c")]).check(), Ok(()));
+        assert!(with(&[("", "v")]).check().is_err(), "an empty name");
+        assert!(with(&[(&"n".repeat(17), "v")]).check().is_err(), "a name past 16 bytes");
+        assert!(with(&[("n", &"v".repeat(65))]).check().is_err(), "a value past 64 bytes");
+        let many: Vec<(String, String)> = (0..11).map(|i| (format!("l{i}"), "v".into())).collect();
+        assert!(NodeConfig { labels: many.into_iter().collect(), ..config() }.check().is_err(), "more than 10");
+        let parsed: NodeConfig = serde_json::from_str(r#"{"listen":"127.0.0.1:1","engine":"/e","ports":"/p","egress":"/g","secret_file":"/k","platform":"http://p","labels":{"run":"a"}}"#).unwrap();
+        assert_eq!(parsed.labels.get("run").map(String::as_str), Some("a"));
+        assert!(!serde_json::to_string(&config()).unwrap().contains("labels"), "none written when there are none");
     }
 
     // Goal: a node dials an uplink, listens, or both, never neither; the

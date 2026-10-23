@@ -364,6 +364,7 @@ async fn node(dir: &std::path::Path, fake: &sandcastle_fake_engine::FakeEngine, 
         platform: format!("http://{}/", platform.addr),
         ca_file: None,
         uplink: Some(sandcastle_node::config::UplinkConfig { url: format!("ws://{}/api/nodes/uplink", platform.addr), id: NODE.into() }),
+        labels: [("node".to_string(), NODE.to_string())].into(),
     };
     assert_eq!(config.check(), Ok(()));
     let node = Arc::new(sandcastle_node::Node {
@@ -397,7 +398,8 @@ fn json_of(body: &[u8]) -> serde_json::Value {
 // message past one frame), a guest port's HTTP (bodies past a window both
 // ways) and its WebSocket, an intercept back to the platform, destroy and
 // wait, more streams than the limit, and a dial again after the platform
-// drops the connection, with its old dial refused as a replay.
+// drops the connection, with its old dial refused as a replay. A container
+// carries the node's labels, over the platform's of the same name.
 // Method: the node's uplink against the stand-in platform and the fake
 // engine, in one process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -421,13 +423,14 @@ async fn every_call_through_the_uplink() {
 
     // start, inspect, intercepts
     let c = "c0ffee";
-    let start = serde_json::to_vec(&serde_json::json!({"image": "docker.io/library/stub:1", "enableInternet": false, "env": {"PATH": "/bin"}})).unwrap();
+    let start = serde_json::to_vec(&serde_json::json!({"image": "docker.io/library/stub:1", "enableInternet": false, "env": {"PATH": "/bin"}, "labels": {"app": "x", "node": "another"}})).unwrap();
     let p = format!("/v1/containers/{c}/start");
     let (h, body) = t.fetch("POST", &p, signed(&s, "POST", &p, &start), &start).await.unwrap();
     assert_eq!(h.status, 201, "{}", String::from_utf8_lossy(&body));
     let p = format!("/v1/containers/{c}");
     let (h, body) = t.fetch("GET", &p, signed(&s, "GET", &p, b""), b"").await.unwrap();
     assert_eq!((h.status, json_of(&body)["running"].clone()), (200, serde_json::json!(true)));
+    assert_eq!(json_of(&body)["labels"], serde_json::json!({"app": "x", "node": NODE}));
     let intercepts = serde_json::to_vec(&serde_json::json!({"intercepts": [{"scheme": "http", "target": "api.fragment.internal", "action": {"kind": "handler"}}]})).unwrap();
     let p = format!("/v1/containers/{c}/intercepts");
     let (h, _) = t.fetch("PUT", &p, signed(&s, "PUT", &p, &intercepts), &intercepts).await.unwrap();

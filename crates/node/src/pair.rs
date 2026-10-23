@@ -105,9 +105,9 @@ pub fn uplink_url(platform: &str) -> Result<String, String> {
 /// platform, its uplink as `id`, the secret's file, and the CA.
 pub fn paired_config(existing: Option<NodeConfig>, args: &PairArgs, id: &str) -> Result<NodeConfig, String> {
     let need = |v: &Option<PathBuf>, flag: &str| v.clone().ok_or_else(|| format!("{} does not exist yet: name {flag} (and the engine's other sockets)", args.config.display()));
-    let (listen, engine, ports, egress, secret, ca) = match existing {
-        Some(c) => (c.listen, args.engine.clone().unwrap_or(c.engine), args.ports.clone().unwrap_or(c.ports), args.egress.clone().unwrap_or(c.egress), c.secret_file, c.ca_file),
-        None => (None, need(&args.engine, "--engine")?, need(&args.ports, "--ports")?, need(&args.egress, "--egress")?, default_secret(&args.config), None),
+    let (listen, engine, ports, egress, secret, ca, labels) = match existing {
+        Some(c) => (c.listen, args.engine.clone().unwrap_or(c.engine), args.ports.clone().unwrap_or(c.ports), args.egress.clone().unwrap_or(c.egress), c.secret_file, c.ca_file, c.labels),
+        None => (None, need(&args.engine, "--engine")?, need(&args.ports, "--ports")?, need(&args.egress, "--egress")?, default_secret(&args.config), None, Default::default()),
     };
     let config = NodeConfig {
         listen,
@@ -118,6 +118,7 @@ pub fn paired_config(existing: Option<NodeConfig>, args: &PairArgs, id: &str) ->
         platform: args.platform.trim_end_matches('/').to_string(),
         ca_file: args.ca_file.clone().or(ca),
         uplink: Some(UplinkConfig { url: uplink_url(&args.platform)?, id: id.to_string() }),
+        labels,
     };
     config.check()?;
     Ok(config)
@@ -328,8 +329,8 @@ mod tests {
     }
 
     // Goal: a first config takes the sockets the flags name and puts the
-    // secret beside it; an existing one keeps its engine, sockets, listen
-    // and CA; both name the platform, its uplink as the id the platform
+    // secret beside it; an existing one keeps its engine, sockets, listen,
+    // CA and labels; both name the platform, its uplink as the id the platform
     // gave, and check as `serve` checks them.
     #[test]
     fn the_config_a_pairing_writes() {
@@ -340,13 +341,14 @@ mod tests {
         assert_eq!(first.ca_file, Some(PathBuf::from("/etc/ca.pem")));
         assert_eq!(first.listen, None);
         let existing: NodeConfig = serde_json::from_str(
-            r#"{"listen":"127.0.0.1:8798","engine":"/var/lib/sandcastle/engine.sock","ports":"/var/lib/sandcastle/ports.sock","egress":"/run/sandcastle-node/egress.sock","secret_file":"/etc/sandcastle/old.secret","platform":"http://127.0.0.1:8790","ca_file":"/etc/old-ca.pem"}"#,
+            r#"{"listen":"127.0.0.1:8798","engine":"/var/lib/sandcastle/engine.sock","ports":"/var/lib/sandcastle/ports.sock","egress":"/run/sandcastle-node/egress.sock","secret_file":"/etc/sandcastle/old.secret","platform":"http://127.0.0.1:8790","ca_file":"/etc/old-ca.pem","labels":{"owner":"me"}}"#,
         )
         .unwrap();
         let again = paired_config(Some(existing.clone()), &args(&[]), "paired-00000000000000bb").unwrap();
         assert_eq!((again.listen, &again.engine, &again.secret_file), (existing.listen, &existing.engine, &existing.secret_file));
         assert_eq!(again.platform, "https://fragment.home.arpa");
         assert_eq!(again.ca_file, existing.ca_file, "its CA kept");
+        assert_eq!(again.labels, existing.labels, "its labels kept");
         assert_eq!(again.uplink.as_ref().map(|u| u.id.as_str()), Some("paired-00000000000000bb"));
         let text = serde_json::to_string(&again).unwrap();
         assert_eq!(serde_json::from_str::<NodeConfig>(&text).unwrap(), again, "it reads back as written");

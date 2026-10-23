@@ -207,6 +207,7 @@ async fn a_node_over_the_double() {
         platform: format!("http://{platform_addr}"),
         ca_file: None,
         uplink: None,
+        labels: Default::default(),
     };
     config.check().unwrap();
     let egress = tokio::net::UnixListener::bind(&config.egress).unwrap();
