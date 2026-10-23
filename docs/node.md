@@ -536,9 +536,12 @@ What the double fakes, and how:
   where Cloudflare's containers find theirs. The start answers once the
   relay is up. A container that exits during its start still starts, and
   `wait` reports the exit. A missing image is a 404.
-- **Intercepts** take exact hosts on 80 (http) and 443 (https) only.
-  A glob, `*`, an address, another port or a substitute is a 400. Each
-  host goes into the container's `/etc/hosts` as 127.0.0.1. There the
+- **Intercepts** take hosts and globs on 80 (http) and 443 (https) only.
+  `*`, an address, another port or a substitute is a 400. Each exact
+  host goes into the container's `/etc/hosts` as 127.0.0.1. A glob is
+  taken (a platform intercepts its own hosts, `*.<zone>`), but no name
+  under it resolves to the relay: only a guest that dials loopback for it
+  itself reaches it (curl does for `*.localhost`). There the
   relay (`sandcastle-docker-relay`, static, std only) listens on loopback.
   It joins each connection to the container's `http.sock` or
   `https.sock`, which the double serves on the host. The double terminates
