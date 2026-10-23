@@ -209,7 +209,12 @@ async fn runs_containers_in_docker() {
     assert_eq!(answer, "container=t:1;intercept=1;host=api.test.internal;scheme=https;path=/secure");
     let ca = exec(&client, "t:1", cmd(&["cat", "/etc/cloudflare/certs/cloudflare-containers-ca.crt"]), None, None).await;
     assert!(ca.stdout.starts_with(b"-----BEGIN CERTIFICATE-----"));
-    for bad in [Intercept::http("*.test.internal", Action::Handler), Intercept::https("api.test.internal:8443", Action::Handler)] {
+    // a glob is taken, on 80 or another HTTP port, resolving nothing; an
+    // exact host on another port is refused, the relay not on its port
+    for glob in ["*.test.internal", "*.test.internal:8790"] {
+        client.set_intercepts("t:1", vec![api.clone(), Intercept::http(glob, Action::Handler)]).await.unwrap();
+    }
+    for bad in [Intercept::http("api.test.internal:8790", Action::Handler), Intercept::https("api.test.internal:8443", Action::Handler), Intercept::http("*.test.internal:0", Action::Handler)] {
         let e = client.set_intercepts("t:1", vec![bad]).await.unwrap_err();
         assert_eq!(e.status(), Some(400), "{e}");
     }
