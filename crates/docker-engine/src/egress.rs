@@ -39,21 +39,25 @@ fn refused(status: u16, message: &str) -> Response<Body> {
     r
 }
 
-/// The host an intercept sends to the relay; why the double cannot route
-/// it, otherwise. The double routes exact hosts on 80 and 443 only: the
-/// guest reaches them by name through `/etc/hosts`, which holds no globs.
-pub fn routed_host(i: &Intercept) -> Result<String, String> {
+/// The host an intercept sends to the relay (`None` for a glob); why the
+/// double cannot route it, otherwise. The double routes exact hosts on 80
+/// and 443: the guest reaches them by name through `/etc/hosts`, which
+/// holds no globs. A glob (`*.example.com`) on 80 or 443 is taken, and its
+/// requests go to the handler as the engine's would, but only from a guest
+/// that dials the relay itself: no name under it resolves there (curl
+/// resolves `*.localhost` to loopback on its own; a resolver asks DNS).
+pub fn routed_host(i: &Intercept) -> Result<Option<String>, String> {
     if i.action != Action::Handler {
         return Err(format!("{}: the double hands requests to the handler only; it substitutes nothing", i.target));
     }
-    let only = || format!("{}: the double routes exact hosts on 80 (http) and 443 (https) only", i.target);
+    let only = || format!("{}: the double routes hosts and globs on 80 (http) and 443 (https) only", i.target);
     match parse_target(i.scheme, &i.target) {
-        Ok((Target::Host(_), port)) if port == i.scheme.port() && !i.target.starts_with("*.") => {
+        Ok((Target::Host(_), port)) if port == i.scheme.port() => {
             let host = match i.scheme {
                 Scheme::Https => i.target.strip_suffix(":443").unwrap_or(&i.target),
                 Scheme::Http => &i.target,
             };
-            Ok(host.trim_end_matches('.').to_ascii_lowercase())
+            Ok((!host.starts_with("*.")).then(|| host.trim_end_matches('.').to_ascii_lowercase()))
         }
         Ok(_) => Err(only()),
         Err(e) => Err(e.to_string()),
@@ -213,16 +217,19 @@ mod tests {
         Intercept { scheme, target: target.into(), action: Action::Handler }
     }
 
-    // Goal: exact hosts on 80 and 443 route; a glob, `*`, an address, a
-    // range, another port, and a substitute are each refused, saying why.
+    // Goal: exact hosts on 80 and 443 route by name, and a glob there is
+    // taken with no name; `*`, an address, a range, another port, and a
+    // substitute are each refused, saying why.
     #[test]
     fn what_the_double_routes() {
-        assert_eq!(routed_host(&handler(Scheme::Http, "api.fragment.internal")), Ok("api.fragment.internal".into()));
-        assert_eq!(routed_host(&handler(Scheme::Https, "Model.Example.com.")), Ok("model.example.com".into()));
-        assert_eq!(routed_host(&handler(Scheme::Https, "model.example.com:443")), Ok("model.example.com".into()));
-        for (scheme, target) in [(Scheme::Http, "*.example.com"), (Scheme::Http, "*"), (Scheme::Https, "*"), (Scheme::Https, "x.example.com:8443"), (Scheme::Http, "10.0.0.1:8080"), (Scheme::Http, "10.0.0.0/8")] {
+        assert_eq!(routed_host(&handler(Scheme::Http, "api.fragment.internal")), Ok(Some("api.fragment.internal".into())));
+        assert_eq!(routed_host(&handler(Scheme::Https, "Model.Example.com.")), Ok(Some("model.example.com".into())));
+        assert_eq!(routed_host(&handler(Scheme::Https, "model.example.com:443")), Ok(Some("model.example.com".into())));
+        assert_eq!(routed_host(&handler(Scheme::Http, "*.fragment.localhost")), Ok(None));
+        assert_eq!(routed_host(&handler(Scheme::Https, "*.example.com:443")), Ok(None));
+        for (scheme, target) in [(Scheme::Http, "*"), (Scheme::Https, "*"), (Scheme::Https, "x.example.com:8443"), (Scheme::Https, "*.example.com:8443"), (Scheme::Http, "10.0.0.1:8080"), (Scheme::Http, "10.0.0.0/8")] {
             let e = routed_host(&handler(scheme, target)).unwrap_err();
-            assert!(e.contains("exact hosts on 80 (http) and 443 (https) only"), "{target}: {e}");
+            assert!(e.contains("hosts and globs on 80 (http) and 443 (https) only"), "{target}: {e}");
         }
         assert!(routed_host(&handler(Scheme::Http, "not a host")).is_err());
         let sub = Intercept::http("api.example.com", Action::Substitute { placeholders: vec![] });

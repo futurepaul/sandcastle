@@ -13,8 +13,9 @@
 //!   the relay at `/.sandcastle-relay`, and the double's CA where
 //!   Cloudflare's containers find theirs. Then the relay starts inside
 //!   (`docker exec -d`) and the start waits for its ready marker.
-//! - **intercepts** (`egress`): exact hosts on 80 and 443 only, each sent
-//!   to the relay on loopback by `/etc/hosts`, then to the handler with the
+//! - **intercepts** (`egress`): hosts and globs on 80 and 443 only, each
+//!   exact host sent to the relay on loopback by `/etc/hosts` (a glob's
+//!   names are not: `egress::routed_host`), then to the handler with the
 //!   egress proxy's `x-sandcastle-*` headers.
 //! - **exec** (`exec`) is `docker exec`, the relay in front so a signal
 //!   reaches the process.
@@ -462,7 +463,7 @@ async fn start_container(shared: &Arc<Shared>, name: &str, start: StartRequest) 
     let mut hosts = Vec::with_capacity(start.intercepts.len());
     for i in &start.intercepts {
         match egress::routed_host(i) {
-            Ok(h) => hosts.push(h),
+            Ok(h) => hosts.extend(h),
             Err(e) => return error(400, "invalid", &e),
         }
     }
@@ -748,7 +749,7 @@ async fn set_intercepts(shared: &Arc<Shared>, name: &str, intercepts: Vec<Interc
     let mut hosts = Vec::with_capacity(intercepts.len());
     for i in &intercepts {
         match egress::routed_host(i) {
-            Ok(h) => hosts.push(h),
+            Ok(h) => hosts.extend(h),
             Err(e) => return error(400, "invalid", &e),
         }
     }
