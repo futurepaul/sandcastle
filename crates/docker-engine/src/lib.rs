@@ -13,9 +13,10 @@
 //!   the relay at `/.sandcastle-relay`, and the double's CA where
 //!   Cloudflare's containers find theirs. Then the relay starts inside
 //!   (`docker exec -d`) and the start waits for its ready marker.
-//! - **intercepts** (`egress`): hosts and globs on 80 and 443 only, each
-//!   exact host sent to the relay on loopback by `/etc/hosts` (a glob's
-//!   names are not: `egress::routed_host`), then to the handler with the
+//! - **intercepts** (`egress`): hosts and globs on 80 and 443, and globs
+//!   on another HTTP port, each exact host sent to the relay on loopback
+//!   by `/etc/hosts` (a glob's names are not, and the relay listens on 80
+//!   and 443 alone: `egress::routed_host`), then to the handler with the
 //!   egress proxy's `x-sandcastle-*` headers.
 //! - **exec** (`exec`) is `docker exec`, the relay in front so a signal
 //!   reaches the process.
@@ -27,7 +28,8 @@
 //! What it does not do, and says so in its log: CPU and memory limits,
 //! `enableInternet: false`, allow and deny lists (Docker's network is
 //! open), data disks (refused), a guest port bound to loopback alone
-//! (refused), and globs, `*` and other ports in intercepts (refused).
+//! (refused), `*`, addresses and an exact host on another port in
+//! intercepts (refused), and a name under a glob (never resolved).
 
 pub mod docker;
 pub mod egress;

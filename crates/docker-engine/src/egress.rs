@@ -42,23 +42,28 @@ fn refused(status: u16, message: &str) -> Response<Body> {
 /// The host an intercept sends to the relay (`None` for a glob); why the
 /// double cannot route it, otherwise. The double routes exact hosts on 80
 /// and 443: the guest reaches them by name through `/etc/hosts`, which
-/// holds no globs. A glob (`*.example.com`) on 80 or 443 is taken, and its
-/// requests go to the handler as the engine's would, but only from a guest
-/// that dials the relay itself: no name under it resolves there (curl
-/// resolves `*.localhost` to loopback on its own; a resolver asks DNS).
+/// holds no globs, at the relay, which listens on those two ports alone. A
+/// glob (`*.example.com`) on 80 or 443 is taken, and its requests go to the
+/// handler as the engine's would, but only from a guest that dials the
+/// relay itself: no name under it resolves there (curl resolves
+/// `*.localhost` to loopback on its own; a resolver asks DNS). A glob on
+/// another HTTP port (`*.example.com:8790`, sandcastle's own: a platform on
+/// a local stack's port) is taken the same way, and reaches nothing here:
+/// no name under it resolves, and the relay is not on its port. An exact
+/// host on another port is refused: the double could name it, but has
+/// nothing on its port to take it.
 pub fn routed_host(i: &Intercept) -> Result<Option<String>, String> {
     if i.action != Action::Handler {
         return Err(format!("{}: the double hands requests to the handler only; it substitutes nothing", i.target));
     }
-    let only = || format!("{}: the double routes hosts and globs on 80 (http) and 443 (https) only", i.target);
+    let only = || format!("{}: the double routes hosts and globs on 80 (http) and 443 (https) only, and takes a glob on another http port unresolved", i.target);
+    let glob = i.target.starts_with("*.");
     match parse_target(i.scheme, &i.target) {
         Ok((Target::Host(_), port)) if port == i.scheme.port() => {
-            let host = match i.scheme {
-                Scheme::Https => i.target.strip_suffix(":443").unwrap_or(&i.target),
-                Scheme::Http => &i.target,
-            };
-            Ok((!host.starts_with("*.")).then(|| host.trim_end_matches('.').to_ascii_lowercase()))
+            let host = i.target.strip_suffix(&format!(":{port}")).unwrap_or(&i.target);
+            Ok((!glob).then(|| host.trim_end_matches('.').to_ascii_lowercase()))
         }
+        Ok((Target::Host(_), _)) if glob && i.scheme == Scheme::Http => Ok(None),
         Ok(_) => Err(only()),
         Err(e) => Err(e.to_string()),
     }
@@ -217,21 +222,36 @@ mod tests {
         Intercept { scheme, target: target.into(), action: Action::Handler }
     }
 
-    // Goal: exact hosts on 80 and 443 route by name, and a glob there is
-    // taken with no name; `*`, an address, a range, another port, and a
-    // substitute are each refused, saying why.
+    // Goal: exact hosts on 80 and 443 route by name, and a glob there, or
+    // on another http port, is taken with no name; `*`, an address, a
+    // range, an exact host on another port, and a substitute are each
+    // refused, saying why.
     #[test]
     fn what_the_double_routes() {
         assert_eq!(routed_host(&handler(Scheme::Http, "api.fragment.internal")), Ok(Some("api.fragment.internal".into())));
         assert_eq!(routed_host(&handler(Scheme::Https, "Model.Example.com.")), Ok(Some("model.example.com".into())));
         assert_eq!(routed_host(&handler(Scheme::Https, "model.example.com:443")), Ok(Some("model.example.com".into())));
+        assert_eq!(routed_host(&handler(Scheme::Http, "api.fragment.internal:80")), Ok(Some("api.fragment.internal".into())));
         assert_eq!(routed_host(&handler(Scheme::Http, "*.fragment.localhost")), Ok(None));
         assert_eq!(routed_host(&handler(Scheme::Https, "*.example.com:443")), Ok(None));
-        for (scheme, target) in [(Scheme::Http, "*"), (Scheme::Https, "*"), (Scheme::Https, "x.example.com:8443"), (Scheme::Https, "*.example.com:8443"), (Scheme::Http, "10.0.0.1:8080"), (Scheme::Http, "10.0.0.0/8")] {
+        // a glob on another http port: taken, unresolved, as on 80
+        assert_eq!(routed_host(&handler(Scheme::Http, "*.fragment.localhost:8790")), Ok(None));
+        assert_eq!(routed_host(&handler(Scheme::Http, "*.fragment.localhost:80")), Ok(None));
+        for (scheme, target) in [
+            (Scheme::Http, "*"),
+            (Scheme::Https, "*"),
+            (Scheme::Https, "x.example.com:8443"),
+            (Scheme::Https, "*.example.com:8443"),
+            (Scheme::Http, "fragment.localhost:8790"),
+            (Scheme::Http, "10.0.0.1:8080"),
+            (Scheme::Http, "10.0.0.0/8"),
+        ] {
             let e = routed_host(&handler(scheme, target)).unwrap_err();
             assert!(e.contains("hosts and globs on 80 (http) and 443 (https) only"), "{target}: {e}");
         }
-        assert!(routed_host(&handler(Scheme::Http, "not a host")).is_err());
+        for bad in ["not a host", "*.fragment.localhost:0", "*.fragment.localhost:65536", "a.example.com:"] {
+            assert!(routed_host(&handler(Scheme::Http, bad)).is_err(), "{bad}");
+        }
         let sub = Intercept::http("api.example.com", Action::Substitute { placeholders: vec![] });
         assert!(routed_host(&sub).unwrap_err().contains("handler only"));
     }
@@ -253,6 +273,11 @@ mod tests {
         assert_eq!(intercept_of(&list, Scheme::Http, "api.example.com", 80), None);
         assert_eq!(intercept_of(&list, Scheme::Http, "elsewhere.example", 80), None);
         assert_eq!(intercept_of(&[], Scheme::Http, "api.fragment.internal", 80), None);
+        // a glob on its port takes that port's requests, and 80's go to the one on 80
+        let globs = vec![handler(Scheme::Http, "*.fragment.localhost:8790"), handler(Scheme::Http, "*.fragment.localhost")];
+        assert_eq!(intercept_of(&globs, Scheme::Http, "a.fragment.localhost", 80), Some(1));
+        assert_eq!(intercept_of(&globs, Scheme::Http, "a.fragment.localhost", 8790), Some(0));
+        assert_eq!(intercept_of(&globs[..1], Scheme::Http, "a.fragment.localhost", 80), None);
     }
 
     #[test]
