@@ -1,0 +1,80 @@
+{
+  "evidence": {
+    "images": {
+      "alpine:3.24": {
+        "build_ms": 430,
+        "ok": true,
+        "out": "3.24.4\n0",
+        "pull_and_build_ms": 1378.0,
+        "start_ms": 197.0
+      },
+      "debian:trixie-slim": {
+        "build_ms": 1364,
+        "ok": true,
+        "out": "debian 13\napt 3.0.4 (amd64)",
+        "pull_and_build_ms": 5174.0,
+        "start_ms": 213.0
+      },
+      "nginx:1.31-alpine": {
+        "ok": true,
+        "start_ms": 646.0,
+        "status": "HTTP/1.1 200 OK"
+      },
+      "node:24-slim": {
+        "build_ms": 2374,
+        "ok": true,
+        "out": "v24.22.3",
+        "pull_and_build_ms": 11706.0,
+        "start_ms": 374.0
+      },
+      "python:3.14-slim": {
+        "build_ms": 1493,
+        "ok": true,
+        "out": "(3, 14)",
+        "pull_and_build_ms": 4240.0,
+        "start_ms": 190.0
+      },
+      "sandbox-shim-on-node:test": {
+        "checks": {
+          "mkdir": true,
+          "node_runs": true,
+          "read_directory": true,
+          "read_file": true,
+          "remove_recursive": true,
+          "rename": true,
+          "stat": true,
+          "user_denied": true,
+          "write_file": true
+        },
+        "load_and_build_ms": 2508.0,
+        "ok": true,
+        "seen": {
+          "denied": "[FileError(13, \"Permission denied (os error 13)\")]",
+          "missing": "[FileError(2, \"No such file or directory (os error 2)\")]",
+          "stat": {
+            "mode": "100644",
+            "size": 40,
+            "type": 0
+          }
+        },
+        "start_ms": 356.0
+      },
+      "ubuntu:26.04": {
+        "build_ms": 2344,
+        "ok": true,
+        "out": "ubuntu 26.04\nDebian 'dpkg' package management program version 1.23.7 (amd64).",
+        "pull_and_build_ms": 7352.0,
+        "start_ms": 226.0
+      }
+    },
+    "pass": true
+  },
+  "scenario": "corpus",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+    "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
+    "runner_sha256_16": ""
+  }
+}

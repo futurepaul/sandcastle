@@ -74,7 +74,7 @@ caller passes `ctx.container`'s options through unchanged
 
 ## Build and test
 
-Rust stable (1.98 tested), on Linux or macOS:
+Rust stable (1.99 tested), on Linux or macOS:
 
 ```sh
 cargo build --workspace
@@ -98,10 +98,14 @@ The engine needs:
   `mke2fs`, and `nft` (aarch64, as on a Mac's Linux VM with nested
   virtualization: docs/mac.md). A node runs images of its own
   architecture (`linux/amd64` or `linux/arm64`);
-- libkrun `b63baa1895c60d58b731fdebb9180ba266292848` (built with
-  `--features ffi,blk,net`) and libkrunfw
-  `f6a710faaa8cfe3b67a4bcdadb082c2183a914f1` (5.6.2), built into a prefix
-  and loaded from there by path, never installed system-wide;
+- libkrun `c9327bda52ee0c93d803ee12f409fc6b52c52fab` (main, 2.0.0-dev;
+  built with `cargo build --release --locked -p libkrun --features
+  ffi,blk,net`) and libkrunfw `a9320d977080d548bca059ac8883b4acfb13ba61`
+  (v5.6.3, Linux 6.12.115), built into a prefix and loaded from there by
+  path, never installed system-wide. libkrunfw's Makefile downloads its
+  kernel with no checksum: seed `tarballs/v5.6.3-6.12.115.tar.gz`
+  (sha256 `62841e8af1a0e6630c12dd2f36d4f2bd352b32715780308bd9c364a8e1fd4ede`)
+  first. Why these (docs/krun-engine.md, Dependencies, 2026-11-11);
 - the guest built static:
   `cargo build --release -p sandcastle-guest --target x86_64-unknown-linux-musl`
   (`aarch64-unknown-linux-musl` on arm64);

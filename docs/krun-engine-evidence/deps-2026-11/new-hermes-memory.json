@@ -1,0 +1,54 @@
+{
+  "evidence": {
+    "guest_meminfo_at_end": "MemTotal:        6091012 kB\nMemFree:         5626304 kB\nMemAvailable:    5568448 kB\nCached:            35584 kB\n",
+    "instance": {
+      "memoryMib": 6144,
+      "vcpu": 2
+    },
+    "msb_idle_hermes_mib": "892 to 925 (msb, VMM resident, no reclaim)",
+    "reclaim": {
+      "freeKibAfter": 5629052,
+      "freeKibBefore": 5385864
+    },
+    "reporting": "the engine's kernel_args (page_reporting order 0)",
+    "samples": [
+      {
+        "at_s": 0,
+        "cgroup_mib": 684
+      },
+      {
+        "at_s": 30,
+        "cgroup_mib": 1005
+      },
+      {
+        "at_s": 60,
+        "cgroup_mib": 1059
+      },
+      {
+        "at_s": 90,
+        "cgroup_mib": 1042
+      },
+      {
+        "after_reclaim_s": 5,
+        "cgroup_mib": 807
+      },
+      {
+        "after_reclaim_s": 15,
+        "cgroup_mib": 794
+      },
+      {
+        "after_reclaim_s": 45,
+        "cgroup_mib": 751
+      }
+    ],
+    "serving_after": 200
+  },
+  "scenario": "hermes-memory",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+    "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
+    "runner_sha256_16": ""
+  }
+}

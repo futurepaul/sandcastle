@@ -1,0 +1,46 @@
+{
+  "evidence": {
+    "data_kept_root_fresh": true,
+    "exec_round_trip_ms": {
+      "max": 4.109,
+      "median": 2.714,
+      "min": 1.469,
+      "n": 3
+    },
+    "first_start_to_serving_ms": 5923.7,
+    "health_get_ms": {
+      "max": 2.454,
+      "median": 1.788,
+      "min": 1.106,
+      "n": 3
+    },
+    "image": "nousresearch/hermes-agent:v2026.9.24",
+    "instance": {
+      "diskMb": 16000,
+      "memoryMib": 6144,
+      "vcpu": 2
+    },
+    "pid1_in_workload": "/package/admin/s6/command/s6-svscan -d4 -- /run/service",
+    "second_start_saw": "kept\nroot-fresh\n",
+    "start_to_ready_ms": {
+      "max": 274.077,
+      "median": 234.088,
+      "min": 194.099,
+      "n": 2
+    },
+    "start_to_serving_ms": {
+      "max": 4979.869,
+      "median": 4873.703,
+      "min": 4767.537,
+      "n": 2
+    }
+  },
+  "scenario": "hermes",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+    "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
+    "runner_sha256_16": ""
+  }
+}

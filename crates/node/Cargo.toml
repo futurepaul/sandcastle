@@ -24,7 +24,7 @@ url.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
-rustls-pki-types = { version = "=1.15.1", features = ["std"] }
+rustls-pki-types = { version = "=1.16.0", features = ["std"] }
 hmac.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true

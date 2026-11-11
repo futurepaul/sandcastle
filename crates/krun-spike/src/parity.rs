@@ -64,6 +64,8 @@ pub fn scenario(layout: &Layout, node: &Node) -> Result<Value, Error> {
     let mut huge = start(BUSYBOX, SLEEP_FOREVER);
     huge.instance = Some(Instance::Custom { vcpu: 4.0, memory_mib: 12 * 1024, disk_mb: 20_000 });
     check("refuses_past_the_node_budget", refused(node.try_start("p", &huge), 429));
+    // A node whose budget holds `huge` starts it; never leave it running.
+    let _ = node.block(node.client.destroy("p", None));
 
     // A standard-1 container: labels, inspect, the size the guest sees,
     // exec's env, the CA, and a second start refused.

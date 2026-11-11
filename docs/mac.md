@@ -121,9 +121,18 @@ libkrun, at the commit the box runs:
 
 ```sh
 git clone https://github.com/containers/libkrun ~/src/libkrun
-cd ~/src/libkrun && git checkout b63baa1895c60d58b731fdebb9180ba266292848
+cd ~/src/libkrun && git checkout c9327bda52ee0c93d803ee12f409fc6b52c52fab
 cargo build --release --locked -p libkrun --features ffi,blk,net
 ```
+
+libkrun moved from b63baa1 on 2026-11-11 (docs/krun-engine.md,
+Dependencies); its vtable layout changed, so the gate in
+`crates/vm/src/linux/krun.rs` needs that commit or later. The Linux box
+runs libkrunfw v5.6.3 (Linux 6.12.115), built from source; v5.6.3 has no
+release build yet, so on a Mac either build it from source as below
+(tag `v5.6.3`, seeding `tarballs/v5.6.3-6.12.115.tar.gz` from
+`https://github.com/libkrun/linux/archive/refs/tags/v5.6.3-6.12.115.tar.gz`
+in place of the kernel.org tarball) or keep 5.6.2:
 
 libkrunfw 5.6.2 (the guest's kernel, Linux 6.12.109), upstream's own
 aarch64 release build, checked against GitHub's published digest. Its

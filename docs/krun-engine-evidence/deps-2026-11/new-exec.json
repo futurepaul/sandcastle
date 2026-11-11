@@ -1,0 +1,38 @@
+{
+  "evidence": {
+    "checks": {
+      "entrypoint_exit_code": true,
+      "kill": true,
+      "missing_binary_refused": true,
+      "process_limit": true,
+      "pty_resize": true,
+      "slots_returned": true,
+      "stdin": true,
+      "streams": true,
+      "ten_megabytes": true
+    },
+    "kill_to_exit_ms": 0.517,
+    "monitor": {
+      "code": 7,
+      "destroyed": false,
+      "error": null,
+      "signal": null
+    },
+    "pass": true,
+    "round_trip_ms": {
+      "max": 98.695,
+      "median": 0.743,
+      "min": 0.586,
+      "n": 20
+    },
+    "start_to_monitored_exit_ms": 400.4
+  },
+  "scenario": "exec",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+    "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
+    "runner_sha256_16": ""
+  }
+}

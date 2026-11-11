@@ -4,8 +4,9 @@
 //! globally, so libkrun's own `dlopen("libkrunfw.so.5")` finds it by its
 //! soname instead of searching the system.
 //!
-//! Pinned: libkrun b63baa18 (Apache-2.0), libkrunfw f6a710fa (LGPL-2.1,
-//! its kernel GPL-2.0), docs/krun-spike.md.
+//! Pinned: libkrun c9327bda (Apache-2.0), libkrunfw a9320d97 (v5.6.3,
+//! LGPL-2.1, its kernel GPL-2.0), docs/krun-spike.md, Dependencies. The
+//! layouts below are libkrun.h's at that commit (ffier 0.3).
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::os::fd::RawFd;
@@ -41,11 +42,15 @@ struct VtableHandle {
     metadata: u32,
     vtable_ptr: *const c_void,
     user_data: *const c_void,
-    vtable_size: u16,
 }
 
+/// ffier 0.3's vtable: a header (its method slots, excluding `drop`;
+/// reserved words zero), then `drop`, then the methods.
 #[repr(C)]
 struct PushStrVtable {
+    num_slots: u16,
+    reserved1: u16,
+    reserved2: u32,
     drop: Option<extern "C" fn(*mut c_void)>,
     push: extern "C" fn(*mut c_void, KrunStr) -> bool,
 }
@@ -189,13 +194,12 @@ impl Krun {
 
     fn message(&self, err: ErrOut) -> String {
         let mut out = String::new();
-        let vtable = PushStrVtable { drop: None, push: push_to_string };
+        let vtable = PushStrVtable { num_slots: 1, reserved1: 0, reserved2: 0, drop: None, push: push_to_string };
         let writer = VtableHandle {
             type_tag: PUSH_STR_TYPE_TAG,
             metadata: 0,
             vtable_ptr: &vtable as *const PushStrVtable as *const c_void,
             user_data: &mut out as *mut String as *const c_void,
-            vtable_size: std::mem::size_of::<PushStrVtable>() as u16,
         };
         // SAFETY: `err` is an error libkrun returned and has not destroyed;
         // the writer borrows `out` and `vtable` for this call only.
