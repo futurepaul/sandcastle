@@ -1,0 +1,49 @@
+{
+  "evidence": {
+    "env": [],
+    "image": "nousresearch/hermes-agent:v2026.9.24",
+    "runs": [
+      {
+        "from": "image",
+        "run": 0,
+        "snapshot_bytes": 11681792,
+        "snapshot_taken_ms": 60.212537,
+        "start_to_gateway_api_ms": 5154.454363,
+        "start_to_ready_ms": 140.604077,
+        "start_to_serving_ms": 4539.243665
+      },
+      {
+        "from": "snapshot",
+        "run": 1,
+        "snapshot_bytes": 13746176,
+        "snapshot_taken_ms": 59.26421,
+        "start_to_gateway_api_ms": 4897.279323000001,
+        "start_to_ready_ms": 128.674296,
+        "start_to_serving_ms": 4314.369867
+      },
+      {
+        "from": "snapshot",
+        "run": 2,
+        "snapshot_bytes": 16461824,
+        "snapshot_taken_ms": 67.859431,
+        "start_to_gateway_api_ms": 5306.601378,
+        "start_to_ready_ms": 131.98417500000002,
+        "start_to_serving_ms": 4737.198677
+      }
+    ],
+    "steady_start_to_serving_ms": {
+      "max": 4737.199,
+      "median": 4737.199,
+      "min": 4737.199,
+      "n": 1
+    }
+  },
+  "scenario": "hermes-snapshot",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+    "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
+    "runner_sha256_16": ""
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "evidence": {
+    "engine_ms": {
+      "guest_hello": {
+        "max": 118.13,
+        "median": 114.28,
+        "min": 109.631,
+        "n": 30
+      },
+      "guest_kernel_uptime_at_hello": {
+        "max": 40.0,
+        "median": 38.0,
+        "min": 37.0,
+        "n": 30
+      },
+      "jail_nft": {
+        "max": 1.689,
+        "median": 1.23,
+        "min": 0.951,
+        "n": 30
+      },
+      "jailed": {
+        "max": 6.815,
+        "median": 3.815,
+        "min": 3.183,
+        "n": 30
+      },
+      "prepared": {
+        "max": 3.505,
+        "median": 0.676,
+        "min": 0.517,
+        "n": 30
+      },
+      "ready": {
+        "max": 121.8,
+        "median": 117.963,
+        "min": 112.61,
+        "n": 30
+      },
+      "vmm_built": {
+        "max": 18.507,
+        "median": 13.414,
+        "min": 10.896,
+        "n": 30
+      }
+    },
+    "first_ping_ms": {
+      "max": 4.195,
+      "median": 1.804,
+      "min": 0.498,
+      "n": 30
+    },
+    "image": "busybox:1.37.0",
+    "instance": "lite (1/16 vCPU, 256 MiB; full CPU until ready)",
+    "start_to_ready_ms": {
+      "max": 122.103,
+      "median": 118.207,
+      "min": 112.813,
+      "n": 30
+    }
+  },
+  "scenario": "boot",
+  "versions": {
+    "engine_sha256_16": "",
+    "guest_sha256_16": "",
+    "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
+    "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+    "runner_sha256_16": ""
+  }
+}

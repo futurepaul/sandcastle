@@ -573,6 +573,89 @@ interactive, not an application's start):
   libkrun fixes a VM's disks when it is built, so an image would arrive
   over virtio-fs into a directory the host binds late.
 
+### Dependencies, 2026-11-11
+
+Every pin moved to its newest release, security first. Evidence:
+`krun-engine-evidence/deps-2026-11/` (`old-*` is the install as found on
+fragment's box, `new-*` this one, the same driver against the same
+engine socket; `conformance-old*` is the old engine with the new celld).
+
+**libkrun** `b63baa1` -> `c9327bda` (main, 2026-11-10, 140 commits).
+The v1.19.x line (v1.19.8, 2026-11-06) branched from main at 1.18.0
+and cannot carry the builder API (`krun_vmm_*`, pause and resume, the
+balloon), so main is the only line with our API. Every v1.19.x commit
+is on main by patch id or by subject, except version bumps and 1.x-only
+C entry points (`krun_add_virtiofs4`, a render-server fd, init's
+UID/GID parsing) that sandcastle does not use. Neither repository
+publishes a security advisory. What main adds that matters here:
+`virtio/balloon: ignore free page reports outside guest memory`
+(72be0998; a guest's report was acted on unchecked, and we enable free
+page reporting), zstd updated for its advisories (72b65678), vsock
+refusals for a port with no proxy (b2996b56, 16dd4e0b, 28eaaf11), and
+a dropped Unix stream's buffered data drained before close. `cargo
+audit` on its lock: no vulnerabilities; of its four warnings only
+`chacha20` 0.10.0 (yanked: an SSE4.1 instruction in its SSE2 backend)
+is in the `ffi,blk,net` build, which keeps upstream's lock.
+
+ffier 0.3 changed the C ABI's vtables: `KrunVtableHandle` lost
+`vtable_size`, and each vtable starts with `_num_slots` and two
+reserved words. The gate (`crates/vm/src/linux/krun.rs`) follows; every
+other declaration it loads is unchanged (`krun_vmm_builder_devices` now
+names `KrunDeviceManager`, still a handle). This build of sandcastle
+needs that libkrun or later.
+
+**libkrunfw** `f6a710fa` (5.6.2, Linux 6.12.109) -> `a9320d97`
+(v5.6.3, main, Linux 6.12.115, Landlock enabled, a TSI NULL
+`getsockopt` fixed). libkrunfw now builds its kernel from
+`libkrun/linux`'s tag `v5.6.3-6.12.115`, downloaded with no checksum;
+against kernel.org's `linux-6.12.115.tar.xz` (its signed digest
+matching) it differs only in libkrun's own areas (vsock datagrams, TSI,
+virtio-rtc, -can and -media, DAX, the reboot and exit patches, arm64).
+kernel.org is at 6.12.117; libkrunfw has not taken it yet. fragment's
+box, as found, ran Arch's libkrunfw 5.5.0 (Linux 6.12.91), not the
+5.6.2 this README pinned, so its guests gain 24 stable releases.
+
+**Rust crates**, every pin to its latest: hyper 1.12.0, hyper-util
+0.1.21, libc 0.2.191, flate2 1.1.11, ruzstd 0.9.1, rustls 0.23.46,
+rustls-pki-types 1.16.0, serde_json 1.0.154, sha2 0.11.1, hmac 0.13.0,
+thiserror 2.0.21, tokio 1.54.1, tokio-tungstenite 0.30.0, tokio-rustls
+0.26.6, webpki-roots 1.0.12 (hex, http-body-util, futures-util, tar,
+rcgen, serde and url were already latest). `cargo audit`: 7
+vulnerabilities and 1 warning before (rustls x4, rustls-webpki,
+webpki-roots: distrusted intermediates and roots, ruzstd: a
+decompression bomb in the guest's layer decoder, tokio: `AsyncFd::new`
+unsound), none after. `AsyncFd::new` is deprecated for its I/O safety;
+its three uses are now `AsyncFd::register` on an `OwnedFd` it owns.
+CI's actions moved to checkout v7 and cache v6.
+
+**Test images.** The driver's busybox is 1.38.0, and `corpus` runs the
+current alpine 3.24, debian 13 (trixie), ubuntu 26.04, python 3.14,
+node 24 and nginx 1.31: all pass on the new engine (`new-corpus.json`).
+The timings below were taken with busybox 1.37.0, before that change, to
+compare like with like. The Hermes scenarios keep
+`nousresearch/hermes-agent:v2026.9.24`: their checks know that image's
+layout, and the image a computer runs is fragment's choice.
+
+| On the box, quiet (load about 5) | Before | After |
+|---|---|---|
+| busybox start to ready, n = 30 | 118.2 ms [112.8–122.1] | 123.1 ms [117.1–175.1] |
+| guest kernel's clock at hello | 38 ms | 39 ms |
+| exec round trip, n = 20 | 3.96 ms | 0.74 ms |
+| snapshot; a start from it (`parity`) | 42.9 ms; 120.9 ms | 41.3 ms; 129.8 ms (median, n = 6) |
+| Hermes start to serving, n = 2 | 4.84 s | 4.87 s |
+| Hermes idle after a reclaim (`hermes-memory`) | — | 751 MiB (1042 before it) |
+| celld's conformance Worker | 25 of 25 | 25 of 25 |
+
+The test node's figures above (108 ms, 46.6 ms) were another machine;
+the box's own before and after are the comparison. celld's conformance
+runs slower here than on the test node (`getTcpPort` 10 s, `signal` 10
+s, a start from a snapshot 3 s) with the old engine as with the new
+(`conformance-old*`): the box, not the update. `parity`'s
+`refuses_past_the_node_budget` fails on the box before and after: its
+budget (`memory_mib_max` 32768) holds the 12 GiB start the check
+expects refused. The driver now destroys that start instead of leaving
+it running.
+
 ### Debt
 
 This list is the engine's ledger: each stays here until it is paid.
