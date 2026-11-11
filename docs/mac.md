@@ -129,10 +129,18 @@ libkrun moved from b63baa1 on 2026-11-11 (docs/krun-engine.md,
 Dependencies); its vtable layout changed, so the gate in
 `crates/vm/src/linux/krun.rs` needs that commit or later. The Linux box
 runs libkrunfw v5.6.3 (Linux 6.12.115), built from source; v5.6.3 has no
-release build yet, so on a Mac either build it from source as below
-(tag `v5.6.3`, seeding `tarballs/v5.6.3-6.12.115.tar.gz` from
-`https://github.com/libkrun/linux/archive/refs/tags/v5.6.3-6.12.115.tar.gz`
-in place of the kernel.org tarball) or keep 5.6.2:
+release build yet, so on a Mac either build it from source, its kernel
+seeded and checked first (the Makefile's own download is unchecked):
+
+```sh
+sudo apt-get install -y bc bison flex libelf-dev elfutils python3-pyelftools cpio xz-utils patch
+git clone https://github.com/libkrun/libkrunfw ~/src/libkrunfw-src && cd ~/src/libkrunfw-src && git checkout v5.6.3
+mkdir -p tarballs && curl -fL -o tarballs/v5.6.3-6.12.115.tar.gz https://github.com/libkrun/linux/archive/refs/tags/v5.6.3-6.12.115.tar.gz
+echo "62841e8af1a0e6630c12dd2f36d4f2bd352b32715780308bd9c364a8e1fd4ede  tarballs/v5.6.3-6.12.115.tar.gz" | sha256sum -c
+make -j"$(nproc)" && make PREFIX="$HOME/src/libkrunfw/usr" install
+```
+
+or keep 5.6.2:
 
 libkrunfw 5.6.2 (the guest's kernel, Linux 6.12.109), upstream's own
 aarch64 release build, checked against GitHub's published digest. Its
