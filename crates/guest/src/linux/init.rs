@@ -149,7 +149,10 @@ fn run(
         let pid = child.id().expect("a running child has a pid");
         let mnt = std::fs::File::open(format!("/proc/{pid}/ns/mnt")).map_err(io("the workload's mount namespace"))?;
         let ctx = Arc::new(Ctx::new(OwnedFd::from(mnt), pid as libc::pid_t));
-        let listener = AsyncFd::new(listener).map_err(io("registering the agent"))?;
+        // SAFETY: `listener` is the vsock socket just bound, owned by the
+        // AsyncFd until it drops, so the fd stays open and the same.
+        let listener =
+            unsafe { AsyncFd::register(listener) }.map_err(|e| io("registering the agent")(e.into()))?;
         life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
         let _ = std::io::stdout().flush();
         // From here the lifecycle channel carries the entrypoint's output

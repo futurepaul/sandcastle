@@ -12,7 +12,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
-rustls-pki-types = { version = "=1.15.1", features = ["std"] }
+rustls-pki-types = { version = "=1.16.0", features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

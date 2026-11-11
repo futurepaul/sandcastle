@@ -18,7 +18,7 @@
 //! platform keeps the nonces it took inside the window (`DialBook`), so a
 //! recorded dial is refused when it comes again.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 pub const HEADER: &str = "x-sandcastle-auth";
@@ -76,7 +76,7 @@ impl Secret {
     }
 
     fn mac(&self) -> Hmac<Sha256> {
-        <Hmac<Sha256> as Mac>::new_from_slice(&self.0).expect("HMAC takes a key of any length")
+        <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0).expect("HMAC takes a key of any length")
     }
 
     /// `canonical`'s signature, hex.

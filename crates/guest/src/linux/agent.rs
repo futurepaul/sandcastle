@@ -346,7 +346,10 @@ async fn run_exec(
     };
     let (master, stdios) = match pty {
         Some(w) => match exec::openpty(w.rows, w.cols) {
-            Ok((m, s)) => (Some(Arc::new(AsyncFd::new(m)?)), Stdios::Pty(s)),
+            // SAFETY: `m` is the pty master openpty just made, an OwnedFd
+            // the AsyncFd owns until it drops, so the fd stays open and
+            // the same for its whole life.
+            Ok((m, s)) => (Some(Arc::new(unsafe { AsyncFd::register(m) }.map_err(std::io::Error::from)?)), Stdios::Pty(s)),
             Err(e) => return send(&mut wr, &Reply::error(ErrorKind::Io, format!("openpty: {e}"))).await,
         },
         None => (None, Stdios::Pipes { stdin: stdin_wanted, stdout, stderr }),

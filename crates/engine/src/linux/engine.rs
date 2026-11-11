@@ -992,7 +992,9 @@ impl Engine {
         if fd >= 0 {
             // SAFETY: a fresh descriptor we own.
             let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
-            if let Ok(afd) = tokio::io::unix::AsyncFd::new(fd) {
+            // SAFETY: `fd` is the OwnedFd above, moved into the AsyncFd,
+            // which holds it open and unchanged until it drops.
+            if let Ok(afd) = unsafe { tokio::io::unix::AsyncFd::register(fd) } {
                 let _ = afd.readable().await;
             }
         }
