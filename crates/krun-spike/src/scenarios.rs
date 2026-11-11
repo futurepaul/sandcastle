@@ -17,7 +17,7 @@ use crate::layout::Layout;
 use crate::node::{agent_err, engine_err, start, with_data, Ctr, Node};
 use crate::{stats, Error};
 
-pub const BUSYBOX: &str = "busybox:1.37.0";
+pub const BUSYBOX: &str = "busybox:1.38.0";
 pub const ECHO_SERVER: &str = "jmalloc/echo-server:v0.3.7";
 pub const SLEEP_FOREVER: &[&str] = &["/bin/sh", "-c", "while :; do sleep 3600; done"];
 
@@ -94,8 +94,8 @@ fn versions(layout: &Layout) -> Value {
         std::fs::read(&p).map(|b| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&b))[..16].to_string()).unwrap_or_default()
     };
     json!({
-        "libkrun": "b63baa1895c60d58b731fdebb9180ba266292848",
-        "libkrunfw": "f6a710faaa8cfe3b67a4bcdadb082c2183a914f1 (5.6.2, linux 6.12.109)",
+        "libkrun": "c9327bda52ee0c93d803ee12f409fc6b52c52fab",
+        "libkrunfw": "a9320d977080d548bca059ac8883b4acfb13ba61 (5.6.3, linux 6.12.115)",
         "guest_sha256_16": sha(layout.bin("sandcastle-guest")),
         "runner_sha256_16": sha(layout.bin("sandcastle-vm")),
         "engine_sha256_16": sha(layout.bin("sandcastle-engine")),

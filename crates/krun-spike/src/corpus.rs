@@ -16,11 +16,11 @@ use crate::Error;
 
 /// Image, the check run in it, and what its output must hold.
 const SHELLS: &[(&str, &str, &str)] = &[
-    ("alpine:3.20", "cat /etc/alpine-release; id -u", "3.20"),
-    ("debian:bookworm-slim", ". /etc/os-release; echo $ID $VERSION_ID; apt-get --version | head -1", "debian 12"),
-    ("ubuntu:24.04", ". /etc/os-release; echo $ID $VERSION_ID; dpkg --version | head -1", "ubuntu 24.04"),
-    ("python:3.12-slim", "python3 -c 'import sys, ssl, sqlite3; print(sys.version_info[:2])'", "(3, 12)"),
-    ("node:22-slim", "node -e 'console.log(process.version)'", "v22."),
+    ("alpine:3.24", "cat /etc/alpine-release; id -u", "3.24"),
+    ("debian:trixie-slim", ". /etc/os-release; echo $ID $VERSION_ID; apt-get --version | head -1", "debian 13"),
+    ("ubuntu:26.04", ". /etc/os-release; echo $ID $VERSION_ID; dpkg --version | head -1", "ubuntu 26.04"),
+    ("python:3.14-slim", "python3 -c 'import sys, ssl, sqlite3; print(sys.version_info[:2])'", "(3, 14)"),
+    ("node:24-slim", "node -e 'console.log(process.version)'", "v24."),
 ];
 
 pub const SANDBOX_ON_NODE: &str = "sandbox-shim-on-node:test";
@@ -53,7 +53,7 @@ pub fn scenario(node: &Node) -> Result<Value, Error> {
     }
 
     // nginx on its own entrypoint, serving its port.
-    let image = "nginx:1.27-alpine";
+    let image = "nginx:1.31-alpine";
     node.block(node.client.pull(image)).map_err(engine_err)?;
     let c = node.start("corpus", &start(image, &[]))?;
     let page = http_get(&c, 80, "/")?;
