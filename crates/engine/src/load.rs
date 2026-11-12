@@ -59,6 +59,15 @@ pub fn manifest(bytes: &[u8]) -> Result<SavedImage, LoadError> {
     Ok(img)
 }
 
+/// For each layer a manifest names, the index of the same layer named
+/// earlier in it, if any. Docker lists a layer once per build step that
+/// made it, so two steps whose diffs are identical (an empty `mkdir` twice,
+/// say) name one blob twice; the tar holds it once, and it is hashed and
+/// stored once, then applied at each place it is named.
+pub fn repeats(layers: &[String]) -> Vec<Option<usize>> {
+    layers.iter().enumerate().map(|(i, l)| layers[..i].iter().position(|e| e == l)).collect()
+}
+
 /// A layer's media type, from its first bytes.
 pub fn media_type(head: &[u8]) -> &'static str {
     if head.starts_with(&[0x1f, 0x8b]) {
@@ -125,6 +134,16 @@ mod tests {
         assert!(manifest(two.as_bytes()).is_err());
         assert!(manifest(br#"[{"Config":"../x","Layers":["a"]}]"#).is_err());
         assert!(manifest(format!(r#"[{{"Config":"blobs/sha256/{H}","Layers":[]}}]"#).as_bytes()).is_err());
+    }
+
+    // Goal: a layer named twice is found as a repeat of its first naming,
+    // and every other layer as its own.
+    #[test]
+    fn a_layer_named_twice_is_one_layer() {
+        let named = |l: &[&str]| repeats(&l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(named(&["a", "b", "c"]), vec![None, None, None]);
+        assert_eq!(named(&["a", "b", "a", "c", "b", "a"]), vec![None, None, Some(0), None, Some(1), Some(0)]);
+        assert_eq!(named(&[]), Vec::<Option<usize>>::new());
     }
 
     #[test]

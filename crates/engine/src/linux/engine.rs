@@ -529,9 +529,16 @@ impl Engine {
         let config_digest = sandcastle_rootfs::Digest::of(&config_bytes);
         let blobs_dir = self.config.blobs().join("sha256");
         std::fs::create_dir_all(&blobs_dir).map_err(internal("the blob store"))?;
-        let mut layers = Vec::new();
-        let mut blobs = Vec::new();
-        for l in &saved.layers {
+        let mut layers: Vec<sandcastle_rootfs::Descriptor> = Vec::new();
+        let mut blobs: Vec<PathBuf> = Vec::new();
+        // a layer named again was hashed and stored at its first naming
+        // (its file moved into the blob store), and is applied again here
+        for (l, first) in saved.layers.iter().zip(crate::load::repeats(&saved.layers)) {
+            if let Some(i) = first {
+                layers.push(layers[i].clone());
+                blobs.push(blobs[i].clone());
+                continue;
+            }
             let p = dir.join(l);
             let (digest, size, head) = tokio::task::spawn_blocking(move || -> std::io::Result<(sandcastle_rootfs::Digest, u64, Vec<u8>)> {
                 let mut f = std::fs::File::open(&p)?;
