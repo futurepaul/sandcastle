@@ -47,6 +47,16 @@ fn refused(e: auth::AuthError) -> Response<Body> {
     http::error(401, "unauthorized", &e.to_string())
 }
 
+/// The guest's own path in a guest port's call
+/// (`/v1/containers/{name}/ports/{port}{path}`), as the platform sent it:
+/// a trailing slash kept (`/simplex/` is not `/simplex`), and `/` for none.
+fn port_path(path: &str) -> String {
+    match path.trim_start_matches('/').splitn(6, '/').nth(5) {
+        Some(rest) => format!("/{rest}"),
+        None => "/".to_string(),
+    }
+}
+
 pub async fn route(node: Arc<Node>, req: Request<Incoming>) -> Response<Body> {
     let path = path_of(&req);
     let segments: Vec<String> = req.uri().path().trim_matches('/').split('/').map(str::to_string).collect();
@@ -59,7 +69,7 @@ pub async fn route(node: Arc<Node>, req: Request<Incoming>) -> Response<Body> {
             return refused(e);
         }
         let Ok(port) = port.parse::<u16>() else { return http::error(400, "invalid", "a port is 1 to 65535") };
-        let rest = format!("/{}", p[5..].join("/"));
+        let rest = port_path(req.uri().path());
         let rest = match req.uri().query() {
             Some(q) => format!("{rest}?{q}"),
             None => rest,
@@ -331,5 +341,22 @@ pub async fn serve(node: Arc<Node>, listener: tokio::net::TcpListener) {
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(s), svc).with_upgrades().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_path;
+
+    // Goal: a guest port's path reaches the guest as the platform sent it,
+    // its trailing slash and inner slashes kept (fragment's SimpleX link
+    // page is `/simplex/`, and `/simplex` is another route there).
+    #[test]
+    fn a_guest_ports_path_is_kept_as_sent() {
+        assert_eq!(port_path("/v1/containers/computer:00aa/ports/6080/simplex/"), "/simplex/");
+        assert_eq!(port_path("/v1/containers/c/ports/6080/simplex"), "/simplex");
+        assert_eq!(port_path("/v1/containers/c/ports/6080/a//b/"), "/a//b/");
+        assert_eq!(port_path("/v1/containers/c/ports/6080/"), "/");
+        assert_eq!(port_path("/v1/containers/c/ports/6080"), "/");
     }
 }
