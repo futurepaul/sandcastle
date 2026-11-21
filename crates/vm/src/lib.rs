@@ -19,6 +19,8 @@ pub mod paths {
     pub const AGENT_SOCK: &str = "agent.sock";
     /// A Nitro guest's attested session, relayed to its vsock port 1026.
     pub const SESSION_SOCK: &str = "session.sock";
+    /// A Nitro guest's egress sessions, from the runner to the engine.
+    pub const SESSION_EGRESS_SOCK: &str = "egress-session.sock";
     pub const LIFECYCLE_SOCK: &str = "lifecycle.sock";
     pub const CONTROL_SOCK: &str = "control.sock";
     pub const CONSOLE_LOG: &str = "console.log";

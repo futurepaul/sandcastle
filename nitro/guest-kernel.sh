@@ -18,7 +18,9 @@
 #    block device allowed (FPAC's daemon holds its loop device open for
 #    writing while ext4 is mounted on it; Firecracker's CI config turns this
 #    off), dm-crypt with AES-XTS (the sealed scratch disk: a key the guest
-#    makes at boot and never shows; the CPU's AES instructions for it), and
+#    makes at boot and never shows; the CPU's AES instructions for it),
+#    nftables' redirect and a dummy device (the guest catches its own
+#    workload's connections for egress inside the boundary), and
 #    nothing built as a module, since the guest boots from an initrd with
 #    no module tree.
 #
@@ -80,6 +82,10 @@ CONFIG_BLK_DEV_INITRD=y
 CONFIG_DM_CRYPT=y
 CONFIG_CRYPTO_XTS=y
 CONFIG_CRYPTO_AES=y
+CONFIG_NFT_REDIR=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NF_TABLES_IPV6=y
+CONFIG_DUMMY=y
 CONFIG_MODULES=n
 EOF
 # The CPU's AES for dm-crypt, by architecture (a symbol of another one

@@ -137,6 +137,20 @@ pub fn serve_agent(listener: UnixListener, vsock: std::path::PathBuf) {
     serve_port(listener, vsock, sandcastle_wire::PORT_AGENT)
 }
 
+/// Relays each of the guest's dials to a host port to `to`, a unix socket
+/// of the engine's: its egress sessions, on a node of sessions.
+pub fn serve_out(listener: UnixListener, to: std::path::PathBuf) {
+    // Unbounded by design: the socket serves for the VM's life.
+    for conn in listener.incoming() {
+        let Ok(guest) = conn else { continue };
+        let to = to.clone();
+        let _ = std::thread::Builder::new().name("egress-relay".into()).spawn(move || {
+            let Ok(engine) = UnixStream::connect(&to) else { return };
+            splice(guest, engine);
+        });
+    }
+}
+
 /// The same for any of the guest's vsock ports (its attested session's).
 pub fn serve_port(listener: UnixListener, vsock: std::path::PathBuf, port: u32) {
     // Unbounded by design: the agent socket serves for the VM's life.

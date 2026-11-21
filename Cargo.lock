@@ -1064,14 +1064,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-forward"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sandcastle-wire",
+]
+
+[[package]]
 name = "sandcastle-guest"
 version = "0.1.0"
 dependencies = [
  "flate2",
  "libc",
  "ruzstd",
+ "sandcastle-forward",
  "sandcastle-session",
  "sandcastle-wire",
+ "serde",
  "serde_json",
  "tar",
  "thiserror",
@@ -1179,6 +1189,7 @@ name = "sandcastle-vm"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sandcastle-forward",
  "sandcastle-wire",
  "serde",
  "serde_json",

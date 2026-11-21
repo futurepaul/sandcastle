@@ -64,6 +64,27 @@ impl Lifecycle {
 
 /// Opened sessions waiting for the agent at once.
 const SESSIONS_QUEUE: usize = 16;
+/// How long a guest of attested sessions waits for its home's claim.
+const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a home's claim tells its guest (`sandcastle_session`).
+#[derive(serde::Deserialize)]
+struct HomeConfig {
+    /// The home's CA, the one the workload trusts for intercepted hosts.
+    #[serde(default)]
+    ca_pem: Option<String>,
+    /// The workload's connections and lookups go to the home over egress
+    /// sessions (`super::egress`).
+    #[serde(default)]
+    egress: bool,
+}
+
+fn write_ca(ca: &str) -> Result<(), InitError> {
+    let at = format!("{}/{}", mounts::ROOT, mounts::CA_PATH);
+    let dir = std::path::Path::new(&at).parent().expect("a file path").to_str().expect("utf-8");
+    sys::mkdir_p(dir).map_err(io("mkdir the CA's directory"))?;
+    std::fs::write(&at, ca).map_err(io("writing the CA"))
+}
 
 /// The longest the guest waits for its last event to be recorded.
 const RECORDED_WAIT_MS: u64 = 2000;
@@ -168,11 +189,10 @@ fn run(
     if let Some(path) = data {
         sys::mount(&mounts::data(path.as_deref())).map_err(io("mounting the data disk"))?;
     }
-    if let Some(ca) = ca_pem {
-        let at = format!("{}/{}", mounts::ROOT, mounts::CA_PATH);
-        let dir = std::path::Path::new(&at).parent().expect("a file path").to_str().expect("utf-8");
-        sys::mkdir_p(dir).map_err(io("mkdir the CA's directory"))?;
-        std::fs::write(&at, ca).map_err(io("writing the CA"))?;
+    // A guest of attested sessions trusts its home's CA alone, from the
+    // claim (below); the parent's start message names none it heeds.
+    if let Some(ca) = ca_pem.filter(|_| !doors.session) {
+        write_ca(&ca)?;
     }
     super::net::loopback_up().map_err(io("bringing up lo"))?;
     if let Some(n) = &net {
@@ -196,13 +216,26 @@ fn run(
         if !sealed {
             return Err(InitError::Refused("the kernel line requires an attested session, and this guest has no NSM".into()));
         }
-        let guest = sandcastle_session::Guest::new().map_err(|e| InitError::Refused(format!("the session's key: {e}")))?;
+        let guest = Arc::new(sandcastle_session::Guest::new().map_err(|e| InitError::Refused(format!("the session's key: {e}")))?);
         let (tx, rx) = tokio::sync::mpsc::channel(SESSIONS_QUEUE);
-        super::session::listen(std::sync::Arc::new(guest), tx).map_err(io("listening for sessions"))?;
+        super::session::listen(guest.clone(), tx).map_err(io("listening for sessions"))?;
+        // Ready before the workload: the engine says running, the home
+        // claims this guest, and its configuration comes with the claim.
+        // The workload starts once it has.
+        life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
+        let config = guest.wait_claimed(CLAIM_WAIT).ok_or_else(|| InitError::Refused(format!("no home claimed this computer within {} s", CLAIM_WAIT.as_secs())))?;
+        let home: HomeConfig = serde_json::from_slice(&config).map_err(|e| InitError::Refused(format!("the home's configuration: {e}")))?;
+        if let Some(ca) = &home.ca_pem {
+            write_ca(ca)?;
+        }
+        if home.egress {
+            super::egress::start(guest.clone()).map_err(io("egress inside the boundary"))?;
+        }
         Some(rx)
     } else {
         None
     };
+    let ready_sent = sessions.is_some();
     // Every process this thread forks from now on is in the workload's PID
     // namespace; the first, the entrypoint, is its PID 1. The runtime runs
     // on this thread alone, so every fork is from here.
@@ -217,7 +250,9 @@ fn run(
         // AsyncFd until it drops, so the fd stays open and the same.
         let listener =
             unsafe { AsyncFd::register(listener) }.map_err(|e| io("registering the agent")(e.into()))?;
-        life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
+        if !ready_sent {
+            life.send(&Event::Ready { uptime_ms: sys::uptime_ms() })?;
+        }
         let _ = std::io::stdout().flush();
         // From here the lifecycle channel carries the entrypoint's output
         // too, so one task writes it all, in order.

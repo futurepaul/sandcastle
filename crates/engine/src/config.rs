@@ -65,6 +65,10 @@ pub struct NitroConfig {
     /// (`nitro/guest-mke2fs.sh`); it goes into the measured initrd.
     #[serde(default = "nitro_mke2fs")]
     pub mke2fs: String,
+    /// The static nft a guest loads its egress rules with
+    /// (`nitro/guest-nft.sh`); it goes into the measured initrd too.
+    #[serde(default = "nitro_nft")]
+    pub nft: String,
     /// The parent cannot read a computer's memory. Direct mode is for
     /// tests only, and an image's build always uses it (no secret yet).
     #[serde(default = "yes")]
@@ -78,6 +82,12 @@ pub struct NitroConfig {
     /// home's. Off, the engine drives its guests itself, as a test node's.
     #[serde(default)]
     pub session_required: bool,
+    /// Where a node of sessions hands each guest's egress session on: the
+    /// path the bridge's parent half listens on for its home
+    /// (`sandcastle-bridge parent --egress`). None, a guest's egress sessions
+    /// have nowhere to go.
+    #[serde(default)]
+    pub session_egress: Option<PathBuf>,
 }
 
 fn firecracker() -> String {
@@ -90,6 +100,10 @@ fn nitro_kernel() -> String {
 
 fn nitro_mke2fs() -> String {
     "nitro-mke2fs".into()
+}
+
+fn nitro_nft() -> String {
+    "nitro-nft".into()
 }
 
 /// Debian's: the multiarch directory, and the interpreter where it lies
@@ -140,7 +154,7 @@ impl EngineConfig {
             return Err(ConfigError("memory_mib_max: above 0".into()));
         }
         if let Some(n) = &self.nitro {
-            for (name, f) in [("nitro.firecracker", &n.firecracker), ("nitro.kernel", &n.kernel), ("nitro.mke2fs", &n.mke2fs)] {
+            for (name, f) in [("nitro.firecracker", &n.firecracker), ("nitro.kernel", &n.kernel), ("nitro.mke2fs", &n.mke2fs), ("nitro.nft", &n.nft)] {
                 if f.is_empty() || f.contains('/') || f == "." || f == ".." {
                     return Err(ConfigError(format!("{name}: a file name in lib_dir")));
                 }
@@ -246,7 +260,7 @@ pub(crate) mod tests {
         assert!(bad(&|c| c.state_dir = "/".into()));
         assert!(bad(&|c| c.vms_max = 0));
         assert!(bad(&|c| c.uid_base = 1000));
-        let n = |firecracker: &str, kernel: &str, mke2fs: &str| Some(NitroConfig { firecracker: firecracker.into(), kernel: kernel.into(), mke2fs: mke2fs.into(), confidential: true, cpu_overcommit: false, session_required: false });
+        let n = |firecracker: &str, kernel: &str, mke2fs: &str| Some(NitroConfig { firecracker: firecracker.into(), kernel: kernel.into(), mke2fs: mke2fs.into(), nft: "nitro-nft".into(), confidential: true, cpu_overcommit: false, session_required: false, session_egress: None });
         assert!(bad(&|c| c.nitro = n("../firecracker", "k", "m")));
         assert!(bad(&|c| c.nitro = n("firecracker", "", "m")));
         assert!(bad(&|c| c.nitro = n("firecracker", "k", "/usr/sbin/mke2fs")));
@@ -255,7 +269,7 @@ pub(crate) mod tests {
         let krun: EngineConfig = serde_json::from_str(&serde_json::to_string(&config()).unwrap()).unwrap();
         assert_eq!(krun.nitro, None);
         let n: NitroConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!((n.firecracker.as_str(), n.kernel.as_str(), n.mke2fs.as_str(), n.confidential, n.cpu_overcommit), ("firecracker", "nitro-kernel", "nitro-mke2fs", true, false));
+        assert_eq!((n.firecracker.as_str(), n.kernel.as_str(), n.mke2fs.as_str(), n.nft.as_str(), n.confidential, n.cpu_overcommit), ("firecracker", "nitro-kernel", "nitro-mke2fs", "nitro-nft", true, false));
         assert!(bad(&|c| c.client_uid = 300_001));
         assert!(bad(&|c| c.client_uid = 0));
         assert!(bad(&|c| c.state_dir = format!("/{}", "a".repeat(100)).into()));

@@ -3,7 +3,7 @@
 # (docs/krun-spike.md, Dependencies).
 [workspace]
 resolver = "2"
-members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/node", "crates/fake-engine", "crates/docker-engine", "crates/docker-relay", "crates/krun-spike", "crates/nitro-attest", "crates/session"]
+members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/node", "crates/fake-engine", "crates/docker-engine", "crates/docker-relay", "crates/krun-spike", "crates/nitro-attest", "crates/session", "crates/forward"]
 
 [workspace.package]
 edition = "2021"
@@ -17,6 +17,7 @@ sandcastle-egress = { path = "crates/egress" }
 sandcastle-engine = { path = "crates/engine" }
 sandcastle-nitro-attest = { path = "crates/nitro-attest" }
 sandcastle-session = { path = "crates/session" }
+sandcastle-forward = { path = "crates/forward" }
 sandcastle-node = { path = "crates/node" }
 sandcastle-fake-engine = { path = "crates/fake-engine" }
 sandcastle-docker-engine = { path = "crates/docker-engine" }

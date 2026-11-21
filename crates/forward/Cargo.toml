@@ -1,0 +1,10 @@
+[package]
+name = "sandcastle-forward"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The forwarder: every TCP connection and DNS query nftables redirects to it, each handed to an egress proxy with where it was going. The runner's, dialing the node's proxy; and a Nitro guest's, dialing its home's over an egress session."
+
+[dependencies]
+sandcastle-wire.workspace = true
+libc.workspace = true

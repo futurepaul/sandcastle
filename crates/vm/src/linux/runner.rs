@@ -185,6 +185,13 @@ fn run_nitro(config: VmConfig, nitro: crate::config::Nitro, events: Events, t0: 
             .name("session".into())
             .spawn(move || super::nitro::serve_port(listener, vsock, sandcastle_wire::PORT_SESSION))
             .map_err(io("spawning the session relay"))?;
+        // The guest's dials to the host's egress port: Firecracker hands each
+        // to `v.sock_1027`, and the engine takes them on to the home.
+        let (listener, engine) = (bind(&config.sock(&format!("{}_{}", paths::NITRO_VSOCK, sandcastle_wire::PORT_EGRESS)))?, config.sock(paths::SESSION_EGRESS_SOCK));
+        std::thread::Builder::new()
+            .name("egress".into())
+            .spawn(move || super::nitro::serve_out(listener, engine))
+            .map_err(io("spawning the egress relay"))?;
     }
     std::thread::Builder::new()
         .name("agent".into())

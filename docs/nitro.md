@@ -27,6 +27,9 @@ The stack, each a draft PR on `node`:
    use; the parent keeps start, stop and kill.
 8. **A guest with no door** (`nitro/home-no-door`): a home's own sandbox
    takes no exec at all and runs only what its measured root names.
+9. **Egress inside the boundary** (`nitro/egress-in-session`): a
+   computer's connections and lookups go to its home over sessions; the
+   parent's proxy sees none of them, and the NIC takes nothing in.
 
 ## The guest
 
@@ -79,8 +82,12 @@ each built the same way every time, because each is measured:
   release (kernel.org's SHA-256), built statically with Alpine's musl
   toolchain in an image pinned by digest. The guest formats its sealed
   scratch disk with it (below).
-- **The initrd**: the engine makes it at open from its `guest` binary and
-  that mke2fs, as it makes the boot disk for libkrun: a newc archive with
+- **The guest's nft** (`nitro/guest-nft.sh`): libmnl, libnftnl and
+  nftables at pinned releases (their tarballs' SHA-256, as downloaded:
+  netfilter.org signs with GPG, not checked here), built statically the
+  same way. A guest of sessions loads its egress rules with it (below).
+- **The initrd**: the engine makes it at open from its `guest` binary,
+  that mke2fs and that nft, as it makes the boot disk for libkrun: a newc archive with
   every owner, mode and time fixed (`sandcastle_rootfs::initrd`), so the
   same inputs make the same bytes.
 
@@ -269,6 +276,33 @@ own. A debug image is another one, with another PCR0, so it can never get
 the production home's keys. A word for a session and one for no door at
 all refuse the boot together.
 
+## Egress inside the boundary
+
+On a node of sessions, a computer's connections and lookups never reach
+the parent's egress proxy:
+
+- **The claim** carries the home's configuration: its CA (the one the
+  workload trusts for intercepted hosts; the parent's CA in the start
+  message is not written) and egress on. The guest says Ready, waits for
+  it, and starts its workload only then.
+- **The guest catches its own traffic**: nftables in the guest (the
+  kernel's inet family, `/nft` from the initrd) redirects every TCP
+  connection the workload makes to anywhere but the guest, and every DNS
+  query, to the forwarder (`crates/forward`, the runner's own, now
+  shared); nothing else leaves, and nothing comes in but on loopback. The
+  NIC still exists and carries nothing.
+- **Each one is an egress session**: the guest dials the host's vsock port
+  1027, names itself by its key, and runs Noise NNpsk0 with the claim's
+  secret, so only its home can answer. The runner hands it to the engine
+  (`egress-session.sock`), the engine to its `nitro.session_egress` path,
+  the bridge's parent half into the home (vsock 5003), all unread.
+- **The home decides**: the home half runs the same egress proxy the
+  engine runs (`sandcastle_egress`), one per computer, from the policy its
+  start named (the home reads the start and the intercepts' changes as it
+  forwards them): intercepted hosts to celld's socket in the home, the
+  internet from the home, refusals. The CA's key is made once in the
+  home's state directory and never leaves it.
+
 ## What the parent can still see and do
 
 A confidential sandbox keeps its memory from the parent. Everything that
@@ -277,21 +311,17 @@ computer:
 
 **It sees:**
 
-1. **Intercepted traffic, in plain text.** The egress proxy runs in the
-   engine, on the parent, and terminates TLS for every intercepted host
-   with the node's CA. On a Fragment node those are the platform's API,
-   the model routes and the saves (`backups.sandbox.internal`): the
-   agent's conversations, its tool calls and its saved files all pass
-   through it. Hosts that are not intercepted are spliced, so the parent
-   sees their names and sizes but not their contents.
+1. **A computer's traffic**, on a node of sessions with egress inside the
+   boundary (above): ciphertext of egress sessions, not even where each
+   goes. Elsewhere, the egress proxy runs in the engine and terminates TLS
+   for every intercepted host: on a Fragment node the platform's API, the
+   model routes and the saves, in plain text.
 2. **Exec and terminals** go over each computer's attested session on a
    node that requires them (above): the parent carries ciphertext. On a
    node that does not, `agent.sock` is relayed in the clear.
 3. **Ports.** A home's connection to a computer's port goes over its
-   session. But the computer's NIC still takes connections from the
-   parent: the engine's own `ports.sock` reaches its ports over TCP, in
-   the clear (shown in `session.md`). Closed when the computer's egress
-   moves inside the boundary and its NIC goes.
+   session. With egress inside the boundary the guest takes nothing in on
+   its NIC, so the parent's own `ports.sock` reaches no port (`egress.md`).
 4. **Disks.** The scratch disk is ciphertext (above, "The sealed scratch
    disk"); the parent sees which blocks are written and when, not what.
    The image is protected for integrity only (dm-verity): its contents are
@@ -315,10 +345,11 @@ computer:
 9. **Stop, refuse or slow anything** (availability is never protected).
 
 **What is closed, and what is left:** the attested session closes 6 and
-8, and 2 and 7 for exec. 4 is closed for the scratch disk by a key the
-guest makes and keeps. Left: 1 (intercepted traffic through the parent's
-proxy) and 3 for the NIC; both go when the computer's egress moves into
-the session.
+8, and 2 and 7 for exec; egress inside the boundary closes 1 and 3. 4 is
+closed for the scratch disk by a key the guest makes and keeps. Left: 5
+(metadata: when computers start and stop, their sizes, the timing and size
+of their sessions), 7 for scrambled disk blocks, 9, and that a pin is read
+from a node's own build.
 
 ## Evidence
 
@@ -335,6 +366,9 @@ this engine in Nitro mode, every sandbox confidential.
   build VM applying its five layers and ending, then each sandbox's start
   (ready in about 500 ms) and end.
 
+- `egress.md`: egress inside the boundary: a canary the parent's proxy read
+  9 times with the parent deciding, 0 times with the home deciding; the
+  parent's own port connection refused; the suite through the home.
 - `no-door.md`: a guest with no door: the image's own start run in place
   of the parent's, the parent's exec refused, an image without a start
   refused its boot.

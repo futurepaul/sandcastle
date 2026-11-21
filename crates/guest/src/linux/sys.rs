@@ -231,10 +231,12 @@ pub fn leave_initrd_root() -> io::Error {
             mkdir_p(&format!("/newroot/{d}"))?;
         }
         std::fs::copy("/init", "/newroot/init")?;
-        // The sealed scratch disk's formatter (`seal`), where an initrd
-        // carries one.
-        if std::path::Path::new(super::seal::MKE2FS).exists() {
-            std::fs::copy(super::seal::MKE2FS, format!("/newroot{}", super::seal::MKE2FS))?;
+        // The sealed scratch disk's formatter (`seal`) and the egress rules'
+        // loader (`egress`), where an initrd carries them.
+        for tool in [super::seal::MKE2FS, super::egress::NFT] {
+            if std::path::Path::new(tool).exists() {
+                std::fs::copy(tool, format!("/newroot{tool}"))?;
+            }
         }
         let (dot, slash) = (cstr(".")?, cstr("/")?);
         check(unsafe { libc::chdir(dst.as_ptr()) })?;
@@ -272,6 +274,17 @@ struct NsmRaw {
 
 const _: () = assert!(std::mem::size_of::<NsmRaw>() == 32);
 const _: () = assert!(NSM_IOCTL_RAW == (3 << 30) | (32 << 16) | (0x0A << 8));
+
+/// 32 random bytes.
+pub fn random32() -> io::Result<[u8; 32]> {
+    let mut b = [0u8; 32];
+    // SAFETY: getrandom writes at most the buffer's length.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };
+    if n != b.len() as isize {
+        return Err(io::Error::other("getrandom gave too few bytes"));
+    }
+    Ok(b)
+}
 
 /// An attestation document from `/dev/nsm`, for a fresh random nonce.
 pub fn nsm_document() -> io::Result<Vec<u8>> {

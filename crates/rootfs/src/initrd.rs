@@ -22,12 +22,14 @@ const CHAR: u32 = 0o020_000;
 /// An archive's largest file: the guest is a few MiB.
 pub const FILE_BYTES_MAX: usize = 64 << 20;
 
-/// The guest's initrd: `/init`, `/mke2fs`, the mount points the guest
+/// The guest's initrd: `/init`, `/mke2fs` (the sealed scratch disk's),
+/// `/nft` (egress inside the boundary's rules), the mount points the guest
 /// uses, and `/dev/console` so the kernel can open init's console before
 /// devtmpfs.
-pub fn guest(init: &[u8], mke2fs: &[u8]) -> Vec<u8> {
-    assert!(!init.is_empty() && init.len() <= FILE_BYTES_MAX);
-    assert!(!mke2fs.is_empty() && mke2fs.len() <= FILE_BYTES_MAX);
+pub fn guest(init: &[u8], mke2fs: &[u8], nft: &[u8]) -> Vec<u8> {
+    for f in [init, mke2fs, nft] {
+        assert!(!f.is_empty() && f.len() <= FILE_BYTES_MAX);
+    }
     let dir = |path| Entry { path, mode: DIR | 0o755, rdev: (0, 0), data: &[] };
     newc(&[
         dir("dev"),
@@ -38,6 +40,7 @@ pub fn guest(init: &[u8], mke2fs: &[u8]) -> Vec<u8> {
         dir("tmp"),
         Entry { path: "init", mode: FILE | 0o755, rdev: (0, 0), data: init },
         Entry { path: "mke2fs", mode: FILE | 0o755, rdev: (0, 0), data: mke2fs },
+        Entry { path: "nft", mode: FILE | 0o755, rdev: (0, 0), data: nft },
     ])
 }
 
@@ -97,12 +100,13 @@ mod tests {
     // either makes others; both are in it, executable.
     #[test]
     fn reproducible() {
-        let (one, two, mkfs) = (b"\x7fELF one", b"\x7fELF two", b"\x7fELF mke2fs");
-        assert_eq!(guest(one, mkfs), guest(one, mkfs));
-        assert_ne!(guest(one, mkfs), guest(two, mkfs));
-        assert_ne!(guest(one, mkfs), guest(one, b"\x7fELF other"));
-        let a = guest(one, mkfs);
-        for (name, body) in [(&b"init\0"[..], &one[..]), (&b"mke2fs\0"[..], &mkfs[..])] {
+        let (one, two, mkfs, nft) = (b"\x7fELF one", b"\x7fELF two", b"\x7fELF mke2fs", b"\x7fELF nft");
+        assert_eq!(guest(one, mkfs, nft), guest(one, mkfs, nft));
+        assert_ne!(guest(one, mkfs, nft), guest(two, mkfs, nft));
+        assert_ne!(guest(one, mkfs, nft), guest(one, b"\x7fELF other", nft));
+        assert_ne!(guest(one, mkfs, nft), guest(one, mkfs, b"\x7fELF other"));
+        let a = guest(one, mkfs, nft);
+        for (name, body) in [(&b"init\0"[..], &one[..]), (&b"mke2fs\0"[..], &mkfs[..]), (&b"nft\0"[..], &nft[..])] {
             let at = a.windows(name.len()).position(|w| w == name).expect("named");
             let mode = u32::from_str_radix(std::str::from_utf8(&a[at - 110 + 14..at - 110 + 22]).unwrap(), 16).unwrap();
             assert_eq!(mode, FILE | 0o755);

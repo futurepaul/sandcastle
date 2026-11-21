@@ -12,7 +12,9 @@
 //!   is a home on the parent itself: the engine's socket on this host in
 //!   place of the host's over vsock.
 //! - `parent --vsock <uds> --engine <engine.sock> [--ports <ports.sock>]
-//!   [--intercepts <path>] [--owner <uid>:<gid>]`: on the parent. `<uds>`
+//!   [--intercepts <path>] [--egress <path>] [--owner <uid>:<gid>]`: on the
+//!   parent. `--egress` is where the engine hands its computers' egress
+//!   sessions (its `nitro.session_egress`), each carried into the home. `<uds>`
 //!   is the home's Firecracker vsock socket; `--ports` defaults to the one
 //!   beside `--engine`; `--intercepts` is the path celld names as its
 //!   handler, where the engine dials it.
@@ -23,7 +25,7 @@ use std::process::ExitCode;
 fn usage() -> ExitCode {
     eprintln!(
         "usage: sandcastle-bridge home [--dir <dir>] [--intercepts <path>] [--owner <uid>:<gid>] [--sessions <dir> --pins <file>] [--up <engine.sock>]\n       \
-         sandcastle-bridge parent --vsock <uds> --engine <engine.sock> [--ports <ports.sock>] [--intercepts <path>] [--owner <uid>:<gid>]"
+         sandcastle-bridge parent --vsock <uds> --engine <engine.sock> [--ports <ports.sock>] [--intercepts <path>] [--egress <path>] [--owner <uid>:<gid>]"
     );
     ExitCode::from(2)
 }
@@ -50,12 +52,13 @@ fn main() -> ExitCode {
                 _ => return usage(),
             },
             up: flag("--up").map(PathBuf::from),
+            egress_at: flag("--egress").map(PathBuf::from),
         }),
         Some("parent") => {
             let (Some(vsock), Some(engine)) = (flag("--vsock"), flag("--engine")) else { return usage() };
             let engine = PathBuf::from(engine);
             let Some(ports) = flag("--ports").map(PathBuf::from).or_else(|| engine.parent().map(|d| d.join("ports.sock"))) else { return usage() };
-            bridge::parent(bridge::Parent { vsock: vsock.into(), engine, ports, intercepts: flag("--intercepts").map(PathBuf::from), owner })
+            bridge::parent(bridge::Parent { vsock: vsock.into(), engine, ports, intercepts: flag("--intercepts").map(PathBuf::from), owner, egress: flag("--egress").map(PathBuf::from) })
         }
         _ => return usage(),
     };

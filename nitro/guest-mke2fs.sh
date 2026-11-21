@@ -43,7 +43,7 @@ docker run --rm -e "E2FS=$E2FS" -e SOURCE_DATE_EPOCH=0 -v "$OUT:/w" -w /w "$ALPI
     chown "$(stat -c %u:%g /w)" /w/out/mke2fs
     rm -rf /w/src
 '
-file out/mke2fs | grep -q 'statically linked' || { echo "guest-mke2fs: not statically linked" >&2; exit 1; }
+file out/mke2fs | grep -qE 'statically linked|static-pie linked' || { echo "guest-mke2fs: not statically linked" >&2; exit 1; }
 sum=$(sha256sum out/mke2fs | cut -d' ' -f1)
 version=$(out/mke2fs -V 2>&1 | head -1)
 python3 -I - "$E2FS" "$E2FS_SHA256" "$ALPINE" "$sum" "$version" > out/mke2fs.json <<'PY'

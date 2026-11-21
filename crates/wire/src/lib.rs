@@ -28,6 +28,10 @@ pub const PORT_AGENT: u32 = 1024;
 /// A Nitro guest's attested session (`sandcastle_session`): the home's
 /// requests, each a connection, sealed end to end through the parent.
 pub const PORT_SESSION: u32 = 1026;
+/// The host's port a Nitro guest dials for each of its workload's
+/// connections and lookups, carried to its home over an egress session
+/// (docs/nitro.md, "Egress inside the boundary").
+pub const PORT_EGRESS: u32 = 1027;
 /// The kernel-line word by which a Nitro guest takes exec, connections and
 /// the rest of the agent's work only over its attested session. The line
 /// is measured, so the parent cannot drop the word without changing PCR0.

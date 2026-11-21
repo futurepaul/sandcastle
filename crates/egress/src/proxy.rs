@@ -192,7 +192,9 @@ impl Egress {
         }
     }
 
-    async fn connection(self: Arc<Self>, mut s: UnixStream) -> Result<(), ProxyError> {
+    /// One forwarded connection: its header, then what the rules decide. A
+    /// home serving its computers' egress sessions calls it for each.
+    pub async fn connection(self: Arc<Self>, mut s: UnixStream) -> Result<(), ProxyError> {
         let mut h = [0u8; HEADER_BYTES];
         s.read_exact(&mut h).await?;
         let header = Header::decode(&h).map_err(|e| ProxyError::Refused(e.to_string()))?;

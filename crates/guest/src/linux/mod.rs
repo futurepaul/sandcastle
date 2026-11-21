@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod build;
+pub mod egress;
 pub mod exec;
 pub mod init;
 pub mod net;

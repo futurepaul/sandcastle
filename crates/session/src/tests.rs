@@ -50,7 +50,7 @@ fn a_home_attests_once_then_resumes() {
     let (home, carrier) = UnixStream::pair().unwrap();
     let served = serve_one(guest.clone(), carrier);
     let nonce = [7u8; NONCE_BYTES];
-    let (session, credential) = attest(home, nonce, [9u8; KEY_BYTES], verify_for(nonce)).unwrap();
+    let (session, credential) = attest(home, nonce, [9u8; KEY_BYTES], b"{}", verify_for(nonce)).unwrap();
     assert_eq!(credential.guest_key, guest.public_key());
     assert_eq!(round_trip(session, &payload), payload.to_ascii_uppercase());
     served.join().unwrap().unwrap();
@@ -78,20 +78,20 @@ fn a_guest_is_claimed_once() {
 
     let (home, carrier) = UnixStream::pair().unwrap();
     let served = serve_one(guest.clone(), carrier);
-    let refused = attest(home, [2; NONCE_BYTES], [3; KEY_BYTES], |_| Err("PCR0 is no image of ours".to_string()));
+    let refused = attest(home, [2; NONCE_BYTES], [3; KEY_BYTES], b"{}", |_| Err("PCR0 is no image of ours".to_string()));
     assert!(matches!(refused, Err(SessionError::Attestation(m)) if m.contains("PCR0")));
     assert!(served.join().unwrap().is_err());
     assert!(!guest.claimed(), "a refused document claims nothing");
 
     let (home, carrier) = UnixStream::pair().unwrap();
     let served = serve_one(guest.clone(), carrier);
-    let (session, _) = attest(home, [4; NONCE_BYTES], [5; KEY_BYTES], verify_for([4; NONCE_BYTES])).unwrap();
+    let (session, _) = attest(home, [4; NONCE_BYTES], [5; KEY_BYTES], b"{}", verify_for([4; NONCE_BYTES])).unwrap();
     assert_eq!(round_trip(session, b"x"), b"X");
     served.join().unwrap().unwrap();
 
     let (home, carrier) = UnixStream::pair().unwrap();
     let served = serve_one(guest.clone(), carrier);
-    assert!(attest(home, [6; NONCE_BYTES], [7; KEY_BYTES], verify_for([6; NONCE_BYTES])).is_err());
+    assert!(attest(home, [6; NONCE_BYTES], [7; KEY_BYTES], b"{}", verify_for([6; NONCE_BYTES])).is_err());
     assert!(served.join().unwrap().unwrap_err().contains("claimed already"));
 }
 
@@ -103,7 +103,7 @@ fn a_resume_needs_the_secret_and_the_key() {
     let guest = Arc::new(Guest::new().unwrap());
     let (home, carrier) = UnixStream::pair().unwrap();
     let served = serve_one(guest.clone(), carrier);
-    let (session, credential) = attest(home, [1; NONCE_BYTES], [8; KEY_BYTES], verify_for([1; NONCE_BYTES])).unwrap();
+    let (session, credential) = attest(home, [1; NONCE_BYTES], [8; KEY_BYTES], b"{}", verify_for([1; NONCE_BYTES])).unwrap();
     round_trip(session, b"claim");
     served.join().unwrap().unwrap();
 
@@ -141,7 +141,7 @@ fn a_changed_or_cut_session_is_refused() {
             to.write_all(&hello).unwrap();
             for i in 0.. {
                 let Ok(Some(mut frame)) = read_frame(&mut from) else { break };
-                if i == 2 {
+                if i == 3 {
                     if cut {
                         let _ = to.shutdown(std::net::Shutdown::Both);
                         break;
@@ -165,8 +165,9 @@ fn a_changed_or_cut_session_is_refused() {
             }
         });
         let nonce = [3u8; NONCE_BYTES];
-        // Frames: 0 the handshake's, 1 the secret, 2 the data, 3 the end.
-        let (session, _) = attest(home, nonce, [1; KEY_BYTES], verify_for(nonce)).unwrap();
+        // Frames: 0 the handshake's, 1 the secret, 2 the configuration, 3
+        // the data, 4 the end.
+        let (session, _) = attest(home, nonce, [1; KEY_BYTES], b"{}", verify_for(nonce)).unwrap();
         let (_r, mut w) = session.split().unwrap();
         let _ = w.write_all(b"the agent's request");
         let _ = w.end();
@@ -183,10 +184,74 @@ fn a_changed_or_cut_session_is_refused() {
 fn a_bad_hello_is_refused() {
     let hello = Hello { kind: Kind::Resume, nonce: [5; NONCE_BYTES] }.encode();
     assert_eq!(Hello::decode(&hello).unwrap(), Hello { kind: Kind::Resume, nonce: [5; NONCE_BYTES] });
-    for (i, v) in [(0usize, 2u8), (1, 0), (1, 3)] {
+    for (i, v) in [(0usize, 2u8), (1, 0), (1, 4)] {
         let mut b = hello;
         b[i] = v;
         assert!(matches!(Hello::decode(&b), Err(SessionError::Hello)));
     }
     assert!(format!("{:?}", Credential { guest_key: [1; 32], secret: [2; 32] }).contains("<secret>"), "a credential's secret never prints");
+}
+
+/// A claimed guest and its credential.
+fn claimed(config: &[u8]) -> (Arc<Guest>, Credential) {
+    let guest = Arc::new(Guest::new().unwrap());
+    let (home, carrier) = UnixStream::pair().unwrap();
+    let served = serve_one(guest.clone(), carrier);
+    let (session, credential) = attest(home, [1; NONCE_BYTES], [2; KEY_BYTES], config, verify_for([1; NONCE_BYTES])).unwrap();
+    round_trip(session, b"claim");
+    served.join().unwrap().unwrap();
+    (guest, credential)
+}
+
+// Goal: the claim's configuration reaches the guest, which waits for it:
+// none before a claim (the wait ends empty), the home's bytes after.
+#[test]
+fn the_claim_carries_the_homes_configuration() {
+    let unclaimed = Guest::new().unwrap();
+    assert_eq!(unclaimed.wait_claimed(Duration::from_millis(50)), None);
+    let (guest, _) = claimed(br#"{"ca_pem":"a CA","egress":true}"#);
+    assert_eq!(guest.wait_claimed(Duration::from_millis(50)).as_deref(), Some(&br#"{"ca_pem":"a CA","egress":true}"#[..]));
+}
+
+// Goal: a claimed guest's egress connection reaches its home, which finds
+// it by its key and the claim's secret, and carries bytes both ways; an
+// unclaimed guest cannot dial; a home without that secret (the parent)
+// fails the handshake; an egress hello is no attest or resume, and the
+// other kinds are no egress.
+#[test]
+fn a_claimed_guest_dials_its_home() {
+    let (guest, credential) = claimed(b"{}");
+    let (g, h) = UnixStream::pair().unwrap();
+    let home = thread::spawn(move || {
+        let (session, key) = accept_egress(h, |k| (*k == credential.guest_key).then_some(credential.secret)).map_err(|e| e.to_string())?;
+        let mut plain = session.into_plain().map_err(|e| e.to_string())?;
+        let mut got = Vec::new();
+        plain.read_to_end(&mut got).map_err(|e| e.to_string())?;
+        plain.write_all(&got.to_ascii_uppercase()).map_err(|e| e.to_string())?;
+        plain.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+        Ok::<_, String>(key)
+    });
+    let session = guest.dial_egress(g, [3; NONCE_BYTES]).unwrap();
+    assert_eq!(round_trip(session, b"GET / HTTP/1.1"), b"GET / HTTP/1.1".to_ascii_uppercase());
+    assert_eq!(home.join().unwrap().unwrap(), guest.public_key());
+
+    let unclaimed = Guest::new().unwrap();
+    assert!(matches!(unclaimed.dial_egress(UnixStream::pair().unwrap().0, [4; NONCE_BYTES]), Err(SessionError::Unclaimed)));
+
+    let (g, h) = UnixStream::pair().unwrap();
+    let parent = thread::spawn(move || accept_egress(h, |_| Some([0; KEY_BYTES])).is_err());
+    assert!(guest.dial_egress(g, [5; NONCE_BYTES]).is_err());
+    assert!(parent.join().unwrap());
+
+    let (g, h) = UnixStream::pair().unwrap();
+    let unknown = thread::spawn(move || matches!(accept_egress(h, |_| None), Err(SessionError::Unclaimed)));
+    let _ = guest.dial_egress(g, [6; NONCE_BYTES]);
+    assert!(unknown.join().unwrap());
+
+    let (mut g, h) = UnixStream::pair().unwrap();
+    g.write_all(&[Hello { kind: Kind::Resume, nonce: [7; NONCE_BYTES] }.encode().as_slice(), &[0u8; KEY_BYTES]].concat()).unwrap();
+    assert!(matches!(accept_egress(h, |_| Some([0; KEY_BYTES])), Err(SessionError::Hello)));
+    let (mut home, carrier) = UnixStream::pair().unwrap();
+    home.write_all(&Hello { kind: Kind::Egress, nonce: [8; NONCE_BYTES] }.encode()).unwrap();
+    assert!(matches!(guest.accept(carrier, document_for(&guest)), Err(SessionError::Hello)));
 }

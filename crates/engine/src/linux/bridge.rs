@@ -42,6 +42,8 @@ use crate::ports::{self, recv_with_fd, send_with_fd, REPLY_BYTES_MAX, REQUEST_BY
 pub const PORT_ENGINE: u32 = 5000;
 pub const PORT_PORTS: u32 = 5001;
 pub const PORT_INTERCEPTS: u32 = 5002;
+/// The home's port for its computers' egress sessions (parent → home).
+pub const PORT_EGRESS: u32 = 5003;
 /// The host's CID, as every guest sees it.
 pub const CID_HOST: u32 = libc::VMADDR_CID_HOST;
 /// Live connections per listener; one past them is closed at once.
@@ -73,6 +75,9 @@ pub struct Home {
     /// The engine's `engine.sock` on this host, in place of the host's over
     /// vsock: a home on the parent itself (and `ports.sock` beside it).
     pub up: Option<PathBuf>,
+    /// Where a home on the parent itself takes its computers' egress
+    /// sessions (the engine's `nitro.session_egress`), in place of vsock 5003.
+    pub egress_at: Option<PathBuf>,
 }
 
 /// The parent's half.
@@ -89,6 +94,9 @@ pub struct Parent {
     /// The `<uds>_<port>` sockets' owner, when Firecracker runs as another
     /// user.
     pub owner: Option<(u32, u32)>,
+    /// Where the engine hands its computers' egress sessions
+    /// (`NitroConfig::session_egress`), each carried into the home.
+    pub egress: Option<PathBuf>,
 }
 
 /// Serves the home's half until the process ends.
@@ -134,7 +142,19 @@ pub fn home(h: Home) -> io::Result<()> {
                 eprintln!("sandcastle-bridge: engine: {e}");
             }
         })?;
+        let for_egress = sessions.clone();
         serving("ports", &tx, move || accept_unix(&ports_l), move |c| super::home::port(c, &sessions))?;
+        // The computers' egress sessions, from the parent's engine.
+        match &h.egress_at {
+            Some(at) => {
+                let l = bind_unix(at, None, 0o600)?;
+                serving("egress", &tx, move || accept_unix(&l), move |c| for_egress.egress_connection(c))?;
+            }
+            None => {
+                let l = vsock_listen(PORT_EGRESS)?;
+                serving("egress", &tx, move || vsock_accept(&l), move |c| for_egress.egress_connection(c))?;
+            }
+        }
     } else {
         serving("engine", &tx, move || accept_unix(&engine), move |c| {
             splice(c, up_engine()?);
@@ -184,8 +204,20 @@ pub fn parent(p: Parent) -> io::Result<()> {
     })?;
     serving("ports", &tx, move || accept_unix(&ports_l), move |c| parent_port(c, &ports_sock))?;
     if let Some(l) = intercepts {
+        let vsock = vsock.clone();
         serving("intercepts", &tx, move || accept_unix(&l), move |c| {
             splice(c, connect_port(&vsock, PORT_INTERCEPTS)?);
+            Ok(())
+        })?;
+    }
+    if let Some(at) = &p.egress {
+        if let Some(dir) = at.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Only the engine (root) dials it.
+        let l = bind_unix(at, None, 0o600)?;
+        serving("egress", &tx, move || accept_unix(&l), move |c| {
+            splice(c, connect_port(&vsock, PORT_EGRESS)?);
             Ok(())
         })?;
     }

@@ -19,6 +19,12 @@
 //!    that VM.
 //! 3. **Resume**, every later connection: Noise NKpsk0 to the same key with
 //!    that secret, which only the home that claimed the guest has.
+//! 4. **Egress**, the other way: the guest dials its home for each of its
+//!    workload's connections, the hello followed by the guest's key (which
+//!    names it to the home), then Noise NNpsk0 with the claim's secret. The
+//!    claim's second message is the home's configuration for the guest
+//!    (its CA, its egress), which the guest waits for before its workload
+//!    starts (`Guest::wait_claimed`).
 //!
 //! Then each direction is Noise transport messages, each framed by a
 //! two-byte length. An empty message ends a direction (a half-close); a
@@ -47,6 +53,11 @@ pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
 
 const ATTEST: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const RESUME: &str = "Noise_NKpsk0_25519_ChaChaPoly_SHA256";
+const EGRESS: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+/// An egress hello: the hello, then the guest's key.
+pub const EGRESS_HELLO_BYTES: usize = HELLO_BYTES + KEY_BYTES;
+/// The home's configuration for a guest, at most.
+pub const CONFIG_BYTES_MAX: usize = CHUNK_BYTES_MAX;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -76,6 +87,7 @@ fn noise(e: snow::Error) -> SessionError {
 pub enum Kind {
     Attest = 1,
     Resume = 2,
+    Egress = 3,
 }
 
 /// The connection's opening, in the clear.
@@ -98,6 +110,7 @@ impl Hello {
         let kind = match (b[0], b[1]) {
             (VERSION, 1) => Kind::Attest,
             (VERSION, 2) => Kind::Resume,
+            (VERSION, 3) => Kind::Egress,
             _ => return Err(SessionError::Hello),
         };
         Ok(Hello { kind, nonce: b[2..].try_into().expect("32 bytes") })
@@ -138,6 +151,9 @@ pub struct Guest {
     private: Vec<u8>,
     public: [u8; KEY_BYTES],
     state: Mutex<Claim>,
+    /// The claim's configuration, and its arrival.
+    config: Mutex<Option<Vec<u8>>>,
+    claimed: std::sync::Condvar,
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +169,7 @@ impl Guest {
     pub fn new() -> Result<Guest, SessionError> {
         let keys = snow::Builder::new(ATTEST.parse().map_err(noise)?).generate_keypair().map_err(noise)?;
         let public: [u8; KEY_BYTES] = keys.public.as_slice().try_into().map_err(|_| SessionError::Key("not 32 bytes"))?;
-        Ok(Guest { private: keys.private, public, state: Mutex::new(Claim::Open) })
+        Ok(Guest { private: keys.private, public, state: Mutex::new(Claim::Open), config: Mutex::new(None), claimed: std::sync::Condvar::new() })
     }
 
     /// The key a document binds (its `public_key`).
@@ -165,6 +181,38 @@ impl Guest {
         matches!(*self.state.lock().expect("never poisoned"), Claim::Claimed(_))
     }
 
+    /// Waits until a home claims this guest, at most `wait`: the home's
+    /// configuration, or `None` when none came in time.
+    pub fn wait_claimed(&self, wait: Duration) -> Option<Vec<u8>> {
+        let config = self.config.lock().expect("never poisoned");
+        let (config, _) = self.claimed.wait_timeout_while(config, wait, |c| c.is_none()).expect("never poisoned");
+        config.clone()
+    }
+
+    /// One egress connection to the home that claimed this guest: the
+    /// hello (its nonce the caller's) and this guest's key, then Noise
+    /// NNpsk0 with the claim's secret, which the parent never saw.
+    pub fn dial_egress(&self, mut s: UnixStream, nonce: [u8; NONCE_BYTES]) -> Result<Session, SessionError> {
+        let Claim::Claimed(secret) = *self.state.lock().expect("never poisoned") else {
+            return Err(SessionError::Unclaimed);
+        };
+        s.set_read_timeout(Some(HANDSHAKE_WAIT))?;
+        let mut hello = Vec::with_capacity(EGRESS_HELLO_BYTES);
+        hello.extend_from_slice(&Hello { kind: Kind::Egress, nonce }.encode());
+        hello.extend_from_slice(&self.public);
+        s.write_all(&hello)?;
+        let hs = snow::Builder::new(EGRESS.parse().map_err(noise)?)
+            .psk(0, &secret)
+            .map_err(noise)?
+            .prologue(&hello)
+            .map_err(noise)?
+            .build_initiator()
+            .map_err(noise)?;
+        let transport = initiate(&mut s, hs)?;
+        s.set_read_timeout(None)?;
+        Ok(Session::new(s, transport))
+    }
+
     /// One connection, from the hello to an open session. `document`
     /// answers the NSM's document for a nonce, its public key this guest's.
     pub fn accept(&self, mut s: UnixStream, document: impl FnOnce(&[u8; NONCE_BYTES]) -> io::Result<Vec<u8>>) -> Result<Session, SessionError> {
@@ -174,6 +222,7 @@ impl Guest {
         let h = Hello::decode(&hello)?;
         let session = match h.kind {
             Kind::Attest => self.attest(&mut s, &hello, &h, document)?,
+            Kind::Egress => return Err(SessionError::Hello),
             Kind::Resume => {
                 let resumed = {
                 let Claim::Claimed(secret) = *self.state.lock().expect("never poisoned") else {
@@ -216,14 +265,18 @@ impl Guest {
                 .build_responder()
                 .map_err(noise)?;
             let mut session = Session::new(s.try_clone()?, respond(s, hs)?);
-            // The home's first message: the session's secret.
+            // The home's first message: the session's secret; its second,
+            // its configuration for this guest.
             let secret: [u8; KEY_BYTES] = session.recv_message()?.try_into().map_err(|_| SessionError::Key("a secret of another length"))?;
-            Ok::<_, SessionError>((session, secret))
+            let config = session.recv_message()?;
+            Ok::<_, SessionError>((session, secret, config))
         })();
         let mut state = self.state.lock().expect("never poisoned");
         match attempt {
-            Ok((session, secret)) => {
+            Ok((session, secret, config)) => {
                 *state = Claim::Claimed(secret);
+                *self.config.lock().expect("never poisoned") = Some(config);
+                self.claimed.notify_all();
                 Ok(session)
             }
             Err(e) => {
@@ -236,13 +289,18 @@ impl Guest {
 
 /// The home's first connection to a guest: attest, verify, claim. `verify`
 /// checks the document for `nonce` (chain, nonce, PCR0) and answers the
-/// key it binds. `secret` is 32 random bytes of the caller's.
+/// key it binds. `secret` is 32 random bytes of the caller's; `config` is
+/// what the guest waits for before its workload starts.
 pub fn attest(
     mut s: UnixStream,
     nonce: [u8; NONCE_BYTES],
     secret: [u8; KEY_BYTES],
+    config: &[u8],
     verify: impl FnOnce(&[u8]) -> Result<[u8; KEY_BYTES], String>,
 ) -> Result<(Session, Credential), SessionError> {
+    if config.len() > CONFIG_BYTES_MAX {
+        return Err(SessionError::Frame);
+    }
     s.set_read_timeout(Some(HANDSHAKE_WAIT))?;
     let hello = Hello { kind: Kind::Attest, nonce }.encode();
     s.write_all(&hello)?;
@@ -259,7 +317,32 @@ pub fn attest(
     s.set_read_timeout(None)?;
     let mut session = Session::new(s, transport);
     session.send_message(&secret)?;
+    session.send_message(config)?;
     Ok((session, Credential { guest_key, secret }))
+}
+
+/// The home's side of a guest's egress connection: the guest named by the
+/// key after its hello, its claim's secret found by `secret_of`.
+pub fn accept_egress(mut s: UnixStream, secret_of: impl FnOnce(&[u8; KEY_BYTES]) -> Option<[u8; KEY_BYTES]>) -> Result<(Session, [u8; KEY_BYTES]), SessionError> {
+    s.set_read_timeout(Some(HANDSHAKE_WAIT))?;
+    let mut hello = [0u8; EGRESS_HELLO_BYTES];
+    s.read_exact(&mut hello)?;
+    let h = Hello::decode(hello[..HELLO_BYTES].try_into().expect("a hello's bytes"))?;
+    if h.kind != Kind::Egress {
+        return Err(SessionError::Hello);
+    }
+    let guest_key: [u8; KEY_BYTES] = hello[HELLO_BYTES..].try_into().expect("a key's bytes");
+    let secret = secret_of(&guest_key).ok_or(SessionError::Unclaimed)?;
+    let hs = snow::Builder::new(EGRESS.parse().map_err(noise)?)
+        .psk(0, &secret)
+        .map_err(noise)?
+        .prologue(&hello)
+        .map_err(noise)?
+        .build_responder()
+        .map_err(noise)?;
+    let transport = respond(&mut s, hs)?;
+    s.set_read_timeout(None)?;
+    Ok((Session::new(s, transport), guest_key))
 }
 
 /// A later connection of the home that claimed the guest.

@@ -15,6 +15,15 @@
 //!
 //! The credentials are kept in the home's own state directory, so a
 //! computer kept running through a home restart is still the home's.
+//!
+//! **Egress inside the boundary** (docs/nitro.md): the claim tells each
+//! computer to send its workload's connections and lookups to its home, and
+//! hands it the home's CA. Each comes as an egress session (bridge port
+//! 5003), and the home's own egress proxy (`sandcastle_egress`, the same
+//! the engine runs) decides it by that computer's start: intercepts to
+//! celld's socket in the home, the internet from the home, refusals. The
+//! CA's key never leaves the home; the parent never sees where a
+//! connection goes, or what it carries.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -43,6 +52,11 @@ pub const PINS_MAX: usize = 64;
 /// Computers a home keeps credentials for, at most.
 pub const CREDENTIALS_MAX: usize = 1024;
 const STATE_FILE: &str = "sessions.json";
+/// Each kept computer's egress: its policy and its intercepts' handler.
+const EGRESS_FILE: &str = "egress.json";
+const CA_CERT: &str = "ca.pem";
+const CA_KEY: &str = "ca.key";
+const CA_NAME: &str = "sandcastle home CA";
 const STATE_BYTES_MAX: u64 = 1 << 20;
 /// An upgrade's answer head, at most.
 const HEAD_BYTES_MAX: usize = 8192;
@@ -61,13 +75,31 @@ fn fail(e: ApiError) -> Response<Body> {
     full(super::server::error(e))
 }
 
-/// The home's sessions: its pins, its credentials, its way to the parent.
+/// The home's sessions: its pins, its credentials, its way to the parent,
+/// and its computers' egress.
 pub struct Sessions {
     trust: sandcastle_nitro_attest::Trust,
     pins: BTreeSet<[u8; 48]>,
     state: PathBuf,
     credentials: Mutex<BTreeMap<String, Credential>>,
     up: Up,
+    ca: Arc<sandcastle_egress::ca::Ca>,
+    egress: Mutex<BTreeMap<String, Kept>>,
+    node_addrs: Vec<std::net::IpAddr>,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+/// One computer's egress: what its start asked for, and the proxy for it.
+struct Kept {
+    policy: sandcastle_egress::Policy,
+    handler: PathBuf,
+    proxy: Arc<sandcastle_egress::Egress>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptEgress {
+    policy: sandcastle_egress::Policy,
+    handler: PathBuf,
 }
 
 impl Sessions {
@@ -89,7 +121,82 @@ impl Sessions {
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e),
         };
-        Ok(Sessions { trust: sandcastle_nitro_attest::Trust::aws_nitro_enclaves_root_g1(), pins, state: state.to_path_buf(), credentials: Mutex::new(credentials), up })
+        let ca = Arc::new(home_ca(state)?);
+        let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?);
+        let s = Sessions {
+            trust: sandcastle_nitro_attest::Trust::aws_nitro_enclaves_root_g1(),
+            pins,
+            state: state.to_path_buf(),
+            credentials: Mutex::new(credentials),
+            up,
+            ca,
+            egress: Mutex::new(BTreeMap::new()),
+            node_addrs: super::node_addrs(),
+            rt,
+        };
+        // The kept computers' egress, as their starts asked.
+        let file = state.join(EGRESS_FILE);
+        if let Ok(body) = std::fs::read(&file) {
+            let kept: BTreeMap<String, KeptEgress> = serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", file.display())))?;
+            for (name, k) in kept {
+                s.register(&name, k.policy, k.handler)?;
+            }
+        }
+        Ok(s)
+    }
+
+    /// The egress a computer's start asks for, run in the home.
+    fn register(&self, name: &str, policy: sandcastle_egress::Policy, handler: PathBuf) -> io::Result<()> {
+        let rules = policy.compile(&self.node_addrs).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let proxy = Arc::new(sandcastle_egress::Egress::new(rules, self.ca.clone(), handler.clone(), name.to_string()));
+        self.egress.lock().expect("never poisoned").insert(name.to_string(), Kept { policy, handler, proxy });
+        self.save_egress()
+    }
+
+    /// A running computer's intercepts, replaced whole.
+    fn set_intercepts(&self, name: &str, intercepts: Vec<sandcastle_egress::Intercept>) -> io::Result<()> {
+        {
+            let mut all = self.egress.lock().expect("never poisoned");
+            let Some(k) = all.get_mut(name) else { return Ok(()) };
+            let mut policy = k.policy.clone();
+            policy.intercept = intercepts;
+            let rules = policy.compile(&self.node_addrs).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            k.proxy.set_rules(rules);
+            k.policy = policy;
+        }
+        self.save_egress()
+    }
+
+    fn save_egress(&self) -> io::Result<()> {
+        let all = self.egress.lock().expect("never poisoned");
+        let kept: BTreeMap<&String, KeptEgress> = all.iter().map(|(n, k)| (n, KeptEgress { policy: k.policy.clone(), handler: k.handler.clone() })).collect();
+        write_private(&self.state.join(EGRESS_FILE), &serde_json::to_vec(&kept).expect("serializes"))
+    }
+
+    /// One of a guest's egress sessions (bridge port 5003): the guest found
+    /// by its key, then its connection or lookup to its proxy.
+    pub fn egress_connection(self: &Arc<Self>, s: UnixStream) -> io::Result<()> {
+        let mut named = None;
+        let (session, _) = sandcastle_session::accept_egress(s, |key| {
+            let all = self.credentials.lock().expect("never poisoned");
+            let (name, c) = all.iter().find(|(_, c)| c.guest_key == *key)?;
+            named = Some(name.clone());
+            Some(c.secret)
+        })
+        .map_err(io::Error::other)?;
+        let name = named.expect("found with its secret");
+        let proxy = self.egress.lock().expect("never poisoned").get(&name).map(|k| k.proxy.clone());
+        let Some(proxy) = proxy else {
+            return Err(io::Error::other(format!("{name} has no egress in this home")));
+        };
+        let plain = session.into_plain()?;
+        plain.set_nonblocking(true)?;
+        self.rt.spawn(async move {
+            if let Ok(s) = tokio::net::UnixStream::from_std(plain) {
+                let _ = proxy.connection(s).await;
+            }
+        });
+        Ok(())
     }
 
     /// Attests the computer `name` and claims its session.
@@ -97,7 +204,10 @@ impl Sessions {
         let stream = self.upgrade(name).map_err(|e| format!("reaching its session: {e}"))?;
         let (nonce, secret) = (random32().map_err(|e| e.to_string())?, random32().map_err(|e| e.to_string())?);
         let now = now_ms();
-        let (session, credential) = sandcastle_session::attest(stream, nonce, secret, |doc| verify(&self.trust, &self.pins, doc, &nonce, now)).map_err(|e| e.to_string())?;
+        // What the guest waits for before its workload starts: the home's CA,
+        // and its egress to the home.
+        let config = serde_json::to_vec(&serde_json::json!({ "ca_pem": self.ca.cert_pem(), "egress": true })).expect("serializes");
+        let (session, credential) = sandcastle_session::attest(stream, nonce, secret, &config, |doc| verify(&self.trust, &self.pins, doc, &nonce, now)).map_err(|e| e.to_string())?;
         // The claim's own session carries nothing more.
         drop(session);
         self.keep(name, Some(credential)).map_err(|e| format!("keeping its credential: {e}"))
@@ -121,6 +231,10 @@ impl Sessions {
     }
 
     pub fn forget(&self, name: &str) -> io::Result<()> {
+        let had = self.egress.lock().expect("never poisoned").remove(name).is_some();
+        if had {
+            self.save_egress()?;
+        }
         self.keep(name, None)
     }
 
@@ -137,12 +251,7 @@ impl Sessions {
                 all.remove(name);
             }
         }
-        // Whole or not at all, and only this home's to read.
-        let partial = self.state.join(format!("{STATE_FILE}.partial"));
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&partial)?;
-        f.write_all(&serde_json::to_vec(&*all).expect("serializes"))?;
-        f.sync_all()?;
-        std::fs::rename(&partial, self.state.join(STATE_FILE))
+        write_private(&self.state.join(STATE_FILE), &serde_json::to_vec(&*all).expect("serializes"))
     }
 
     /// A stream to the computer's session port, through the parent's engine.
@@ -158,6 +267,29 @@ impl Sessions {
         s.set_read_timeout(None)?;
         Ok(s)
     }
+}
+
+/// Whole or not at all, and only this home's to read.
+fn write_private(at: &Path, body: &[u8]) -> io::Result<()> {
+    let partial = at.with_extension("partial");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&partial)?;
+    f.write_all(body)?;
+    f.sync_all()?;
+    std::fs::rename(&partial, at)
+}
+
+/// The home's CA for its computers' intercepted hosts: made once, kept in
+/// its state directory (the home's encrypted disk), so a computer kept
+/// through a home restart still trusts it.
+fn home_ca(state: &Path) -> io::Result<sandcastle_egress::ca::Ca> {
+    let (cert, key) = (state.join(CA_CERT), state.join(CA_KEY));
+    if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cert), std::fs::read_to_string(&key)) {
+        return sandcastle_egress::ca::Ca::load(CA_NAME, &c, &k).map_err(io::Error::other);
+    }
+    let ca = sandcastle_egress::ca::Ca::generate(CA_NAME).map_err(io::Error::other)?;
+    write_private(&key, ca.key_pem().as_bytes())?;
+    write_private(&cert, ca.cert_pem().as_bytes())?;
+    Ok(ca)
 }
 
 /// A document's checks for a claim: AWS's chain and the nonce
@@ -215,7 +347,7 @@ fn now_ms() -> u64 {
 
 /// Serves celld's `engine.sock` for the process's life.
 pub fn serve_engine(listener: UnixListener, sessions: Arc<Sessions>) -> io::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let rt = sessions.rt.clone();
     rt.block_on(async move {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
@@ -240,9 +372,20 @@ async fn route(sessions: Arc<Sessions>, req: Request<Incoming>) -> Result<Respon
         (&Method::POST, ["v1", "containers", _, "session"]) => fail(ApiError::Invalid("a computer's session is its home's own".into())),
         (&Method::POST, ["v1", "containers", name, "start"]) => {
             let name = name.to_string();
+            // Its policy, for the egress the home runs for it.
+            let (req, start) = match buffered::<api::StartRequest>(req).await {
+                Ok(r) => r,
+                Err(e) => return Ok(fail(e)),
+            };
             let answer = forward(&sessions, req).await;
             if !answer.status().is_success() {
                 return Ok(answer);
+            }
+            let policy = sandcastle_egress::Policy { internet: start.enable_internet, allow: start.allow.clone(), deny: start.deny.clone(), intercept: start.intercepts.clone() };
+            let handler = PathBuf::from(start.handler.as_deref().and_then(|h| h.strip_prefix("unix:")).unwrap_or("/nonexistent"));
+            if let Err(e) = sessions.register(&name, policy, handler) {
+                let _ = destroy(&sessions, &name).await;
+                return Ok(fail(ApiError::Invalid(format!("the computer's egress: {e}"))));
             }
             match claim_when_running(sessions.clone(), name.clone()).await {
                 Ok(()) => answer,
@@ -252,6 +395,20 @@ async fn route(sessions: Arc<Sessions>, req: Request<Incoming>) -> Result<Respon
                     fail(ApiError::Internal(format!("the computer did not attest: {why}")))
                 }
             }
+        }
+        (&Method::PUT, ["v1", "containers", name, "intercepts"]) => {
+            let name = name.to_string();
+            let (req, x) = match buffered::<api::InterceptsRequest>(req).await {
+                Ok(r) => r,
+                Err(e) => return Ok(fail(e)),
+            };
+            let answer = forward(&sessions, req).await;
+            if answer.status().is_success() {
+                if let Err(e) = sessions.set_intercepts(&name, x.intercepts) {
+                    return Ok(fail(ApiError::Invalid(format!("the computer's intercepts: {e}"))));
+                }
+            }
+            answer
         }
         (&Method::POST, ["v1", "containers", name, "destroy"]) => {
             let name = name.to_string();
@@ -263,6 +420,19 @@ async fn route(sessions: Arc<Sessions>, req: Request<Incoming>) -> Result<Respon
         }
         _ => forward(&sessions, req).await,
     })
+}
+
+/// A request's body read whole (up to the engine's ceiling) and parsed, and
+/// the same request again to forward.
+async fn buffered<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<(Request<Body>, T), ApiError> {
+    let (parts, body) = req.into_parts();
+    let bytes = http_body_util::Limited::new(body, super::server::BODY_BYTES_MAX)
+        .collect()
+        .await
+        .map_err(|_| ApiError::Invalid(format!("a body of at most {} bytes", super::server::BODY_BYTES_MAX)))?
+        .to_bytes();
+    let parsed = serde_json::from_slice(&bytes).map_err(|e| ApiError::Invalid(format!("the body: {e}")))?;
+    Ok((Request::from_parts(parts, Full::new(bytes).map_err(|never| match never {}).boxed()), parsed))
 }
 
 /// The start's computer running, then claimed.
@@ -325,7 +495,10 @@ async fn exec(sessions: Arc<Sessions>, name: String, mut req: Request<Incoming>)
 }
 
 /// One request to the parent's engine, on a connection of its own.
-async fn forward(sessions: &Sessions, req: Request<Incoming>) -> Response<Body> {
+async fn forward<B>(sessions: &Sessions, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Send + Sync + 'static,
+{
     match send(sessions, req.map(|b| b.boxed())).await {
         Ok(r) => r.map(|b| b.boxed()),
         Err(e) => fail(ApiError::Internal(format!("the parent's engine: {e}"))),

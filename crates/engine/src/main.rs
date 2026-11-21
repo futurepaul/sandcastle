@@ -48,7 +48,7 @@ fn serve(config: sandcastle_engine::EngineConfig) -> ExitCode {
         }
     };
     rt.block_on(async {
-        let node = node_addrs();
+        let node = sandcastle_engine::linux::node_addrs();
         let engine = match sandcastle_engine::linux::engine::Engine::open(config, node) {
             Ok(e) => std::sync::Arc::new(e),
             Err(e) => {
@@ -99,40 +99,6 @@ fn serve(config: sandcastle_engine::EngineConfig) -> ExitCode {
         }
         ExitCode::SUCCESS
     })
-}
-
-/// Every address the node answers on.
-#[cfg(target_os = "linux")]
-fn node_addrs() -> Vec<std::net::IpAddr> {
-    let mut out = Vec::new();
-    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills a list we walk and then free.
-    unsafe {
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return out;
-        }
-        let mut p = ifap;
-        // Bounded by the list's length.
-        while !p.is_null() {
-            let a = (*p).ifa_addr;
-            if !a.is_null() {
-                match (*a).sa_family as libc::c_int {
-                    libc::AF_INET => {
-                        let s = &*(a as *const libc::sockaddr_in);
-                        out.push(std::net::IpAddr::from(u32::from_be(s.sin_addr.s_addr).to_be_bytes()));
-                    }
-                    libc::AF_INET6 => {
-                        let s = &*(a as *const libc::sockaddr_in6);
-                        out.push(std::net::IpAddr::from(s.sin6_addr.s6_addr));
-                    }
-                    _ => {}
-                }
-            }
-            p = (*p).ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-    }
-    out
 }
 
 /// Ends every VM under the engine's cgroup subtree, removes their run

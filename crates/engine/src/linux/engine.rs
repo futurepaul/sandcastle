@@ -322,13 +322,14 @@ impl Engine {
         let nitro = match &c.nitro {
             None => None,
             Some(n) => {
-                for f in [&n.firecracker, &n.kernel, &n.mke2fs] {
+                for f in [&n.firecracker, &n.kernel, &n.mke2fs, &n.nft] {
                     if !c.lib_dir.join(f).is_file() {
-                        return Err(ApiError::Internal(format!("{}: no such file (nitro/parent-ready.sh, nitro/guest-kernel.sh, nitro/guest-mke2fs.sh)", c.lib_dir.join(f).display())));
+                        return Err(ApiError::Internal(format!("{}: no such file (nitro/parent-ready.sh, nitro/guest-kernel.sh, nitro/guest-mke2fs.sh, nitro/guest-nft.sh)", c.lib_dir.join(f).display())));
                     }
                 }
                 let mke2fs = std::fs::read(c.lib_dir.join(&n.mke2fs)).map_err(internal("the guest's mke2fs"))?;
-                let archive = sandcastle_rootfs::initrd::guest(&guest, &mke2fs);
+                let nft = std::fs::read(c.lib_dir.join(&n.nft)).map_err(internal("the guest's nft"))?;
+                let archive = sandcastle_rootfs::initrd::guest(&guest, &mke2fs, &nft);
                 let initrd = c.boot().join(format!("guest-{}.initrd", &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&archive))[..12]));
                 if !initrd.exists() {
                     write_atomic(&initrd, &archive).map_err(internal("the guest's initrd"))?;
@@ -364,6 +365,18 @@ impl Engine {
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// A node of sessions' second socket per VM: where its runner hands each
+    /// of the guest's egress sessions, relayed unread to the home
+    /// (`NitroConfig::session_egress`). None on any other node.
+    fn session_egress(&self, run_dir: &Path) -> Result<Option<(tokio::net::UnixListener, Option<PathBuf>)>, ApiError> {
+        let Some(n) = self.config.nitro.as_ref().filter(|n| n.session_required) else { return Ok(None) };
+        let sock = run_dir.join(sandcastle_vm::paths::SESSION_EGRESS_SOCK);
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("binding the session egress socket"))?;
+        mode(&sock, 0o777).map_err(internal("the session egress socket's mode"))?;
+        Ok(Some((listener, n.session_egress.clone())))
     }
 
     /// Where a running computer's attested session is relayed: only a
@@ -1028,7 +1041,8 @@ impl Engine {
         let sock = run_dir.join(EGRESS_SOCK);
         let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("binding the egress socket"))?;
         mode(&sock, 0o777).map_err(internal("the egress socket's mode"))?;
-        let egress_task = tokio::spawn(egress.clone().serve(listener));
+        let session_egress = self.session_egress(&run_dir)?;
+        let egress_task = tokio::spawn(serve_egress(egress.clone(), listener, session_egress));
 
         // The process: the start's entrypoint or the image's, the image's
         // env under the start's, the image's directory and user.
@@ -1267,7 +1281,8 @@ impl Engine {
         let _ = std::fs::remove_file(&sock);
         let listener = tokio::net::UnixListener::bind(&sock).map_err(internal("rebinding the egress socket"))?;
         mode(&sock, 0o777).map_err(internal("the egress socket's mode"))?;
-        let egress_task = tokio::spawn(egress.clone().serve(listener));
+        let session_egress = self.session_egress(&run_dir)?;
+        let egress_task = tokio::spawn(serve_egress(egress.clone(), listener, session_egress));
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         for e in image.config.env.clone().unwrap_or_default() {
             if let Some((k, v)) = e.split_once('=') {
@@ -1591,6 +1606,28 @@ async fn wait_event(l: &mut Launched, name: &str) -> Result<Value, ApiError> {
     })
     .await
     .map_err(|_| ApiError::Internal(format!("no {name} in time")))?
+}
+
+/// A VM's egress for its life: the proxy, and on a node of sessions the
+/// relay of the guest's egress sessions to its home, which decides there.
+async fn serve_egress(egress: Arc<Egress>, listener: tokio::net::UnixListener, session: Option<(tokio::net::UnixListener, Option<PathBuf>)>) {
+    let Some((sessions, home)) = session else {
+        return egress.serve(listener).await;
+    };
+    let relay = async move {
+        // Unbounded by design: the VM's life; each connection its own.
+        loop {
+            let Ok((mut guest, _)) = sessions.accept().await else { continue };
+            let home = home.clone();
+            tokio::spawn(async move {
+                let Some(home) = home else { return };
+                let Ok(mut to) = tokio::net::UnixStream::connect(&home).await else { return };
+                // Ciphertext both ways; the session's ends see a cut.
+                let _ = tokio::io::copy_bidirectional(&mut guest, &mut to).await;
+            });
+        }
+    };
+    tokio::join!(egress.serve(listener), relay);
 }
 
 /// Why a Nitro node takes no snapshot: the scratch disk is ciphertext under
