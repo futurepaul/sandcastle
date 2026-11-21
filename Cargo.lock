@@ -998,6 +998,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandcastle-nitro-home"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "libc",
+ "ring",
+ "sandcastle-nitro-spike",
+ "sandcastle-vm",
+ "sandcastle-wire",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "sandcastle-nitro-key"
 version = "0.1.0"
 dependencies = [

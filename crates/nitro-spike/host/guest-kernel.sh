@@ -78,6 +78,15 @@ CONFIG_BLK_DEV_INITRD=y
 CONFIG_MODULES=n
 EOF
 
+# A caller's own lines (EXTRA_CONFIG, a file), after the spike's, so they
+# win too: the home's kernel adds dm-crypt for its encrypted data disk
+# (docs/nitro-home.md). Recorded in kernel.json by their SHA-256.
+extra_sum=none
+if [ -n "${EXTRA_CONFIG:-}" ]; then
+    cat "$EXTRA_CONFIG" >> spike.config
+    extra_sum=$(sha256sum "$EXTRA_CONFIG" | cut -d' ' -f1)
+fi
+
 cd linux
 export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=nitro-spike KBUILD_BUILD_VERSION=1 LOCALVERSION=
 KBUILD_BUILD_TIMESTAMP=$(git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M:%S UTC' "$AL_TAG")
@@ -102,9 +111,9 @@ sum=$(sha256sum "../out/$target" | cut -d' ' -f1)
 release=$(cat include/config/kernel.release)
 cd ..
 python3 -I - "$AL_TAG" "$commit" "$FC_REF" "$target" "$sum" "$release" \
-    "$(sha256sum fc-microvm.config | cut -d' ' -f1)" "$(sha256sum spike.config | cut -d' ' -f1)" > out/kernel.json <<'PY'
+    "$(sha256sum fc-microvm.config | cut -d' ' -f1)" "$(sha256sum spike.config | cut -d' ' -f1)" "$extra_sum" > out/kernel.json <<'PY'
 import json, sys
-tag, commit, fc_ref, target, sha, release, fc_cfg, spike_cfg = sys.argv[1:9]
-print(json.dumps({"source": "github.com/amazonlinux/linux", "tag": tag, "commit": commit, "firecracker_config": fc_ref, "firecracker_config_sha256": fc_cfg, "spike_config_sha256": spike_cfg, "image": target, "image_sha256": sha, "release": release, "kbuild": {"user": "builder", "host": "nitro-spike", "version": "1", "timestamp": "the tag's commit date"}}, indent=1))
+tag, commit, fc_ref, target, sha, release, fc_cfg, spike_cfg, extra_cfg = sys.argv[1:10]
+print(json.dumps({"source": "github.com/amazonlinux/linux", "tag": tag, "commit": commit, "firecracker_config": fc_ref, "firecracker_config_sha256": fc_cfg, "spike_config_sha256": spike_cfg, "extra_config_sha256": extra_cfg, "image": target, "image_sha256": sha, "release": release, "kbuild": {"user": "builder", "host": "nitro-spike", "version": "1", "timestamp": "the tag's commit date"}}, indent=1))
 PY
 cat out/kernel.json

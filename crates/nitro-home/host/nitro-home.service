@@ -1,0 +1,18 @@
+# The home on its parent (docs/nitro-home.md): booted at the parent's
+# start and again whenever it exits. A stop is graceful: SIGTERM to the
+# launcher alone (KillMode=mixed), which asks the home's workload to stop
+# (celld's last writes durable in the bucket) before its sandbox ends.
+[Unit]
+Description=Fragment home: celld and the cell in a confidential Nitro sandbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nitro-home up --conf /etc/nitro-home/home.json
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

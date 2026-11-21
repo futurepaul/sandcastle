@@ -3,7 +3,7 @@
 # (docs/krun-spike.md, Dependencies).
 [workspace]
 resolver = "2"
-members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/krun-spike", "crates/nitro-attest", "crates/nitro-key", "crates/nitro-probe", "crates/nitro-spike"]
+members = ["crates/wire", "crates/vm", "crates/guest", "crates/rootfs", "crates/egress", "crates/engine", "crates/krun-spike", "crates/nitro-attest", "crates/nitro-key", "crates/nitro-probe", "crates/nitro-spike", "crates/nitro-home"]
 
 [workspace.package]
 edition = "2021"

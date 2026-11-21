@@ -1,0 +1,32 @@
+[package]
+name = "sandcastle-nitro-home"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A Fragment home (docs/nitro-home.md): celld and the cell in a confidential Nitro sandbox of their own. The parent's launcher, the guest's opener of its sealed secrets, and the operator's sealer. Spike code, not the product."
+
+[[bin]]
+name = "nitro-home"
+path = "src/bin/nitro-home.rs"
+
+[[bin]]
+name = "nitro-home-guest"
+path = "src/bin/nitro-home-guest.rs"
+
+[[bin]]
+name = "nitro-home-seal"
+path = "src/bin/nitro-home-seal.rs"
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandcastle-nitro-spike = { path = "../nitro-spike" }
+sandcastle-wire.workspace = true
+sandcastle-vm.workspace = true
+libc.workspace = true

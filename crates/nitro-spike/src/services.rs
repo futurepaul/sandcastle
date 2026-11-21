@@ -160,24 +160,29 @@ impl Services {
 
     /// The signer, on the sandbox's `<uds_path>_9100`, for its life.
     pub fn signer(&self, uds: &Path) -> Result<(), Failure> {
-        let path = format!("{}_{SIGNER_PORT}", uds.display());
-        let _ = std::fs::remove_file(&path);
-        let listener = StdUnixListener::bind(&path).map_err(|e| Failure(format!("the signer's socket: {e}")))?;
-        let signed = self.signed.clone();
-        std::thread::spawn(move || {
-            // Unbounded by design: one sandbox's life, one request a
-            // connection.
-            for conn in listener.incoming() {
-                let Ok(conn) = conn else { continue };
-                let _ = sign_one(conn, &signed);
-            }
-        });
-        Ok(())
+        serve_signer(uds, self.signed.clone())
     }
 
     pub fn block<T>(&self, f: impl std::future::Future<Output = T>) -> T {
         self.rt.block_on(f)
     }
+}
+
+/// The signer alone (a home's, docs/nitro-home.md), on the sandbox's
+/// `<uds_path>_9100`, for its life: what it signed goes to `signed`.
+pub fn serve_signer(uds: &Path, signed: Arc<Mutex<Vec<SignRecord>>>) -> Result<(), Failure> {
+    let path = format!("{}_{SIGNER_PORT}", uds.display());
+    let _ = std::fs::remove_file(&path);
+    let listener = StdUnixListener::bind(&path).map_err(|e| Failure(format!("the signer's socket: {e}")))?;
+    std::thread::spawn(move || {
+        // Unbounded by design: one sandbox's life, one request a
+        // connection.
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let _ = sign_one(conn, &signed);
+        }
+    });
+    Ok(())
 }
 
 /// What the guest asks the parent to sign: a KMS target and its body's
